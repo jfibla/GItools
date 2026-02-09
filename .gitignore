@@ -24,3 +24,6 @@ app/_state/
 app/Inspector_resources/software/plink19
 app/LD_Inspector/www/plink19
 app/LD_Inspector/www/POP
+
+# LD_Inspector local POP panels
+app/LD_Inspector/www/POP/
