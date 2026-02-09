@@ -1,39 +1,24 @@
-# ----------------------------
-# Recursos grans locals (NO pujar)
-# ----------------------------
-resources/
-app/Inspector_resources/**
-
-
-# Permet pujar només el README d'Inspector_resources
-!app/Inspector_resources/README.md
-
-# Logs / state (runtime)
-_logs/
-_state/
+# local heavy resources
+app/Inspector_resources/
 app/_logs/
 app/_state/
-**/_logs/
-**/_state/
 
-# R artifacts
-*.rds
-*.RData
-*.rda
-.Rhistory
-.Ruserdata
-*.Rproj.user/
-
-# Compressed / big data (opcional però recomanat)
-*.tsv.gz
+# common big files
+*.bed
+*.bim
+*.fam
+*.vcf
 *.vcf.gz
-*.bed.gz
+*.tbi
+*.rds
+*.rda
+*.RData
+*.tsv.gz
+*.out
+*.out.gz
 *.zip
+*.tar
 *.tar.gz
 
-# renv opcional
-renv/library/
-renv/staging/
-
-# OS
-.DS_Store
+# binaries
+app/Inspector_resources/software/plink19
