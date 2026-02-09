@@ -1,0 +1,39 @@
+# ----------------------------
+# Recursos grans locals (NO pujar)
+# ----------------------------
+resources/
+app/Inspector_resources/**
+
+
+# Permet pujar només el README d'Inspector_resources
+!app/Inspector_resources/README.md
+
+# Logs / state (runtime)
+_logs/
+_state/
+app/_logs/
+app/_state/
+**/_logs/
+**/_state/
+
+# R artifacts
+*.rds
+*.RData
+*.rda
+.Rhistory
+.Ruserdata
+*.Rproj.user/
+
+# Compressed / big data (opcional però recomanat)
+*.tsv.gz
+*.vcf.gz
+*.bed.gz
+*.zip
+*.tar.gz
+
+# renv opcional
+renv/library/
+renv/staging/
+
+# OS
+.DS_Store
