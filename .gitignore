@@ -23,3 +23,4 @@ app/_state/
 # binaries
 app/Inspector_resources/software/plink19
 app/LD_Inspector/www/plink19
+app/LD_Inspector/www/POP
