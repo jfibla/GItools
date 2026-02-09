@@ -1,7 +1,15 @@
-# local heavy resources
+# local heavy resources (ignored)
 app/Inspector_resources/
 app/_logs/
 app/_state/
+
+# but keep the placeholder README tracked
+!app/Inspector_resources/
+!app/Inspector_resources/README.md
+
+# LD_Inspector local files (ignored)
+app/LD_Inspector/www/POP/
+app/LD_Inspector/www/plink19
 
 # common big files
 *.bed
@@ -20,10 +28,7 @@ app/_state/
 *.tar
 *.tar.gz
 
-# binaries
-app/Inspector_resources/software/plink19
-app/LD_Inspector/www/plink19
-app/LD_Inspector/www/POP
-
-# LD_Inspector local POP panels
-app/LD_Inspector/www/POP/
+# junk
+.DS_Store
+**/.DS_Store
+.Rhistory
