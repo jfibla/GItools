@@ -3,8 +3,7 @@
 The content of this folder is **NOT included in the GitHub repository**.  
 It is a local “resources” directory that each user must populate in order to run some GItools modules (LD, NonSyn, EWAS, etc.).
 
-You can downoad a compresed file containing all **Inspector_resources** folder at https://www.dropbox.com/scl/fi/z865sh1ijzb01ftnc8tij/Inspector_resources.tar.zst?rlkey=4j527yyn5vo3hvx9j322wwu6n&dl=0
-
+You can downoad a compresed file containing all **Inspector_resources** folder at https://www.dropbox.com/scl/fi/mkmpc0x5vauopir9d32e1/Inspector_resources.tar.zst?rlkey=4j527yyn5vo3hvx9j322wwu6n&st=5ku1gr2f&dl=0
 GItools will look here by default:
 `<GItools_root>/Inspector_resources/`
 
