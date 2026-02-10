@@ -184,9 +184,10 @@ example_files/
 ## Run locally
 
 1. Clone the repository
-2. Open the project in RStudio
-3. Install required CRAN / Bioconductor dependencies
-4. Run:
+2. Download **Inspector resources** folder from dropbox (see Inspector resources/readme.md)
+3. Open the project in RStudio
+4. Install required CRAN / Bioconductor dependencies
+5. Run:
 
 ```r
 shiny::runApp()
