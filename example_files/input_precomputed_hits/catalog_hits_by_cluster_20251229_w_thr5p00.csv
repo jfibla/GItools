@@ -1,0 +1,57 @@
+cluster_id,cluster,cluster_start,cluster_end,CHR,POS,rsid,P_VALUE,OR_BETA,PUBMEDID,MAPPED_GENE,DISEASE,MAPPED_TRAIT,hit_key
+cluster_chr3_1,1,2307302,2338334,3,2323342,rs11713899,2e-10,0.00912317,30643251,CNTN4,Smoking initiation (ever regular vs never regular) (MTAG),smoking status measurement,rs11713899
+cluster_chr3_1,1,2307302,2338334,3,2334088,rs62243994,5e-8,1.4,40187613,CNTN4,Gut microbiome abundance (class Bacteroides thetaiotaomicron (at 1 year) x Spring Birth (Mar-May) interaction,"gut microbiome measurement, environmental exposure measurement",rs62243994
+cluster_chr3_1,1,2307302,2338334,3,2328412,rs528519891,3e-8,2.32247,36672889,CNTN4,Red vs non-red hair color,hair color,rs528519891
+cluster_chr3_1,1,2307302,2338334,3,2315897,rs56035150,2e-6,,40360795,CNTN4,Mannose levels,mannose measurement,rs56035150
+cluster_chr3_1,1,2307302,2338334,3,2316679,rs62243961,7e-17,0.00855,36477530,CNTN4,Smoking initiation,smoking initiation,rs62243961
+cluster_chr3_1,1,2307302,2338334,3,2324313,rs11714993,9e-16,0.00899,36477530,CNTN4,Smoking initiation,smoking initiation,rs11714993
+cluster_chr3_1,1,2307302,2338334,3,2336698,rs1178548,2e-17,0.10838204,39789286,CNTN4,CNTN4 protein levels,contactin-4 measurement,rs1178548
+cluster_chr4_1,1,142556298,142576298,4,142565809,rs11942731,1e-8,0.0079,30643258,INPP4B,General risk tolerance (MTAG),risk-taking behaviour,rs11942731
+cluster_chr4_1,1,142556298,142576298,4,142572060,rs1425522,8e-11,0.019668229,32451486,INPP4B,Problematic alcohol use (MTAG),"alcohol use disorder measurement, alcohol consumption quality",rs1425522
+cluster_chr4_1,1,142556298,142576298,4,142568413,rs2081474,6e-24,0.0113,36477530,INPP4B,Smoking initiation,smoking initiation,rs2081474
+cluster_chr4_1,1,142556298,142576298,4,142572406,rs1425523,5e-24,0.0113,36477530,INPP4B,Smoking initiation,smoking initiation,rs1425523
+cluster_chr4_1,1,142556298,142576298,4,142558537,rs189372239,1e-11,0.5592389,39789286,INPP4B,GLIPR1 protein levels,glioma pathogenesis-related protein 1 measurement,rs189372239
+cluster_chr5_1,1,134510666,134539762,5,134513486,rs13187289,2e-10,3,21102462,LINC01843 - RN7SL541P,Menarche (age at onset),age at menarche,rs13187289
+cluster_chr5_1,1,134510666,134539762,5,134528909,rs329122,5e-7,0.00613147,32042192,JADE2,Sex hormone-binding globulin levels,sex hormone-binding globulin measurement,rs329122
+cluster_chr5_1,1,134510666,134539762,5,134526066,rs329120,6e-11,0.00594388,32042192,JADE2,Sex hormone-binding globulin levels,sex hormone-binding globulin measurement,rs329120
+cluster_chr5_1,1,134510666,134539762,5,134525973,rs329118,9e-12,0.00948808,32376654,JADE2,Adult body size,body height,rs329118
+cluster_chr5_1,1,134510666,134539762,5,134513226,rs10900829,3e-7,1.0786322,32887889,LINC01843 - RN7SL541P,Prostate cancer,prostate carcinoma,rs10900829
+cluster_chr5_1,1,134510666,134539762,5,134529762,rs329124,1e-8,,30595370,JADE2,Smoking status,smoking status measurement,rs329124
+cluster_chr5_1,1,134510666,134539762,5,134527662,rs329121,2e-9,0.013460061,32888494,JADE2,White blood cell count,leukocyte quantity,rs329121
+cluster_chr5_1,1,134510666,134539762,5,134533580,rs620498,3e-15,0.02414351,32888494,JADE2,Monocyte percentage of white cells,monocyte percentage of leukocytes,rs620498
+cluster_chr5_1,1,134510666,134539762,5,134524410,rs329117,8e-11,0.014577624,32888494,JADE2,Neutrophil count,neutrophil count,rs329117
+cluster_chr5_1,1,134510666,134539762,5,134535411,rs329125,1e-12,0.016638,32888493,JADE2,Monocyte count,monocyte count,rs329125
+cluster_chr5_1,1,134510666,134539762,5,134512969,rs4559047,2e-10,0.012,38429522,LINC01843 - RN7SL541P,Pain intensity (without opioid use disorder),pain measurement,rs4559047
+cluster_chr5_1,1,134510666,134539762,5,134520717,rs329113,3e-10,0.03,38429522,RN7SL541P - JADE2,Pain intensity (NRS pain scale 0-11),pain measurement,rs329113
+cluster_chr5_1,1,134510666,134539762,5,134513069,rs11242219,5e-12,0.014,38429522,LINC01843 - RN7SL541P,Pain intensity (NRS pain scale 0-11),pain measurement,rs11242219
+cluster_chr5_1,1,134510666,134539762,5,134539343,rs11242222,2e-8,0.0686,34211149,JADE2,Age at first birth,age at first birth measurement,rs11242222
+cluster_chr5_1,1,134510666,134539762,5,134514931,rs11948454,9e-11,0.0193237,34021172,LINC01843 - RN7SL541P,Hip circumference adjusted for BMI,BMI-adjusted hip circumference,rs11948454
+cluster_chr5_1,1,134510666,134539762,5,134512828,rs72798639,3e-8,0.0302162,34021172,LINC01843 - RN7SL541P,Hip circumference adjusted for BMI,BMI-adjusted hip circumference,rs72798639
+cluster_chr5_1,1,134510666,134539762,5,134513025,rs66914325,4e-12,0.0162,34594039,LINC01843 - RN7SL541P,Platelet count,platelet count,rs66914325
+cluster_chr5_1,1,134510666,134539762,5,134535049,rs7738043,8e-10,0.0114,34594039,JADE2,Hematocrit,hematocrit,rs7738043
+cluster_chr5_1,1,134510666,134539762,5,134532178,rs146681214,4e-9,0.0084185,31263887,JADE2,Mental health study participation (completed survey),health study participation,rs146681214
+cluster_chr5_1,1,134510666,134539762,5,134517330,rs614508,3e-8,0.0066477,31263887,LINC01843 - RN7SL541P,Mental health study participation (completed survey),health study participation,rs614508
+cluster_chr5_1,1,134510666,134539762,5,134512997,rs11242218,2e-8,,31676860,LINC01843 - RN7SL541P,Brain region volumes,brain volume,rs11242218
+cluster_chr5_1,1,134510666,134539762,5,134520667,rs10712727,1e-14,0.0162268,39134668,RN7SL541P - JADE2,Body mass index,body mass index,rs10712727
+cluster_chr5_1,1,134510666,134539762,5,134537882,rs329126,1e-10,0.006439,36653479,JADE2,Medication use for T2D (number of purchases),Drugs used in diabetes use measurement,rs329126
+cluster_chr5_1,1,134510666,134539762,5,134529745,rs329123,7e-20,0.017838161,39789286,JADE2,IGF 1 (UKB data field 30770),IGF-1 measurement,rs329123
+cluster_chr5_1,1,134510666,134539762,5,134511488,rs1860059,2e-12,0.01885991,39789286,LINC01843 - RN7SL541P,Monocyte percentage (UKB data field 30190),monocyte percentage of leukocytes,rs1860059
+cluster_chr5_1,1,134510666,134539762,5,134519733,rs200837000,1e-13,0.019060187,39789286,RN7SL541P - JADE2,Hip circumference (UKB data field 49),hip circumference,rs200837000
+cluster_chr5_1,1,134510666,134539762,5,134513996,rs6860961,5e-15,0.07148,39024449,LINC01843 - RN7SL541P,Prostate cancer,prostate cancer,rs6860961
+cluster_chr5_1,1,134510666,134539762,5,134528746,rs6894631,4e-10,0.017435,39256582,JADE2,"Estimated glomerular filtration rate (creatinine, cystatin c)",glomerular filtration rate,rs6894631
+cluster_chr10_1,1,61927130,61947130,10,61935289,rs6479779,1e-6,0.1943,23382691,ARID5B,IgG glycosylation,serum IgG glycosylation measurement,rs6479779
+cluster_chr10_1,1,61927130,61947130,10,61935039,rs7071908,3e-10,,40465716,ARID5B,Reticulosarcoma (PheCode 202.22),reticulum cell sarcoma,rs7071908
+cluster_chr10_1,1,61927130,61947130,10,61939429,rs189088802,1e-8,0.5999,40195560,ARID5B,Heart failure,heart failure,rs189088802
+cluster_chr10_1,1,61927130,61947130,10,61942813,rs55767272,8e-11,0.03,41044249,ARID5B,Triglycerides in large VLDL,triglycerides in large VLDL measurement,rs55767272
+cluster_chr10_1,1,61927130,61947130,10,61941777,rs112779912,4e-11,1.59403,34046847,ARID5B,Femur bone mineral density x serum urate levels interaction,"urate measurement, bone tissue density",rs112779912
+cluster_chr10_1,1,61927130,61947130,10,61937857,rs2893880,9e-7,0.171,35501403,ARID5B,Serum selenium levels,serum selenium amount,rs2893880
+cluster_chr10_1,1,61927130,61947130,10,61935943,rs79498125,3e-8,1.8574415,34746714,ARID5B,Disease-related mortality after unrelated donor allogeneic hematopoietic cell transplantation (donor effect),"response to allogeneic hematopoietic stem cell transplant, donor genotype effect measurement, mortality",rs79498125
+cluster_chr10_1,1,61927130,61947130,10,61936364,rs10821933,5e-11,0.00542,36477530,ARID5B,Drinks per week,alcohol consumption quality,rs10821933
+cluster_chr14_1,1,33957212,33977212,14,33974720,rs35833468,3e-6,1.0869565,30820047,EGLN3,Alzheimer's disease (late onset),late-onset Alzheimers disease,rs35833468
+cluster_chr14_1,1,33957212,33977212,14,33976479,rs146309721,9e-6,1.7636756,40708016,EGLN3,"Alzheimer's disease, proxy Alzheimer's disease or related dementias in APOE e4 non-carriers","Alzheimer disease, dementia, family history of Alzheimer’s disease",rs146309721
+cluster_chr14_1,1,33957212,33977212,14,33968948,rs11623319,5e-7,0.1701361,37359372,EGLN3,Color vision defects (Deutan-Protan),color vision disorder,rs11623319
+cluster_chr18_1,1,75983892,76012716,18,76000450,rs71361173,3e-6,0.111,27989323,LINC01898 - LINC01893,Interleukin-12p70 levels,interleukin 12 measurement,rs71361173
+cluster_chr18_1,1,75983892,76012716,18,75990278,rs35585298,4e-6,1.2726,28754779,LINC01898 - LINC01893,Alcoholic chronic pancreatitis,alcoholic pancreatitis,rs35585298
+cluster_chr18_1,1,75983892,76012716,18,75985500,rs11873753,1e-6,1.85,31488892,LINC01898 - LINC01893,Ovarian cancer,ovarian carcinoma,rs11873753
+cluster_chr18_1,1,75983892,76012716,18,75988278,rs78286182,1e-6,1.08,31488892,LINC01898 - LINC01893,Ovarian cancer (MTAG),ovarian carcinoma,rs78286182
+cluster_chr18_1,1,75983892,76012716,18,76000481,rs143894017,3e-6,1.14783,35386118,LINC01898 - LINC01893,White matter lesions (Fazekas score),white matter lesion progression measurement,rs143894017
