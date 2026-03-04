@@ -32,3 +32,11 @@ app/LD_Inspector/www/plink19
 .DS_Store
 **/.DS_Store
 .Rhistory
+
+# logs & runtime
+app/_logs/
+**/_logs/
+*_runtime.log
+*.log
+.Rhistory
+.RData
