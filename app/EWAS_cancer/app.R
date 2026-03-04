@@ -1,9 +1,9 @@
 # app.R — EWAS Inspector Cancer (GWAS clusters + EWAS significant cancer bins)
-# include clustering methos and save csv as input for LD
+# /Volumes/DISK1TB/Inspector_app_slaves_ngroc/GItools/app/EWAS_cancer/app.R
 options(shiny.maxRequestSize = 1024*1024^2)
 # /Volumes/DISK1TB/Inspector_app_slaves_github/GItools/app/EWAS_cancer/app.R
 
-library(shiny)
+library(shiny) 
 library(readr)
 library(dplyr)
 library(stringr)
@@ -31,6 +31,34 @@ library(AnnotationDbi)
 library(org.Hs.eg.db)
 
 txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+# ===========================
+# Runtime logging (EARLY)
+# ===========================
+APP_KEY <- "ewastum"  # <- canvia: catalog / nonsyn / ewastum / ewasdis
+
+APP_LOG_DIR <- Sys.getenv("GITOOLS_LOG_DIR", "")
+if (!nzchar(APP_LOG_DIR)) {
+  APP_LOG_DIR <- file.path(dirname(getwd()), "_logs")  # -> GItools/app/_logs
+}
+dir.create(APP_LOG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+APP_LOG <- file.path(APP_LOG_DIR, paste0(APP_KEY, "_runtime.log"))
+
+applog <- function(...) {
+  cat(paste0(..., collapse = ""), "\n", file = APP_LOG, append = TRUE)
+}
+
+applog("[", APP_KEY, "] boot @ ", format(Sys.time()), " wd=", getwd(),
+       " pid=", Sys.getpid(),
+       " host=", getOption("shiny.host"),
+       " port=", getOption("shiny.port"))
+
+# Captura errors de Shiny al log
+options(shiny.error = function() {
+  applog("[", APP_KEY, "][ERROR] ", format(Sys.time()))
+  applog(paste(capture.output(sys.calls()), collapse = "\n"))
+})
 
 # ============================================================
 # GItools portable config
@@ -99,6 +127,46 @@ enrich_file <- file.path(gi_shared_root, "mod_ewas_enrichment.R")
 stopifnot(file.exists(enrich_file))
 source(enrich_file, local = TRUE)
 
+# --- EWAS nearby genes helpers (portable via _shared) ---
+genes_file <- file.path(gi_shared_root, "gi_ewas_genes_nearby.R")
+stopifnot(file.exists(genes_file))
+source(genes_file, local = TRUE)
+stopifnot(exists("ewas_genes_for_enrichment"), exists("ewas_bins_nearby_genes"))
+
+# ------------------------------------------------------------
+# Wrapper esperat pel mòdul: gi_ewas_genes_nearby()
+# Usa el teu codi ewas_bins_nearby_genes() + TxDb hg38
+# Retorna una taula "detail" amb 'gene' (per a downstream)
+# ------------------------------------------------------------
+gi_ewas_genes_nearby <- function(bins_df, flank_bp = 25000L) {
+  
+  # TxDb hg38
+  txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene::TxDb.Hsapiens.UCSC.hg38.knownGene
+  
+  out <- ewas_bins_nearby_genes(
+    bins_df       = bins_df,
+    txdb          = txdb,
+    flank_bp      = as.integer(flank_bp),
+    return_ids    = "ENTREZID",
+    keep_all_bins = TRUE
+  )
+  
+  gdf <- out$detail
+  if (is.data.frame(gdf) && nrow(gdf)) {
+    # Normalitza columna per al teu mòdul (gene o symbol)
+    if (!"gene" %in% names(gdf)) {
+      if ("SYMBOL" %in% names(gdf)) gdf$gene <- gdf$SYMBOL
+      else if ("ENTREZID" %in% names(gdf)) gdf$gene <- gdf$ENTREZID
+    }
+  }
+  
+  gdf
+}
+
+
+
+
+#---------------------------------------------------
 # Accepta qualsevol dels noms històrics i crea alias estàndard
 if (exists("mod_ewas_enrich_ui") && !exists("mod_ewas_enrichment_ui")) {
   mod_ewas_enrichment_ui <- mod_ewas_enrich_ui
@@ -645,7 +713,7 @@ ui <- navbarPage(
   ),
   
   tabPanel(
-    title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>Cancer/Tumor analysis</span>"),
+    title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>Analysis</span>"),
     
     sidebarLayout(
       sidebarPanel(
@@ -684,7 +752,7 @@ ui <- navbarPage(
         # -----------------------------
         conditionalPanel(
           condition = "input.cluster_method == 'window'",
-          sliderInput("pthr", "-log10(P) threshold", min = 2, max = 20, value = 5, step = 0.5),
+          sliderInput("pthr", "-log10(P) threshold", min = 2, max = 20, value = 8, step = 0.5),
           numericInput("flank", "Flank (+/- bp)", value = 10000, min = 0, max = 10000000, step = 1000)
         ),
         
@@ -703,7 +771,7 @@ ui <- navbarPage(
           ),
           
           sliderInput("min_logp", "-log10(P) threshold (hit significance)",
-                      min = 2, max = 20, value = 5, step = 0.1),
+                      min = 2, max = 20, value = 8, step = 0.5),
           
           numericInput("min_hits", "Minimum GWAS hits per cluster/window",
                        value = 3, min = 1, max = 1000, step = 1),
@@ -881,25 +949,169 @@ ui <- navbarPage(
       )
     )
   ),
-  
-  # ==========================
-  # TAB PRINCIPAL 2 (LD)
-  # ==========================
   tabPanel(
-    title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>🧩 LD</span>"),
-    ld_module_ui("ld")
+    title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>🧩 Table genes</span>"),
+    tags$hr(),
+    div(class="panel-lite", withSpinner(DT::DTOutput("genes_nearby_debug"))),
   ),
+  # ========================================================================
+  # TAB — ENRICHMENT (Disease/Trait + GO/KEGG/GoSlim)
+  #   FIX: keep a SINGLE uiOutput("enrich_bg_note") at the top (no duplicates)
+  # ========================================================================
+  
   tabPanel(
     title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>✳️ Enrichment</span>"),
-    mod_ewas_enrich_ui("enrich")
-  )
+    value = "tab_enrichment",
+    
+    # NOTE: single instance (visible for BOTH sub-tabs)
+    div(class = "panel-lite", uiOutput("enrich_bg_note")),
+    
+    tabsetPanel(
+      id = "enrich_main_tabs",
+      
+      # ------------------------------------
+      # (A) Disease enrichment (module)
+      # ------------------------------------
+      tabPanel(
+        title = HTML("<span style='font-size:15px; font-weight:600;'>🧫 Disease/Trait</span>"),
+        value = "tab_enrich_disease",
+        mod_ewas_enrich_ui("enrich")
+      ),
+      
+      # ------------------------------------
+      # (B) Functional enrichment: GO / KEGG / GoSlim
+      # ------------------------------------
+      tabPanel(
+        title = HTML("<span style='font-size:15px; font-weight:600;'>🧬 GO/KEGG/GoSlim</span>"),
+        value = "tab_enrich_func",
+        
+        sidebarLayout(
+          sidebarPanel(
+            width = 3,
+            
+            radioButtons(
+              "func_scope", "Scope",
+              choices  = c("Global" = "global", "Cluster" = "cluster"),
+              selected = "global"
+            ),
+            
+            conditionalPanel(
+              condition = "input.func_scope == 'cluster'",
+              uiOutput("func_cluster_ui")
+            ),
+            
+            tags$hr(),
+            
+            selectInput(
+              "enrich_background", "Background",
+              choices  = c("Reference annotated genes" = "orgdb", "Dataset genes" = "dataset"),
+              selected = "orgdb"
+            ),
+            
+            numericInput(
+              "enrich_pcut",
+              "FDR cutoff",
+              value = 0.05,
+              min = 0,
+              max = 1,
+              step = 0.01
+            ),
+            
+            # GO controls (GO + GoSlim)
+            conditionalPanel(
+              condition = "input.enrich_tabs == 'tab_enrich_go' || input.enrich_tabs == 'tab_enrich_goslim'",
+              checkboxGroupInput(
+                "go_ontos",
+                "GO ontologies",
+                choices  = c("BP", "CC", "MF"),
+                selected = c("BP", "CC", "MF"),
+                inline   = TRUE
+              ),
+              numericInput("go_topn", "Top terms per ontology", value = 10, min = 1, max = 50, step = 1)
+            ),
+            
+            # GO-only extras
+            conditionalPanel(
+              condition = "input.enrich_tabs == 'tab_enrich_go'",
+              checkboxInput("go_simplify", "Simplify GO terms (optional)", value = FALSE)
+            ),
+            
+            # KEGG-only controls
+            conditionalPanel(
+              condition = "input.enrich_tabs == 'tab_enrich_kegg'",
+              numericInput("enrich_kegg_top", "Top KEGG pathways", value = 15, min = 1, max = 50, step = 1)
+            ),
+            
+            # GoSlim-only controls (NECESSARI per goslim_bar)
+            conditionalPanel(
+              condition = "input.enrich_tabs == 'tab_enrich_goslim'",
+              numericInput("go_class_top", "Top GoSlim terms per ontology", value = 15, min = 1, max = 50, step = 1)
+            ),
+            
+            tags$hr(),
+            
+            actionButton("info_12", "ℹ️ GSSize"),
+            numericInput("enrich_min_gs", "minGSSize", value = 10, min = 1, step = 1),
+            numericInput("enrich_max_gs", "maxGSSize", value = 500, min = 10, step = 10),
+            
+            tags$hr(),
+            
+            actionButton(
+              "run_enrich",
+              label = "Run enrichment",
+              icon  = icon("play"),
+              class = "btn btn-primary"
+            )
+          ),
+          
+          mainPanel(
+            width = 9,
+            
+            # IMPORTANT: removed duplicate uiOutput("enrich_bg_note") from here
+            
+            tabsetPanel(
+              id = "enrich_tabs",
+              
+              tabPanel(
+                title = HTML("<span style='font-size:15px; font-weight:600;'>GO</span>"),
+                value = "tab_enrich_go",
+                div(class = "panel-lite", withSpinner(plotlyOutput("go_bar", height = 400))),
+                tags$hr(),
+                div(class = "panel-lite", withSpinner(DT::DTOutput("go_table")))
+              ),
+              
+              tabPanel(
+                title = HTML("<span style='font-size:15px; font-weight:600;'>KEGG</span>"),
+                value = "tab_enrich_kegg",
+                div(class = "panel-lite", withSpinner(plotlyOutput("kegg_bar", height = 400))),
+                tags$hr(),
+                div(class = "panel-lite", withSpinner(DT::DTOutput("kegg_table")))
+              ),
+              
+              tabPanel(
+                title = HTML("<span style='font-size:15px; font-weight:600;'>GoSlim</span>"),
+                value = "tab_enrich_goslim",
+                div(class = "panel-lite", withSpinner(plotlyOutput("goslim_bar", height = "450px"))),
+                tags$hr(),
+                div(class = "panel-lite", withSpinner(DT::DTOutput("goslim_table")))
+              )
+            )
+          )
+        )
+      )
+    )
+  ),
+      tabPanel(
+        title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>🧩 LD</span>"),
+        # opcional: si vols que LD tingui sidebar + main:
+        # sidebarLayout(sidebarPanel(...), mainPanel(ld_module_ui("ld")))
+        ld_module_ui("ld")
+    )
 )
-
 # -----------------------------
 # Server
 # -----------------------------
 server <- function(input, output, session) {
-
 
   #----------------------------------------------
   # -----------------------------
@@ -917,6 +1129,7 @@ server <- function(input, output, session) {
     source(file.path(SHARED, "gi_state.R"), local = TRUE)
   }
 
+ 
   # -----------------------------
   # Shared reactive holders (filled by Hub OR local upload)
   # -----------------------------
@@ -1144,17 +1357,9 @@ server <- function(input, output, session) {
     out
   })
 
-# -----------------------------
-# Canonical cluster init (local build_ranges)
-# -----------------------------
-gi_cl <- gi_clusters_canonical_init(
-  session = session, input = input, output = output,
-  gwas_df = gwas_df,
-  build_btn_id   = "build_ranges",
-  clusters_dt_id = "cluster_dt",
-  hits_rows_id   = "hits_tbl_rows_selected",
-  app_count_col  = "n_EWAS_bins"
-)
+## -----------------------------
+## Canonical cluster init (local build_ranges)
+## -----------------------------
 
 # keep placeholders in sync with canonical engine (local clustering)
 shiny::observeEvent(gi_cl$clusters_cur(), {
@@ -1815,8 +2020,11 @@ shiny::observeEvent(gi_cl$intervals_raw(), {
           }
         }
         
-        rv$ewas_bins_all   <- rbindlist(all_bins_list, fill = TRUE)
-        rv$ewas_detail_all <- rbindlist(all_detail_list, fill = TRUE)
+        rv$ewas_bins_all <- as.data.frame(data.table::rbindlist(all_bins_list, fill = TRUE))
+        rv$ewas_detail_all <- as.data.frame(data.table::rbindlist(all_detail_list, fill = TRUE))
+        
+      #  rv$ewas_bins_all   <- rbindlist(all_bins_list, fill = TRUE)
+      #  rv$ewas_detail_all <- rbindlist(all_detail_list, fill = TRUE)
       })
       
       counts <- data.table(cluster_id = character(), n_EWAS_bins = integer())
@@ -3064,349 +3272,7 @@ $(document).on('click', '#giCancerPopup .cancerPick', function(e){
   # -----------------------------
   # p_violin_sel  (robust)
   # -----------------------------
-  
-  output$p_violin_selXXXXXXX <- plotly::renderPlotly({
-    req(rv$ewas_sub_full, rv$meta, rv$coord, rv$cancer_sel)
-    validate(need(file.exists(rv$ewas_sub_full), "Subset file not found (run cluster selection again)."))
-    
-    cancer_name <- as.character(rv$cancer_sel)
-    
-    # -----------------------------
-    # Params
-    # -----------------------------
-    bin_size <- max(1000L, as.integer(input$bin_size))
-    alpha    <- as.numeric(input$alpha_any)
-    min_n    <- as.integer(input$min_n_any)
-    min_cpg  <- as.integer(input$min_cpg_any)
-    test_m   <- as.character(input$bin_test_any)
-    use_adj  <- isTRUE(input$use_adj_as_ctl)
-    
-    test_name <- if (identical(test_m, "ttest")) "t-test" else "Wilcoxon"
-    
-    chr_tc <- rv$ewas_chr
-    st0    <- as.integer(rv$ewas_st)
-    en0    <- as.integer(rv$ewas_en)
-    
-    # -----------------------------
-    # 1) Read subset (CpG rows)
-    # -----------------------------
-    dt_all <- data.table::fread(
-      rv$ewas_sub_full,
-      na.strings   = c("NA","<NA>","NaN",""),
-      check.names  = FALSE,
-      showProgress = FALSE
-    )
-    
-    beta_dt <- dt_all[grepl("^cg\\d{8}$", sample_id)]
-    validate(need(nrow(beta_dt) > 0, "Subset has 0 CpG rows."))
-    
-    samp_cols <- setdiff(names(beta_dt), "sample_id")
-    validate(need(length(samp_cols) > 0, "Subset has 0 sample columns."))
-    
-    beta_dt[, (samp_cols) := lapply(.SD, suppressWarnings(as.numeric)), .SDcols = samp_cols]
-    beta_mat_all <- as.matrix(beta_dt[, ..samp_cols])
-    rownames(beta_mat_all) <- beta_dt$sample_id
-    
-    # -----------------------------
-    # 2) CpG positions + bins
-    # -----------------------------
-    coord2 <- rv$coord[chr == chr_tc & pos >= st0 & pos <= en0]
-    validate(need(nrow(coord2) > 0, "No coord rows for this chr/interval."))
-    
-    pos_vec <- coord2$pos[match(rownames(beta_mat_all), coord2$probe)]
-    keep <- is.finite(pos_vec)
-    
-    beta_mat_all <- beta_mat_all[keep, , drop = FALSE]
-    pos_vec <- as.integer(pos_vec[keep])
-    validate(need(nrow(beta_mat_all) > 0, "No CpGs with valid hg38 position in this interval."))
-    
-    bin_start <- st0 + ((pos_vec - st0) %/% bin_size) * bin_size
-    bin_mid   <- bin_start + bin_size/2
-    
-    bin_starts_all <- seq(st0, en0, by = bin_size)
-    bin_mids_all   <- bin_starts_all + bin_size/2
-    
-    # -----------------------------
-    # 3) Mean beta per sample per bin (sb)
-    # -----------------------------
-    idx_list <- split(seq_along(bin_mid), bin_mid)
-    idx_list <- idx_list[vapply(idx_list, length, 1L) >= min_cpg]
-    validate(need(length(idx_list) > 0, "No bins pass min CpGs/bin."))
-    
-    sb_list <- lapply(names(idx_list), function(bm) {
-      ii <- idx_list[[bm]]
-      mb <- colMeans(beta_mat_all[ii, , drop = FALSE], na.rm = TRUE)
-      data.table::data.table(
-        bin_mid   = as.numeric(bm),
-        sample_id = colnames(beta_mat_all),
-        mean_beta = as.numeric(mb),
-        n_cpg     = length(ii)
-      )
-    })
-    sb <- data.table::rbindlist(sb_list, use.names = TRUE, fill = TRUE)
-    sb <- sb[is.finite(mean_beta) & mean_beta >= 0 & mean_beta <= 1]
-    validate(need(nrow(sb) > 0, "No valid mean_beta values in bins."))
-    
-    # -----------------------------
-    # 4) Samples: tumor vs control (for selected cancer)
-    # -----------------------------
-    meta0 <- data.table::as.data.table(rv$meta)
-    meta0[, disease := as.character(disease)]
-    meta0[, sample_type := as.character(sample_type)]
-    meta0[, sample_id := as.character(sample_id)]
-    
-    meta_c <- meta0[
-      disease == cancer_name &
-        sample_type %in% c("disease tissue","control","adjacent normal"),
-      .(sample_id, sample_type)
-    ]
-    meta_c <- unique(meta_c, by = "sample_id")
-    validate(need(nrow(meta_c) > 0, paste0("No samples found for selected cancer: ", cancer_name)))
-    
-    tum_ids <- as.character(meta_c[sample_type == "disease tissue", sample_id])
-    ctl_ids <- as.character(meta_c[sample_type == "control", sample_id])
-    adj_ids <- as.character(meta_c[sample_type == "adjacent normal", sample_id])
-    
-    if (length(ctl_ids) == 0 && isTRUE(use_adj) && length(adj_ids) > 0) {
-      ctl_ids <- adj_ids
-    } else {
-      ctl_ids <- unique(c(ctl_ids, adj_ids))
-    }
-    
-    validate(need(length(tum_ids) > 0 && length(ctl_ids) > 0,
-                  "Selected cancer has no tumor/control (check use_adj_as_ctl)."))
-    
-    tum_ids <- intersect(colnames(beta_mat_all), tum_ids)
-    ctl_ids <- intersect(colnames(beta_mat_all), ctl_ids)
-    validate(need(length(tum_ids) >= 2 && length(ctl_ids) >= 2,
-                  "Not enough tumor/control columns in subset for plots."))
-    
-    # -----------------------------
-    # 5) Bin tests + BH (pdt) using sb
-    # -----------------------------
-    sb_c <- sb[sample_id %in% c(tum_ids, ctl_ids)]
-    validate(need(nrow(sb_c) > 0, "No beta values after filtering tumor/control samples."))
-    
-    sb_c[, grp := data.table::fifelse(sample_id %in% tum_ids, "tumor", "control")]
-    sb_c[, grp := factor(grp, levels = c("control","tumor"))]
-    
-    pdt <- sb_c[, .(
-      n_tum = sum(grp == "tumor"),
-      n_ctl = sum(grp == "control"),
-      p = {
-        x <- mean_beta[grp == "tumor"]
-        y <- mean_beta[grp == "control"]
-        if (length(x) < min_n || length(y) < min_n) NA_real_ else {
-          if (identical(test_m, "ttest")) {
-            tryCatch(t.test(x, y)$p.value, error = function(e) NA_real_)
-          } else {
-            tryCatch(wilcox.test(x, y, exact = FALSE)$p.value, error = function(e) NA_real_)
-          }
-        }
-      }
-    ), by = .(bin_mid)]
-    pdt[, padj := p.adjust(p, method = "BH")]
-    
-    # resum per títol
-    padj_min <- suppressWarnings(min(pdt$padj, na.rm = TRUE))
-    if (!is.finite(padj_min)) padj_min <- NA_real_
-    
-    i_min <- suppressWarnings(which.min(pdt$padj))
-    bin_min <- if (length(i_min) && is.finite(pdt$padj[i_min])) pdt$bin_mid[i_min] else NA_real_
-    
-    padj_txt <- if (is.na(padj_min)) "NA" else formatC(padj_min, format = "e", digits = 2)
-    bin_txt  <- if (is.na(bin_min))  "NA" else format(round(bin_min), scientific = FALSE)
-    
-    sig_sel <- unique(pdt[is.finite(padj) & padj < alpha, bin_mid])
-    validate(need(length(sig_sel) > 0,
-                  paste0("No significant bins for selected cancer at BH<", alpha)))
-    
-    # -----------------------------
-    # 6) Violin data: only sig bins (same as disease)
-    # -----------------------------
-    vdat <- sb_c[bin_mid %in% sig_sel]
-    validate(need(nrow(vdat) > 0, "No rows for significant bins (violin)."))
-    
-    vdat[, hover := paste0(
-      "bin_mid=", format(bin_mid, scientific = FALSE),
-      "<br>grp=", grp,
-      "<br>mean_beta=", signif(mean_beta, 4),
-      "<br>n_cpg=", n_cpg
-    )]
-    
-    # -----------------------------
-    # 7) CpG-level Δbeta scatter (only CpGs in sig bins)
-    # -----------------------------
-    mean_tum <- rowMeans(beta_mat_all[, tum_ids, drop = FALSE], na.rm = TRUE)
-    mean_ctl <- rowMeans(beta_mat_all[, ctl_ids, drop = FALSE], na.rm = TRUE)
-    
-    res_cpg <- data.table::data.table(
-      probe      = rownames(beta_mat_all),
-      pos        = as.integer(pos_vec),
-      delta_beta = as.numeric(mean_tum - mean_ctl)
-    )
-    res_cpg <- res_cpg[is.finite(pos) & is.finite(delta_beta)]
-    
-    # assign CpG to bin (same scheme)
-    res_cpg[, bin_start := st0 + ((pos - st0) %/% bin_size) * bin_size]
-    res_cpg[, bin_mid   := bin_start + bin_size/2]
-    
-    # keep only sig bins (match violins)
-    res_cpg <- res_cpg[bin_mid %in% sig_sel]
-    validate(need(nrow(res_cpg) > 0, "No CpGs found inside significant bins (unexpected)."))
-    
-    res_cpg[, hyper_hypo := data.table::fifelse(
-      delta_beta > 0, "hyper",
-      data.table::fifelse(delta_beta < 0, "hypo", "no_change")
-    )]
-    
-    res_cpg[, hover2 := paste0(
-      "probe=", probe,
-      "<br>pos=", pos,
-      "<br>Δbeta=", signif(delta_beta, 4),
-      "<br>", hyper_hypo
-    )]
-    
-    # top CpGs for labels
-    topN <- 20L
-    top  <- res_cpg[order(-abs(delta_beta))][1:min(topN, .N)]
-    
-    # (optional) tiny jitter to reduce overplotting but keep bin alignment
-    set.seed(1)
-    res_cpg[, x_jit := bin_mid + stats::runif(.N, -0.025*bin_size, 0.025*bin_size)]
-    top[,    x_jit := bin_mid + stats::runif(.N, -0.025*bin_size, 0.025*bin_size)]
-    
-    # -----------------------------
-    # 8) Shared X ticks (kb labels)
-    # -----------------------------
-    n_bins <- length(bin_mids_all)
-    max_labels <- 25L
-    kk <- max(1L, as.integer(ceiling(n_bins / max_labels)))
-    keep_idx <- seq.int(1L, n_bins, by = kk)
-    
-    tickvals <- as.numeric(bin_mids_all[keep_idx])
-    ticktext <- paste0(round((tickvals - st0)/1000, 0), "kb")
-    
-    # restrict x-range to sig bins
-    xr <- c(min(sig_sel), max(sig_sel))
-    
-    # -----------------------------
-    # 9) Plotly violin (2 traces, side-by-side)
-    # -----------------------------
-    p_violin <- plotly::plot_ly() %>%
-      plotly::add_trace(
-        data = vdat[grp == "control"],
-        type = "violin",
-        x = ~bin_mid, y = ~mean_beta,
-        name = "control",
-        text = ~hover, hoverinfo = "text",
-        box = list(visible = TRUE),
-        meanline = list(visible = TRUE),
-        points = "outliers",
-        legendgroup = "control",
-        offsetgroup = "control",
-        side = "negative",
-        width = 0.55,
-        fillcolor = "darkgreen",
-        line = list(color = "black")
-      ) %>%
-      plotly::add_trace(
-        data = vdat[grp == "tumor"],
-        type = "violin",
-        x = ~bin_mid, y = ~mean_beta,
-        name = "tumor",
-        text = ~hover, hoverinfo = "text",
-        box = list(visible = TRUE),
-        meanline = list(visible = TRUE),
-        points = "outliers",
-        legendgroup = "tumor",
-        offsetgroup = "tumor",
-        side = "positive",
-        width = 0.55,
-        fillcolor = "#ff7f00",
-        line = list(color = "black")
-      ) %>%
-      plotly::layout(
-        yaxis = list(title = "Mean beta per sample (bin)"),
-      )
-    
-    # -----------------------------
-    # 10) Plotly scatter (Δbeta per CpG, shared x)
-    # -----------------------------
-    p_scatter <- plotly::plot_ly(
-      data = res_cpg,
-      type = "scatter",
-      mode = "markers",
-      x = ~bin_mid,     # or ~x_jit if you prefer jitter
-      y = ~delta_beta,
-      color = ~hyper_hypo,
-      colors = c("hypo" = "darkblue", "hyper" = "red", "no_change" = "gray70"),
-      text = ~hover2, hoverinfo = "text",
-      marker = list(size = 5, opacity = 0.75),
-      showlegend = FALSE
-    ) %>%
-      plotly::add_lines(
-        x = xr, y = c(0, 0),
-        inherit = FALSE,
-        line = list(width = 1),
-        showlegend = FALSE,
-        hoverinfo = "skip"
-      ) %>%
-      plotly::add_trace(
-        data = top,
-        type = "scatter",
-        mode = "markers+text",
-        x = ~bin_mid,
-        y = ~delta_beta,
-        text = ~probe,
-        textposition = "top center",
-        marker = list(size = 7),
-        showlegend = FALSE
-      ) %>%
-      plotly::layout(
-        yaxis = list(title = "Δbeta (tumor − control)")
-      )
-    
-    # -----------------------------
-    # 11) Subplot (shared X)
-    # -----------------------------
-    plotly::subplot(
-      p_violin, p_scatter,
-      nrows = 2,
-      shareX = TRUE,
-      heights = c(0.58, 0.42),
-      titleX = TRUE
-    ) %>%
-      plotly::layout(
-        title = list(
-          text = paste0(
-            cancer_name, " — ", chr_tc, ":", st0, "-", en0,
-            "\n| BH<", alpha,
-            " | min BH padj=", padj_txt,
-            " | Test: ", test_name
-          ),
-          font = list(size = 12),
-          y = 0.95, yanchor = "top"
-        ),
-        margin = list(t = 90),
-        legend = list(
-          orientation = "h",
-          x = 0, xanchor = "left",
-          y = 0.92, yanchor = "top"
-        ),
-        xaxis = list(
-          title = paste0("Bin midpoints (hg38) — bin_size=", bin_size, " bp"),
-          tickmode = "array",
-          tickvals = tickvals,
-          ticktext = ticktext,
-          tickangle = 90,
-          range = xr
-        ),
-        yaxis  = list(title = "Mean beta per sample (bin)"),
-        yaxis2 = list(title = "Δbeta (tumor − control)")
-      )
-  })
-  
+
   # =========================
   # p_violin_sel (FOCUSED BIN) — EWAS TUMOR/CANCER
   # - Violin: mean beta per sample for ONE focused bin (control vs tumor)
@@ -3695,8 +3561,8 @@ $(document).on('click', '#giCancerPopup .cancerPick', function(e){
         side = "positive"
       ) %>%
       plotly::layout(
-        yaxis = list(title = "Mean beta per sample (bin)"),
-        violinmode = "overlay"  # best for split violins
+        yaxis = list(title = "Mean beta per sample (bin)")
+      #  violinmode = "overlay"  # best for split violins
       )
     
     # -----------------------------
@@ -5686,8 +5552,1382 @@ which(names(show_df)=="hyper_hypo")-1,col_hh_raw
     app_mode   = reactive("tumor"),
     ref_paths  = ref_paths
   )
+  
+#-------------------------------------------------------------------------------
   #### ---------------------------------------------------------------------------
-
+  #### ---------------- GO/KEGG/GoSlim ENRICHMENT MODULE (FINAL) -----------------
+  #### ---------------------------------------------------------------------------
+  
+  # ===========================
+  # bins_for_enrich() — EWAS Cancer
+  # Source of truth:
+  #   - rv$ewas_bins_all (ALL clusters)  [preferred]
+  #   - rv$ewas_bins     (selected cluster)
+  # ===========================
+  bins_for_enrich <- reactive({
+    
+    b <- NULL
+    if (is.data.frame(rv$ewas_bins_all) && nrow(rv$ewas_bins_all) > 0) {
+      b <- rv$ewas_bins_all
+    } else if (is.data.frame(rv$ewas_bins) && nrow(rv$ewas_bins) > 0) {
+      b <- rv$ewas_bins
+    } else {
+      return(data.frame())
+    }
+    
+    # IMPORTANT: copia per evitar modificacions by-reference
+    b <- data.table::as.data.table(data.table::copy(b))
+    
+    need_cols <- c("cluster_id","chr","bin_start","bin_end","bin_mid",
+                   "n_cancers","cancers","best_padj","best_cancer","best_delta")
+    miss <- setdiff(need_cols, names(b))
+    if (length(miss)) return(data.frame())
+    
+    # Tipus coherents
+    b[, cluster_id  := as.character(cluster_id)]
+    b[, chr         := as.character(chr)]
+    b[, bin_start   := as.integer(bin_start)]
+    b[, bin_end     := as.integer(bin_end)]
+    b[, bin_mid     := as.numeric(bin_mid)]
+    b[, n_cancers   := as.integer(n_cancers)]
+    b[, cancers     := as.character(cancers)]
+    b[, best_padj   := as.numeric(best_padj)]
+    b[, best_cancer := as.character(best_cancer)]
+    b[, best_delta  := as.numeric(best_delta)]
+    
+    # Neteja bàsica
+    b <- b[!is.na(cluster_id) & nzchar(cluster_id)]
+    b <- b[!is.na(chr) & nzchar(chr)]
+    b <- b[is.finite(bin_start) & is.finite(bin_end) & bin_end > bin_start]
+    b <- b[is.finite(best_padj)]
+    
+    # Alias start/end
+    if (!"start" %in% names(b)) b[, start := bin_start]
+    if (!"end"   %in% names(b)) b[, end   := bin_end]
+    
+    # disease canònica
+    if (!"disease" %in% names(b)) b[, disease := best_cancer]
+    
+    as.data.frame(b)
+  })
+  
+  # ============================================================
+  # EWAS · genes nearby (per enrichment)  ✅ FIXED & CLEAN
+  #   - calcula ALWAYS quan hi ha bins
+  #   - omple rv$genes_nearby_df (compat amb la resta de mòduls)
+  #   - omple rv$genes_for_enrich
+  #   - debug: rv$genes_debug + output$genes_nearby_debug
+  # ============================================================
+  
+  # 1) Bins que vols usar per genes/enrichment
+  bins_for_genes <- reactive({
+    b <- tryCatch(bins_for_enrich(), error = function(e) NULL)
+    if (!is.data.frame(b) || !nrow(b)) return(NULL)
+    b
+  })
+  
+  # 2) Wrapper de compute (si el teu source exposa ewas_bins_nearby_genes())
+  #    IMPORTANT: NO toquem chr; la funció ja normalitza (2/chr2/CHR2)
+  if (!exists("gi_ewas_genes_nearby", inherits = TRUE)) {
+    gi_ewas_genes_nearby <- function(bins_df, flank_bp = 25000L) {
+      validate(need(exists("ewas_bins_nearby_genes", inherits = TRUE),
+                    "ewas_bins_nearby_genes() not found. Source gi_ewas_genes_nearby.R missing?"))
+      validate(need(requireNamespace("TxDb.Hsapiens.UCSC.hg38.knownGene", quietly = TRUE),
+                    "TxDb.Hsapiens.UCSC.hg38.knownGene required."))
+      
+      txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene::TxDb.Hsapiens.UCSC.hg38.knownGene
+      
+      out <- ewas_bins_nearby_genes(
+        bins_df       = bins_df,
+        txdb          = txdb,
+        flank_bp      = as.integer(flank_bp),
+        return_ids    = "ENTREZID",
+        keep_all_bins = TRUE
+      )
+      
+      gdf <- out$detail
+      if (is.data.frame(gdf) && nrow(gdf)) {
+        # compat: garantir columna gene per la resta de mòduls
+        if (!"gene" %in% names(gdf)) {
+          if ("SYMBOL" %in% names(gdf)) gdf$gene <- gdf$SYMBOL
+          else if ("symbol" %in% names(gdf)) gdf$gene <- gdf$symbol
+          else if ("ENTREZID" %in% names(gdf)) gdf$gene <- gdf$ENTREZID
+        }
+      }
+      gdf
+    }
+  }
+  
+  # 3) Reactive de resultats bin ↔ genes
+  genes_nearby_df <- reactive({
+    b <- bins_for_genes()
+    if (is.null(b)) return(NULL)
+    
+    # assegura chr/start/end
+    if (!"start" %in% names(b) && "bin_start" %in% names(b)) b$start <- b$bin_start
+    if (!"end"   %in% names(b) && "bin_end"   %in% names(b)) b$end   <- b$bin_end
+    
+    validate(need(all(c("chr","start","end") %in% names(b)),
+                  "bins_for_enrich() must contain chr/start/end."))
+    
+    b$chr   <- as.character(b$chr)
+    b$start <- suppressWarnings(as.integer(b$start))
+    b$end   <- suppressWarnings(as.integer(b$end))
+    
+    validate(need(all(is.finite(b$start)) && all(is.finite(b$end)), "start/end must be numeric/integer."))
+    
+    gi_ewas_genes_nearby(bins_df = b, flank_bp = 25000L)
+  })
+  
+  # 4) Omple rv$genes_nearby_df i rv$genes_for_enrich (compat amb codi existent)
+  rv$genes_debug <- NULL
+  
+  observeEvent(genes_nearby_df(), {
+    gdf <- genes_nearby_df()
+    
+    if (!is.data.frame(gdf) || !nrow(gdf)) {
+      rv$genes_nearby_df  <- NULL
+      rv$genes_for_enrich <- character(0)
+      rv$genes_debug <- list(
+        t = format(Sys.time(), "%H:%M:%S"),
+        n_bins = if (!is.null(bins_for_genes())) nrow(bins_for_genes()) else 0,
+        n_rows = 0,
+        n_genes = 0,
+        note = "genes_nearby_df empty (no overlaps or compute failed)"
+      )
+      return()
+    }
+    
+    rv$genes_nearby_df <- gdf
+    
+    gene_col <- if ("gene" %in% names(gdf)) "gene" else if ("SYMBOL" %in% names(gdf)) "SYMBOL" else if ("symbol" %in% names(gdf)) "symbol" else NULL
+    validate(need(!is.null(gene_col), "genes-nearby output must have gene/SYMBOL/symbol."))
+    
+    rv$genes_for_enrich <- unique(na.omit(as.character(gdf[[gene_col]])))
+    
+    rv$genes_debug <- list(
+      t = format(Sys.time(), "%H:%M:%S"),
+      n_bins = if (!is.null(bins_for_genes())) nrow(bins_for_genes()) else 0,
+      chr_example = paste(head(unique(as.character(bins_for_genes()$chr)), 6), collapse = ","),
+      n_rows = nrow(gdf),
+      n_genes = length(unique(na.omit(as.character(gdf[[gene_col]])))),
+      gene_col = gene_col
+    )
+  }, ignoreInit = TRUE)
+  
+  # 5) Helper (mantinc el teu nom, però ara és únic i consistent)
+  genes_for_enrich <- reactive({
+    x <- rv$genes_for_enrich
+    if (is.null(x)) character(0) else x
+  })
+  
+  # ============================================================
+  # DEBUG DT: mostra bin ↔ genes (REAL)
+  # ============================================================
+  output$genes_nearby_debug <- DT::renderDT({
+    gdf <- rv$genes_nearby_df
+    
+    if (!is.data.frame(gdf) || !nrow(gdf)) {
+      dbg <- rv$genes_debug
+      msg <- if (is.list(dbg)) {
+        paste0(
+          "rv$genes_nearby_df is EMPTY | ",
+          "t=", dbg$t %||% "NA",
+          " | n_bins=", dbg$n_bins %||% 0,
+          " | note=", dbg$note %||% "NA"
+        )
+      } else {
+        "rv$genes_nearby_df is EMPTY (genes not computed yet)"
+      }
+      
+      return(DT::datatable(
+        data.frame(Message = msg),
+        options = list(dom = "t"),
+        rownames = FALSE
+      ))
+    }
+    
+    # Ensure required columns exist / map names
+    if (!"bin_start" %in% names(gdf) && "start" %in% names(gdf)) gdf$bin_start <- gdf$start
+    if (!"bin_end"   %in% names(gdf) && "end"   %in% names(gdf)) gdf$bin_end   <- gdf$end
+    if (!"disease" %in% names(gdf) && "best_cancer" %in% names(gdf)) gdf$disease <- gdf$best_cancer
+    
+    # Ensure gene column
+    if (!"gene" %in% names(gdf)) {
+      if ("SYMBOL" %in% names(gdf)) gdf$gene <- gdf$SYMBOL else gdf$gene <- NA_character_
+    }
+    
+    # Ensure best_delta exists
+    if (!"best_delta" %in% names(gdf)) gdf$best_delta <- NA_real_
+    
+    keep <- c(
+      "cluster_id","chr","bin_start","bin_end",
+      "SYMBOL","gene","dist_to_gene_bp",
+      "best_padj","best_delta","disease"
+    )
+    keep <- keep[keep %in% names(gdf)]
+    out <- gdf[, keep, drop = FALSE]
+    
+    # Format best_padj (2 sig. digits)
+    if ("best_padj" %in% names(out)) {
+      out$best_padj <- suppressWarnings(as.numeric(out$best_padj))
+      out$best_padj <- ifelse(is.finite(out$best_padj), sprintf("%.2g", out$best_padj), NA_character_)
+    }
+    
+    # best_delta numeric (optional)
+    if ("best_delta" %in% names(out)) {
+      out$best_delta <- suppressWarnings(as.numeric(out$best_delta))
+      out$best_delta <- ifelse(is.finite(out$best_delta), sprintf("%.2g", out$best_delta), NA_character_)
+    }
+    
+    # --- GeneCards link in "gene" column ---
+    if ("gene" %in% names(out)) {
+      g0 <- as.character(out$gene)
+      ok <- !is.na(g0) & nzchar(g0)
+      out$gene <- ifelse(
+        ok,
+        sprintf("<a href='https://www.genecards.org/cgi-bin/carddisp.pl?gene=%s' target='_blank'>%s</a>",
+                URLencode(g0, reserved = TRUE),
+                htmltools::htmlEscape(g0)),
+        NA_character_
+      )
+    }
+    
+    DT::datatable(
+      out,
+      rownames = FALSE,
+      escape = FALSE,
+      caption = htmltools::tags$caption(
+        style = "caption-side: top; text-align: left; font-weight: 600; font-size: 20px; padding: 6px 0;",
+        "Neighboring genes to EWAS bin hits"
+      ),
+      extensions = "Buttons",
+      options = list(
+        dom = "Bfrtip",
+        buttons = c("copy","csv","excel","pdf","print"),
+        pageLength = 20,
+        scrollX = TRUE
+      )
+    )
+  })
+  
+  
+#-------------------------------------------------------------------------------
+  # ============================================================
+  # ENRICHMENT OUTPUTS (GO / KEGG / GoSlim)  — RESTORED
+  # Requires: clusterProfiler, org.Hs.eg.db, AnnotationDbi, ggplot2, plotly, DT
+  # ============================================================
+  
+  # ----------------------------
+  # Helpers
+  # ----------------------------
+  fmt_p <- function(x) {
+    x <- suppressWarnings(as.numeric(x))
+    ifelse(is.finite(x), sprintf("%.3g", x), NA_character_)
+  }
+  
+  short_term <- function(x, max = 60) {
+    x <- as.character(x)
+    x <- stringr::str_squish(x)
+    ifelse(nchar(x) > max, paste0(substr(x, 1, max - 1), "…"), x)
+  }
+  
+  # ----------------------------
+  # Triggers (no auto-run)
+  # ----------------------------
+  go_trigger     <- reactiveVal(0L)
+  kegg_trigger   <- reactiveVal(0L)
+  goslim_trigger <- reactiveVal(0L)
+  
+  observeEvent(input$run_enrich, {
+    tab <- input$enrich_tabs %||% "tab_enrich_go"
+    if (identical(tab, "tab_enrich_go")) {
+      go_trigger(go_trigger() + 1L)
+    } else if (identical(tab, "tab_enrich_kegg")) {
+      kegg_trigger(kegg_trigger() + 1L)
+    } else if (identical(tab, "tab_enrich_goslim")) {
+      goslim_trigger(goslim_trigger() + 1L)
+    }
+  }, ignoreInit = TRUE)
+  
+  # ----------------------------
+  # ============================================================
+  # ENTREZ inputs for enrichment (COMPATIBLE with YOUR code)
+  # - uses rv$genes_nearby_df produced above
+  # - scope = global OR cluster (using input$func_scope + input$func_cluster_id)
+  # ============================================================
+  
+  genes_scope_nearby_df <- reactive({
+    gdf <- rv$genes_nearby_df
+    if (!is.data.frame(gdf) || !nrow(gdf)) return(NULL)
+    
+    sc <- input$func_scope %||% "global"
+    
+    # Identify cluster column if present
+    idcol <- if ("cluster_id" %in% names(gdf)) "cluster_id" else if ("cluster_chr_n" %in% names(gdf)) "cluster_chr_n" else NULL
+    
+    if (identical(sc, "cluster")) {
+      cid <- input$func_cluster_id %||% ""
+      if (!nzchar(cid) || is.null(idcol)) return(NULL)
+      gdf <- gdf[gdf[[idcol]] == cid, , drop = FALSE]
+      if (!nrow(gdf)) return(NULL)
+    }
+    
+    gdf
+  })
+  
+  entrez_scope_safe <- reactive({
+    gdf <- genes_scope_nearby_df()
+    if (!is.data.frame(gdf) || !nrow(gdf)) return(character(0))
+    
+    ecol <- if ("ENTREZID" %in% names(gdf)) "ENTREZID" else NULL
+    validate(need(!is.null(ecol), "genes_nearby_df must contain ENTREZID for GO/KEGG/GoSlim."))
+    
+    eg <- unique(as.character(gdf[[ecol]]))
+    eg <- eg[!is.na(eg) & nzchar(eg)]
+    eg
+  })
+  
+  # Universe: all ENTREZ in ALL nearby genes (global)
+  universe_entrez <- reactive({
+    gdf <- rv$genes_nearby_df
+    if (!is.data.frame(gdf) || !nrow(gdf)) return(character(0))
+    
+    ecol <- if ("ENTREZID" %in% names(gdf)) "ENTREZID" else NULL
+    validate(need(!is.null(ecol), "genes_nearby_df must contain ENTREZID to build universe."))
+    
+    eg <- unique(as.character(gdf[[ecol]]))
+    eg <- eg[!is.na(eg) & nzchar(eg)]
+    eg
+  })
+  
+  # Optional quick debug (to see in a verbatimTextOutput if you want)
+  rv$enrich_debug <- reactive({
+    list(
+      t = format(Sys.time(), "%H:%M:%S"),
+      scope = input$func_scope %||% "global",
+      cluster = input$func_cluster_id %||% "",
+      n_entrez_scope = length(entrez_scope_safe()),
+      n_entrez_universe = length(universe_entrez())
+    )
+  })
+  # ----------------------------
+  # ------------------------------------------------------------
+  # FAST cache helpers (GO/KEGG)
+  # ------------------------------------------------------------
+  # -----------------------------
+  # Caches + key (FAST)
+  # -----------------------------
+  .go_cache   <- reactiveVal(list(key = NULL, res = NULL))
+  .kegg_cache <- reactiveVal(list(key = NULL, res = NULL))
+  
+  make_gene_key <- function(gene, extra = "") {
+    gene <- sort(unique(as.character(gene)))
+    gene <- gene[!is.na(gene) & nzchar(gene)]
+    if (!length(gene)) return(paste0("EMPTY|", extra))
+    
+    sig <- if (requireNamespace("digest", quietly = TRUE)) {
+      digest::digest(gene, algo = "xxhash64")
+    } else {
+      paste0(length(gene), "|", paste(head(gene, 10), collapse = ","), "|", tail(gene, 1))
+    }
+    paste0(sig, "|", extra)
+  }
+  
+  
+  # ----------------------------
+  # GO enrichment (ENTREZ)
+  # ----------------------------
+  go_enrich_raw <- eventReactive(go_trigger(), {
+    withProgress(message = "Running GO enrichment…", value = 0, {
+      
+      gene <- unique(as.character(entrez_scope_safe()))
+      gene <- gene[!is.na(gene) & nzchar(gene)]
+      validate(need(length(gene) > 0, "No genes for enrichment yet."))
+      
+      ontos <- input$go_ontos
+      if (is.null(ontos) || !length(ontos)) ontos <- c("BP","CC","MF")
+      ontos <- intersect(c("BP","CC","MF"), ontos)
+      validate(need(length(ontos) > 0, "Select at least one ontology (BP/CC/MF)."))
+      
+      pcut  <- input$enrich_pcut %||% 0.05
+      minGS <- input$enrich_min_gs %||% 10
+      maxGS <- input$enrich_max_gs %||% 500
+      
+      # KEY + cache
+      key <- make_gene_key(gene, extra = paste0("GO|ontos=", paste(ontos, collapse=","), "|pcut=", pcut, "|minGS=", minGS, "|maxGS=", maxGS))
+      cc <- .go_cache()
+      if (identical(cc$key, key)) return(cc$res)
+      
+      incProgress(0.2, detail = paste("Genes:", length(gene)))
+      
+      # >>> SPEED: 1 call ONLY (ont="ALL"), then filter by selected ontos
+      eg <- suppressMessages(clusterProfiler::enrichGO(
+        gene          = gene,
+        OrgDb         = org.Hs.eg.db::org.Hs.eg.db,
+        keyType       = "ENTREZID",
+        ont           = "ALL",
+        pAdjustMethod = "BH",
+        pvalueCutoff  = pcut,
+        qvalueCutoff  = pcut,
+        minGSSize     = minGS,
+        maxGSSize     = maxGS,
+        readable      = FALSE
+      ))
+      
+      res <- tibble::tibble()
+      if (!is.null(eg) && !is.null(eg@result) && nrow(eg@result)) {
+        df <- as.data.frame(eg@result, stringsAsFactors = FALSE)
+        # clusterProfiler sol portar columna "ONTOLOGY" quan ont="ALL"
+        if ("ONTOLOGY" %in% names(df)) {
+          df <- df[df$ONTOLOGY %in% ontos, , drop = FALSE]
+          df$Ontology <- df$ONTOLOGY
+        } else {
+          # fallback (no hauria)
+          df$Ontology <- "ALL"
+        }
+        res <- df
+      }
+      
+      .go_cache(list(key = key, res = res))
+      res
+    })
+  }, ignoreInit = TRUE)
+  
+  
+  
+  go_enrich_tbl <- reactive({
+    df <- go_enrich_raw()
+    if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+    
+    pcut <- input$enrich_pcut %||% 0.05
+    topn <- input$go_topn %||% 10
+    
+    df2 <- df |>
+      dplyr::mutate(p.adjust = suppressWarnings(as.numeric(p.adjust))) |>
+      dplyr::filter(is.finite(p.adjust), p.adjust <= pcut) |>
+      dplyr::group_by(Ontology) |>
+      dplyr::arrange(p.adjust, .by_group = TRUE) |>
+      dplyr::slice_head(n = topn) |>
+      dplyr::ungroup()
+    
+    if (!nrow(df2)) return(tibble::tibble())
+    df2
+  })
+  
+  output$go_table <- DT::renderDT({
+    df <- go_enrich_tbl()
+    if (!is.data.frame(df) || !nrow(df)) {
+      return(DT::datatable(
+        data.frame(Message = "No GO terms to show. Run enrichment (and ensure genes exist)."),
+        options = list(dom="t"), rownames = FALSE
+      ))
+    }
+    
+    out <- df |>
+      dplyr::select(Ontology, ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, Count) |>
+      dplyr::mutate(
+        pvalue   = fmt_p(pvalue),
+        p.adjust = fmt_p(p.adjust)
+      )
+    
+    DT::datatable(
+      out, rownames = FALSE,
+      extensions = "Buttons",
+      options    = list(
+        dom        = "Bfrtip",
+        buttons    = c("copy","csv","excel","pdf","print"),
+        pageLength = 10,
+        scrollX    = TRUE
+      )
+    )
+  })
+  
+  output$go_bar <- plotly::renderPlotly({
+    
+    df0 <- go_enrich_tbl()
+    
+    if (!is.data.frame(df0) || !nrow(df0)) {
+      return(plotly::plot_ly() %>% plotly::layout(title = "Run GO enrichment to see barplot."))
+    }
+    
+    # --- Build Catalog-like input: term + n_genes + Ontology (+ p.adjust) ---
+    dat <- df0 %>%
+      dplyr::transmute(
+        Ontology    = as.character(Ontology),
+        go_term     = as.character(Description),
+        n_genes     = suppressWarnings(as.integer(Count)),
+        p.adjust    = suppressWarnings(as.numeric(p.adjust)),
+        ID          = as.character(ID)
+      ) %>%
+      dplyr::filter(!is.na(n_genes), n_genes > 0, !is.na(Ontology), nzchar(Ontology), nzchar(go_term))
+    
+    validate(need(nrow(dat) > 0, "GO: no data to plot yet."))
+    
+    top_n <- input$go_class_top %||% 15
+    gap   <- 2
+    
+    # Helper: shorten/wrap terms (reuse your shorten_term if present)
+    if (!exists("shorten_term", mode = "function")) {
+      shorten_term <- function(x, max = 55) {
+        x <- as.character(x)
+        x <- stringr::str_squish(x)
+        x <- stringr::str_to_sentence(x)
+        ifelse(nchar(x) > max, paste0(substr(x, 1, max - 1), "…"), x)
+      }
+    }
+    
+    dat <- dat %>%
+      dplyr::mutate(
+        term_short = stringr::str_wrap(shorten_term(go_term, 55), width = 28)
+      )
+    
+    ont_order <- c("BP","CC","MF")
+    present   <- intersect(ont_order, unique(dat$Ontology))
+    validate(need(length(present) > 0, "No BP/CC/MF data to plot."))
+    
+    dat <- dat %>%
+      dplyr::filter(Ontology %in% present) %>%
+      dplyr::mutate(Ontology = factor(Ontology, levels = ont_order))
+    
+    # Top-N per ontology
+    dat <- dat %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::slice_max(order_by = n_genes, n = top_n, with_ties = FALSE) %>%
+      dplyr::arrange(Ontology, dplyr::desc(n_genes)) %>%
+      dplyr::mutate(rank = dplyr::row_number()) %>%
+      dplyr::ungroup()
+    
+    n_bp <- if ("BP" %in% present) max(dat$rank[dat$Ontology == "BP"], 0) else 0
+    n_cc <- if ("CC" %in% present) max(dat$rank[dat$Ontology == "CC"], 0) else 0
+    
+    offsets <- c(BP = 0, CC = n_bp + gap, MF = n_bp + gap + n_cc + gap)
+    dat$x <- dat$rank + offsets[as.character(dat$Ontology)]
+    
+    vlines <- c()
+    if (all(c("BP","CC") %in% present)) vlines <- c(vlines, offsets["CC"] - gap/2)
+    if (all(c("CC","MF") %in% present)) vlines <- c(vlines, offsets["MF"] - gap/2)
+    
+    centers <- dat %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::summarise(xmin = min(x), xmax = max(x), xmid = (xmin + xmax)/2, .groups = "drop")
+    
+    ymax  <- max(dat$n_genes, na.rm = TRUE)
+    ylab  <- -0.12 * ymax
+    y_top <- ymax * 1.08
+    
+    sel_label <- if (exists("scope_label", mode = "function")) scope_label() else "global"
+    
+    dat$tooltip <- paste0(
+      "<b>", dat$Ontology, "</b>",
+      "<br><b>GO term:</b> ", htmltools::htmlEscape(dat$go_term),
+      ifelse(!is.na(dat$ID) & nzchar(dat$ID), paste0("<br><b>ID:</b> ", htmltools::htmlEscape(dat$ID)), ""),
+      "<br><b>Genes:</b> ", dat$n_genes,
+      "<br><b>p.adj:</b> ", fmt_p(dat$p.adjust)
+    )
+    
+    p <- ggplot2::ggplot(dat, ggplot2::aes(x = x, y = n_genes, fill = Ontology, text = tooltip)) +
+      ggplot2::geom_col(width = 0.85, color = "black", linewidth = 0.25) +
+      { if (length(vlines)) ggplot2::geom_vline(xintercept = vlines, linewidth = 0.4) } +
+      ggplot2::scale_x_continuous(breaks = dat$x, labels = dat$term_short, expand = c(0,0)) +
+      ggplot2::coord_cartesian(ylim = c(ylab, ymax * 1.20), clip = "off") +
+      { if ("BP" %in% present) ggplot2::annotate("text", x = centers$xmid[centers$Ontology=="BP"], y = y_top,
+                                                 label = "Biological Process", fontface = "bold", size = 3.6) } +
+      { if ("CC" %in% present) ggplot2::annotate("text", x = centers$xmid[centers$Ontology=="CC"], y = y_top,
+                                                 label = "Cellular Component", fontface = "bold", size = 3.6) } +
+      { if ("MF" %in% present) ggplot2::annotate("text", x = centers$xmid[centers$Ontology=="MF"], y = y_top,
+                                                 label = "Molecular Function", fontface = "bold", size = 3.6) } +
+      ggplot2::labs(
+        x = NULL, y = "Number of genes",
+        title = paste0("GO enrichment — ", sel_label)
+      ) +
+      ggplot2::theme_minimal(base_size = 10) +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(size = 11, face = "bold"),
+        axis.text.x = ggplot2::element_text(angle = 90, size = 7, vjust = 0.5, hjust = 1),
+        legend.position = "none",
+        plot.margin = grid::unit(c(28,10,35,10), "pt")
+      ) +
+      ggplot2::scale_fill_manual(values = c(BP = "darkgreen", CC = "orange", MF = "darkblue"), guide = "none")
+    
+    plotly::ggplotly(p, tooltip = "text")
+  })
+  
+  
+  # ----------------------------
+  # KEGG enrichment (ENTREZ)
+  # ----------------------------
+  # ============================================================
+  # KEGG enrichment (FAST + robust + debug)
+  # ============================================================
+  
+  .kegg_debug <- reactiveVal(list())
+  
+  kegg_enrich_raw <- eventReactive(kegg_trigger(), {
+    withProgress(message = "Running KEGG enrichment…", value = 0, {
+      
+      gene <- as.character(entrez_scope_safe())
+      gene <- gene[!is.na(gene) & nzchar(gene)]
+      gene <- unique(gene)
+      
+      validate(need(length(gene) > 0, "No genes for KEGG enrichment yet."))
+      
+      pcut_in <- input$enrich_pcut %||% 0.05
+      minGS_in <- input$enrich_min_gs %||% 10
+      maxGS_in <- input$enrich_max_gs %||% 500
+      
+      # >>> KEY FIX for small gene sets:
+      # never keep minGSSize near N genes (KEGG will likely return empty)
+      minGS <- min(minGS_in, max(2L, floor(length(gene) / 2L)))
+      maxGS <- maxGS_in
+      pcut  <- pcut_in
+      
+      incProgress(0.25, detail = paste("Genes:", length(gene), "| minGS:", minGS))
+      
+      # helper to run enrichKEGG with safe fallbacks
+      run_kegg <- function(use_internal = FALSE, pcut_use = pcut) {
+        args <- list(
+          gene          = gene,
+          universe      = NULL,
+          organism      = "hsa",
+          pAdjustMethod = "BH",
+          pvalueCutoff  = pcut_use,
+          qvalueCutoff  = pcut_use,
+          minGSSize     = minGS,
+          maxGSSize     = maxGS
+        )
+        
+        # Some versions support use_internal_data
+        fn <- clusterProfiler::enrichKEGG
+        if ("use_internal_data" %in% names(formals(fn))) {
+          args$use_internal_data <- isTRUE(use_internal)
+        }
+        
+        suppressMessages(do.call(fn, args))
+      }
+      
+      # 1) Try normal (online KEGGREST)
+      ek <- tryCatch(run_kegg(use_internal = FALSE, pcut_use = pcut), error = function(e) e)
+      
+      # If error or empty, try internal data fallback (if available)
+      if (inherits(ek, "error") || is.null(ek) || is.null(ek@result) || !nrow(ek@result)) {
+        ek2 <- tryCatch(run_kegg(use_internal = TRUE, pcut_use = pcut), error = function(e) e)
+        if (!inherits(ek2, "error") && !is.null(ek2) && !is.null(ek2@result) && nrow(ek2@result)) {
+          ek <- ek2
+        }
+      }
+      
+      # If still empty, do a diagnostic run with pcut=1 to see if ANY mapping exists
+      diag_note <- NULL
+      if (inherits(ek, "error") || is.null(ek) || is.null(ek@result) || !nrow(ek@result)) {
+        ek3 <- tryCatch(run_kegg(use_internal = FALSE, pcut_use = 1), error = function(e) e)
+        if (!inherits(ek3, "error") && !is.null(ek3) && !is.null(ek3@result) && nrow(ek3@result)) {
+          diag_note <- "KEGG returns results with pcut=1 → your pcut/minGS filters were too strict."
+        } else {
+          diag_note <- "KEGG still empty with pcut=1 → likely KEGG mapping/REST issue or ENTREZ mismatch."
+        }
+      }
+      
+      # Debug info always
+      .kegg_debug(list(
+        t = format(Sys.time(), "%H:%M:%S"),
+        n_genes = length(gene),
+        minGS_used = minGS,
+        maxGS_used = maxGS,
+        pcut_used = pcut,
+        example_entrez = paste(head(gene, 10), collapse = ","),
+        note = diag_note %||% "",
+        err = if (inherits(ek, "error")) conditionMessage(ek) else ""
+      ))
+      
+      if (inherits(ek, "error") || is.null(ek) || is.null(ek@result) || !nrow(ek@result)) {
+        return(tibble::tibble())
+      }
+      
+      as.data.frame(ek@result, stringsAsFactors = FALSE)
+    })
+  }, ignoreInit = TRUE)
+  
+  
+  
+  kegg_top_df <- reactive({
+    df <- kegg_enrich_raw()
+    if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+    
+    pcut <- input$enrich_pcut %||% 0.05
+    topn <- input$enrich_kegg_top %||% 15
+    
+    df0 <- df |>
+      dplyr::mutate(
+        pvalue   = suppressWarnings(as.numeric(pvalue)),
+        p.adjust = suppressWarnings(as.numeric(p.adjust)),
+        score    = -log10(p.adjust),
+        term_short = short_term(Description, 55)
+      ) |>
+      dplyr::filter(is.finite(p.adjust), nzchar(term_short)) |>
+      dplyr::arrange(p.adjust) |>
+      dplyr::slice_head(n = topn)
+    
+    # si no hi ha res per pcut, igualment mostrem top by p.adjust
+    df0
+  })
+  
+  output$kegg_table <- DT::renderDT({
+    df <- kegg_top_df()
+    if (!is.data.frame(df) || !nrow(df)) {
+      return(DT::datatable(
+        data.frame(Message="No KEGG pathways to display (or run enrichment first)."),
+        options=list(dom="t"), rownames=FALSE
+      ))
+    }
+    
+    out <- df |>
+      dplyr::mutate(
+        KEGG = if ("ID" %in% names(df))
+          sprintf("<a href='https://www.kegg.jp/pathway/%s' target='_blank'>%s</a>", ID, ID)
+        else NA_character_
+      ) |>
+      dplyr::transmute(
+        KEGG, Description, GeneRatio, BgRatio, Count,
+        pvalue   = fmt_p(pvalue),
+        p.adjust = fmt_p(p.adjust)
+      )
+    
+    DT::datatable(
+      out,
+      escape     = FALSE,
+      rownames   = FALSE,
+      filter     = "top",
+      extensions = "Buttons",
+      options    = list(
+        dom        = "Bfrtip",
+        buttons    = c("copy","csv","excel","pdf","print"),
+        pageLength = 15,
+        scrollX    = TRUE
+      )
+    )
+  })
+  
+  output$kegg_bar <- plotly::renderPlotly({
+    
+    df0 <- kegg_top_df()
+    
+    if (!is.data.frame(df0) || !nrow(df0)) {
+      return(plotly::plot_ly() %>% plotly::layout(title = "Run KEGG enrichment to see barplot."))
+    }
+    
+    # top_n separat per KEGG (si no el tens, reusem go_class_top)
+    top_n <- input$enrich_kegg_top %||% input$go_class_top %||% 15
+    
+    # Helper: shorten/wrap terms
+    if (!exists("shorten_term", mode = "function")) {
+      shorten_term <- function(x, max = 55) {
+        x <- as.character(x)
+        x <- stringr::str_squish(x)
+        x <- stringr::str_to_sentence(x)
+        ifelse(nchar(x) > max, paste0(substr(x, 1, max - 1), "…"), x)
+      }
+    }
+    
+    dat <- df0 %>%
+      dplyr::transmute(
+        pathway   = as.character(Description),
+        n_genes   = suppressWarnings(as.integer(Count)),
+        p.adjust  = suppressWarnings(as.numeric(p.adjust)),
+        ID        = as.character(ID)
+      ) %>%
+      dplyr::filter(!is.na(n_genes), n_genes > 0, nzchar(pathway)) %>%
+      dplyr::arrange(p.adjust) %>%
+      dplyr::slice_head(n = top_n) %>%
+      dplyr::mutate(
+        term_short = stringr::str_wrap(shorten_term(pathway, 55), width = 28),
+        x = dplyr::row_number()
+      )
+    
+    validate(need(nrow(dat) > 0, "KEGG: no data to plot yet."))
+    
+    ymax  <- max(dat$n_genes, na.rm = TRUE)
+    ylab  <- -0.12 * ymax
+    y_top <- ymax * 1.08
+    
+    sel_label <- if (exists("scope_label", mode = "function")) scope_label() else "global"
+    
+    dat$tooltip <- paste0(
+      "<b>KEGG</b>",
+      "<br><b>Pathway:</b> ", htmltools::htmlEscape(dat$pathway),
+      ifelse(!is.na(dat$ID) & nzchar(dat$ID),
+             paste0("<br><b>ID:</b> ", htmltools::htmlEscape(dat$ID)),
+             ""),
+      "<br><b>Genes:</b> ", dat$n_genes,
+      "<br><b>p.adj:</b> ", fmt_p(dat$p.adjust)
+    )
+    
+    p <- ggplot2::ggplot(dat, ggplot2::aes(x = x, y = n_genes, text = tooltip)) +
+      ggplot2::geom_col(width = 0.85, color = "black", linewidth = 0.25) +
+      ggplot2::scale_x_continuous(breaks = dat$x, labels = dat$term_short, expand = c(0,0)) +
+      ggplot2::coord_cartesian(ylim = c(ylab, ymax * 1.20), clip = "off") +
+      ggplot2::annotate("text", x = mean(range(dat$x)), y = y_top,
+                        label = "KEGG pathways", fontface = "bold", size = 3.6) +
+      ggplot2::labs(
+        x = NULL, y = "Number of genes",
+        title = paste0("KEGG enrichment — ", sel_label)
+      ) +
+      ggplot2::theme_minimal(base_size = 10) +
+      ggplot2::theme(
+        plot.title  = ggplot2::element_text(size = 11, face = "bold"),
+        axis.text.x = ggplot2::element_text(angle = 90, size = 7, vjust = 0.5, hjust = 1),
+        plot.margin = grid::unit(c(28,10,35,10), "pt")
+      )
+    
+    plotly::ggplotly(p, tooltip = "text")
+  })
+  
+  # ----------------------------
+  # GoSlim enrichment (FAST) — uses GO_SLIM_GENERIC + enricher()
+  # ----------------------------
+  goslim_t2g_cache <- reactiveVal(list())
+  
+  map_go_to_goslim_safe <- function(go_ids, ontology, slim_ids = NULL) {
+    validate(need(exists("map_go_to_goslim", inherits = TRUE),
+                  "map_go_to_goslim() not found. Source goslim_utils.R"))
+    f <- get("map_go_to_goslim", inherits = TRUE)
+    fnames <- names(formals(f))
+    args <- list(go_ids)
+    if ("ontology" %in% fnames) args$ontology <- ontology
+    if ("ont"      %in% fnames) args$ont      <- ontology
+    if (!is.null(slim_ids)) {
+      if ("goslim_ids" %in% fnames) args$goslim_ids <- slim_ids
+      if ("slim_ids"   %in% fnames) args$slim_ids   <- slim_ids
+      if ("slim"       %in% fnames) args$slim       <- slim_ids
+    }
+    do.call(f, args)
+  }
+  
+  
+  # ------------------------------------------------------------
+  # Resolve app root and R folder robustly
+  # ------------------------------------------------------------
+  get_app_root <- function() {
+    # Shiny sets this internally when runApp() / shinyAppDir()
+    ad <- shiny::getShinyOption("appDir")
+    if (!is.null(ad) && nzchar(ad) && dir.exists(ad)) return(normalizePath(ad, winslash="/", mustWork=FALSE))
+    
+    # Fallbacks
+    wd <- getwd()
+    if (file.exists(file.path(wd, "app.R"))) return(normalizePath(wd, winslash="/", mustWork=FALSE))
+    
+    # If you're inside /R or /www, go one level up
+    up <- normalizePath(file.path(wd, ".."), winslash="/", mustWork=FALSE)
+    if (file.exists(file.path(up, "app.R"))) return(up)
+    
+    normalizePath(wd, winslash="/", mustWork=FALSE)
+  }
+  
+  get_app_R_dir <- function() {
+    app_root <- get_app_root()
+    rdir <- file.path(app_root, "R")
+    if (dir.exists(rdir)) return(rdir)
+    # fallback: sometimes code is in ./app/EWAS_cancer/R while wd is repo root
+    # try common patterns
+    cands <- c(
+      file.path(getwd(), "R"),
+      file.path(getwd(), "app", "EWAS_cancer", "R"),
+      file.path(getwd(), "app", basename(app_root), "R")
+    )
+    cands <- c(rdir, cands)
+    cands <- cands[dir.exists(cands)]
+    if (length(cands)) return(normalizePath(cands[1], winslash="/", mustWork=FALSE))
+    NA_character_
+  }
+  
+  # ============================================================
+  # GoSlim load (FROM APP/R) — robust, no-crash
+  # Files expected in: <app_root>/R/
+  #   - goslim_utils.R
+  #   - go_slim_generic.R
+  #   - goslim_generic.obo
+  # ============================================================
+  local({
+    
+    goslim_root <- get_app_R_dir()
+    validate(need(!is.na(goslim_root) && dir.exists(goslim_root),
+                  paste0("GoSlim: cannot find app R/ folder. wd=", getwd())))
+    
+    f1 <- file.path(goslim_root, "goslim_utils.R")
+    f2 <- file.path(goslim_root, "go_slim_generic.R")
+    f3 <- file.path(goslim_root, "goslim_generic.obo")
+    
+    # 1) Source utils (required)
+    validate(need(file.exists(f1), paste0("Missing: ", f1)))
+    source(f1, local = FALSE)
+    
+    # 2) Try-source go_slim_generic.R but NEVER crash the app
+    # (your go_slim_generic.R currently stops if obo_path doesn't exist)
+    if (file.exists(f2)) {
+      tryCatch(
+        source(f2, local = FALSE),
+        error = function(e) message("[GoSlim] Skipping source(go_slim_generic.R): ", conditionMessage(e))
+      )
+    }
+    
+    # 3) Build GO_SLIM_GENERIC if not already loaded
+    if (!exists("GO_SLIM_GENERIC", inherits = TRUE)) {
+      
+      validate(
+        need(file.exists(f3), paste0("Missing OBO: ", f3)),
+        need(exists("load_goslim_generic_ids", inherits = TRUE),
+             "load_goslim_generic_ids() not found. goslim_utils.R not loaded?"),
+        need(requireNamespace("GO.db", quietly = TRUE), "GO.db required."),
+        need(requireNamespace("AnnotationDbi", quietly = TRUE), "AnnotationDbi required."),
+        need(requireNamespace("dplyr", quietly = TRUE), "dplyr required.")
+      )
+      
+      ids <- load_goslim_generic_ids(f3)
+      validate(need(length(ids) > 0, paste0("OBO read OK but 0 IDs: ", f3)))
+      
+      GO_SLIM_GENERIC <- AnnotationDbi::select(
+        GO.db::GO.db,
+        keys    = ids,
+        keytype = "GOID",
+        columns = c("GOID","TERM","ONTOLOGY")
+      ) |>
+        dplyr::filter(!is.na(GOID), !is.na(TERM), !is.na(ONTOLOGY)) |>
+        dplyr::transmute(
+          GOID      = as.character(GOID),
+          ONTOLOGY  = as.character(ONTOLOGY),
+          slim_term = as.character(TERM)
+        ) |>
+        dplyr::distinct(GOID, ONTOLOGY, slim_term)
+      
+      validate(need(nrow(GO_SLIM_GENERIC) > 0, "GO_SLIM_GENERIC built but empty."))
+      
+      assign("GO_SLIM_GENERIC", GO_SLIM_GENERIC, envir = .GlobalEnv)
+      assign("GOSLIM_OBO_PATH_USED", f3, envir = .GlobalEnv)
+      message("[GoSlim] GO_SLIM_GENERIC loaded from ", f3, " | n=", nrow(GO_SLIM_GENERIC))
+    }
+    
+  })
+  
+  exists("GO_SLIM_GENERIC", inherits = TRUE)
+  if (exists("GO_SLIM_GENERIC", inherits = TRUE)) nrow(GO_SLIM_GENERIC)
+  if (exists("GOSLIM_OBO_PATH_USED", inherits = TRUE)) GOSLIM_OBO_PATH_USED
+  
+  
+  goslim_term2gene_for_onto <- function(ont, universe_ids) {
+    ont <- match.arg(ont, c("BP","CC","MF"))
+    validate(need(exists("GO_SLIM_GENERIC", inherits = TRUE), "GO_SLIM_GENERIC not loaded."))
+    
+    u <- unique(as.character(universe_ids))
+    u <- u[!is.na(u) & nzchar(u)]
+    validate(need(length(u) > 0, "Universe is empty for GoSlim mapping."))
+    
+    slim_ids <- GO_SLIM_GENERIC |>
+      dplyr::filter(ONTOLOGY == ont) |>
+      dplyr::pull(GOID) |>
+      unique()
+    validate(need(length(slim_ids) > 0, paste0("No GoSlim IDs available for ", ont, ".")))
+    
+    key <- paste0("ont=", ont, "|n=", length(u), "|slim=", length(slim_ids))
+    cache <- goslim_t2g_cache()
+    if (!is.null(cache[[key]])) return(cache[[key]])
+    
+    ann <- suppressMessages(AnnotationDbi::select(
+      org.Hs.eg.db::org.Hs.eg.db,
+      keys    = u,
+      keytype = "ENTREZID",
+      columns = c("GO","ONTOLOGY")
+    )) |>
+      dplyr::filter(!is.na(GO), nzchar(GO), ONTOLOGY == ont) |>
+      dplyr::transmute(gene = as.character(ENTREZID), GOID = as.character(GO)) |>
+      dplyr::distinct(gene, GOID)
+    
+    validate(need(nrow(ann) > 0, paste0("No GO annotations found for ontology ", ont, ".")))
+    
+    go2slim <- map_go_to_goslim_safe(unique(ann$GOID), ontology = ont, slim_ids = slim_ids)
+    
+    go2slim_df <- purrr::imap_dfr(go2slim, function(v, k) {
+      v <- unique(as.character(v))
+      v <- v[!is.na(v) & nzchar(v)]
+      if (!length(v)) return(NULL)
+      tibble::tibble(GOID = as.character(k), slim_id = v)
+    }) |>
+      dplyr::distinct(GOID, slim_id)
+    
+    validate(need(nrow(go2slim_df) > 0, paste0("GO→GoSlim mapping produced 0 pairs for ", ont, ".")))
+    
+    term2gene <- ann |>
+      dplyr::inner_join(go2slim_df, by = "GOID", relationship = "many-to-many") |>
+      dplyr::transmute(term = slim_id, gene = gene) |>
+      dplyr::distinct(term, gene)
+    
+    cache[[key]] <- term2gene
+    goslim_t2g_cache(cache)
+    term2gene
+  }
+  
+  goslim_term2name_for_onto <- function(ont) {
+    ont <- match.arg(ont, c("BP","CC","MF"))
+    GO_SLIM_GENERIC |>
+      dplyr::filter(ONTOLOGY == ont) |>
+      dplyr::transmute(term = as.character(GOID), name = as.character(slim_term)) |>
+      dplyr::distinct(term, name)
+  }
+  
+  goslim_enrich_raw <- eventReactive(goslim_trigger(), {
+    validate(need(exists("GO_SLIM_GENERIC", inherits = TRUE), "GO_SLIM_GENERIC not loaded."))
+    validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler required."))
+    
+    withProgress(message = "Running GO slim enrichment…", value = 0, {
+      
+      gene <- as.character(entrez_scope_safe())
+      validate(need(length(gene) > 0,
+                    "No genes for GoSlim yet. Compute nearby genes first (EWAS bins → genes)."))
+      incProgress(0.15, detail = paste("Genes:", length(gene)))
+      
+      uni <- universe_entrez()
+      if (!length(uni)) {
+        uni <- AnnotationDbi::keys(org.Hs.eg.db::org.Hs.eg.db, keytype = "ENTREZID")
+      }
+      validate(need(length(uni) > 0, "Universe is empty (after fallback)."))
+      incProgress(0.05, detail = paste("Universe:", length(uni)))
+      
+      ontos <- input$go_ontos
+      if (is.null(ontos) || !length(ontos)) ontos <- c("BP","CC","MF")
+      ontos <- intersect(c("BP","CC","MF"), ontos)
+      validate(need(length(ontos) > 0, "Select at least one GO ontology (BP/CC/MF)."))
+      
+      minGS <- input$enrich_min_gs %||% 10
+      maxGS <- input$enrich_max_gs %||% 500
+      
+      res <- purrr::map_dfr(ontos, function(ont) {
+        incProgress(0.75/length(ontos), detail = paste("Ontology:", ont))
+        
+        t2g <- goslim_term2gene_for_onto(ont, universe_ids = uni)
+        t2n <- goslim_term2name_for_onto(ont)
+        
+        eg <- suppressMessages(clusterProfiler::enricher(
+          gene          = gene,
+          universe      = uni,
+          TERM2GENE     = t2g,
+          TERM2NAME     = t2n,
+          pAdjustMethod = "BH",
+          pvalueCutoff  = 1,
+          qvalueCutoff  = 1,
+          minGSSize     = minGS,
+          maxGSSize     = maxGS
+        ))
+        
+        if (is.null(eg) || is.null(eg@result) || !nrow(eg@result)) return(NULL)
+        df <- as.data.frame(eg@result, stringsAsFactors = FALSE)
+        df$Ontology <- ont
+        df
+      })
+      
+      if (!is.data.frame(res) || !nrow(res)) return(tibble::tibble())
+      res
+    })
+  }, ignoreInit = TRUE)
+  
+  goslim_top_df <- reactive({
+    df <- goslim_enrich_raw()
+    if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+    
+    pcut <- input$enrich_pcut %||% 0.05
+    topn <- input$go_topn %||% 12
+    
+    df0 <- df |>
+      dplyr::mutate(p.adjust = suppressWarnings(as.numeric(p.adjust))) |>
+      dplyr::filter(is.finite(p.adjust)) |>
+      dplyr::arrange(p.adjust)
+    
+    sig <- df0 |> dplyr::filter(p.adjust <= pcut)
+    if (nrow(sig)) {
+      sig |> dplyr::group_by(Ontology) |> dplyr::slice_head(n = topn) |> dplyr::ungroup()
+    } else {
+      df0 |> dplyr::group_by(Ontology) |> dplyr::slice_head(n = topn) |> dplyr::ungroup()
+    }
+  })
+  
+  output$goslim_table <- DT::renderDT({
+    df <- goslim_top_df()
+    if (!is.data.frame(df) || !nrow(df)) {
+      return(DT::datatable(
+        data.frame(Message="No GoSlim terms to display (or run enrichment first)."),
+        options=list(dom="t"), rownames=FALSE
+      ))
+    }
+    
+    out <- df |>
+      dplyr::transmute(
+        Ontology,
+        GoSlim_term = Description,
+        Count,
+        pvalue   = fmt_p(pvalue),
+        p.adjust = fmt_p(p.adjust)
+      )
+    
+    DT::datatable(
+      out, rownames = FALSE,
+      extensions = "Buttons",
+      options = list(
+        dom="Bfrtip",
+        buttons=c("copy","csv","excel","pdf","print"),
+        pageLength=12,
+        scrollX=TRUE
+      )
+    )
+  })
+  
+  # ------------------------------------------------------------
+  # Scope label (used in GO/KEGG/GoSlim titles)
+  # ------------------------------------------------------------
+  scope_label <- function() {
+    sc <- input$func_scope %||% "global"
+    if (identical(sc, "cluster")) {
+      cid <- input$func_cluster_id %||% ""
+      if (nzchar(cid)) paste0("cluster ", cid) else "cluster"
+    } else {
+      "global"
+    }
+  }
+  
+  output$goslim_bar <- plotly::renderPlotly({
+    
+    dat0 <- goslim_top_df()
+    
+    if (!is.data.frame(dat0) || !nrow(dat0)) {
+      return(plotly::plot_ly() %>% plotly::layout(title = "Run GoSlim enrichment to see barplot."))
+    }
+    
+    # --- Build Catalog-like input: slim_term + n_genes + Ontology ---
+    dat <- dat0 %>%
+      dplyr::transmute(
+        Ontology  = as.character(Ontology),
+        slim_term = as.character(Description),
+        n_genes   = suppressWarnings(as.integer(Count)),
+        p.adjust  = suppressWarnings(as.numeric(p.adjust))
+      ) %>%
+      dplyr::filter(!is.na(n_genes), n_genes > 0, !is.na(Ontology), nzchar(Ontology), nzchar(slim_term))
+    
+    validate(need(nrow(dat) > 0, "GO slim: no data to plot yet."))
+    
+    top_n <- input$go_class_top %||% 15
+    gap   <- 2
+    
+    # Helper: shorten/wrap terms
+    if (!exists("shorten_term", mode = "function")) {
+      shorten_term <- function(x, max = 55) {
+        x <- as.character(x)
+        x <- stringr::str_squish(x)
+        x <- stringr::str_to_sentence(x)
+        ifelse(nchar(x) > max, paste0(substr(x, 1, max - 1), "…"), x)
+      }
+    }
+    
+    dat <- dat %>%
+      dplyr::mutate(
+        term_short = stringr::str_wrap(shorten_term(slim_term, 55), width = 28)
+      )
+    
+    ont_order <- c("BP","CC","MF")
+    present   <- intersect(ont_order, unique(dat$Ontology))
+    validate(need(length(present) > 0, "No BP/CC/MF data to plot."))
+    
+    dat <- dat %>%
+      dplyr::filter(Ontology %in% present) %>%
+      dplyr::mutate(Ontology = factor(Ontology, levels = ont_order))
+    
+    # Top-N per ontology
+    dat <- dat %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::slice_max(order_by = n_genes, n = top_n, with_ties = FALSE) %>%
+      dplyr::arrange(Ontology, dplyr::desc(n_genes)) %>%
+      dplyr::mutate(rank = dplyr::row_number()) %>%
+      dplyr::ungroup()
+    
+    n_bp <- if ("BP" %in% present) max(dat$rank[dat$Ontology == "BP"], 0) else 0
+    n_cc <- if ("CC" %in% present) max(dat$rank[dat$Ontology == "CC"], 0) else 0
+    
+    offsets <- c(BP = 0, CC = n_bp + gap, MF = n_bp + gap + n_cc + gap)
+    dat$x <- dat$rank + offsets[as.character(dat$Ontology)]
+    
+    vlines <- c()
+    if (all(c("BP","CC") %in% present)) vlines <- c(vlines, offsets["CC"] - gap/2)
+    if (all(c("CC","MF") %in% present)) vlines <- c(vlines, offsets["MF"] - gap/2)
+    
+    centers <- dat %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::summarise(xmin = min(x), xmax = max(x), xmid = (xmin + xmax)/2, .groups = "drop")
+    
+    ymax  <- max(dat$n_genes, na.rm = TRUE)
+    ylab  <- -0.12 * ymax
+    y_top <- ymax * 1.08
+    
+    sel_label <- scope_label()  # ja la tens definida
+    
+    dat$tooltip <- paste0(
+      "<b>", dat$Ontology, "</b>",
+      "<br><b>GO slim:</b> ", htmltools::htmlEscape(dat$slim_term),
+      "<br><b>Genes:</b> ", dat$n_genes,
+      "<br><b>p.adj:</b> ", fmt_p(dat$p.adjust)
+    )
+    
+    p <- ggplot2::ggplot(dat, ggplot2::aes(x = x, y = n_genes, fill = Ontology, text = tooltip)) +
+      ggplot2::geom_col(width = 0.85, color = "black", linewidth = 0.25) +
+      { if (length(vlines)) ggplot2::geom_vline(xintercept = vlines, linewidth = 0.4) } +
+      ggplot2::scale_x_continuous(breaks = dat$x, labels = dat$term_short, expand = c(0,0)) +
+      ggplot2::coord_cartesian(ylim = c(ylab, ymax * 1.20), clip = "off") +
+      { if ("BP" %in% present) ggplot2::annotate("text", x = centers$xmid[centers$Ontology=="BP"], y = y_top,
+                                                 label = "Biological Process", fontface = "bold", size = 3.6) } +
+      { if ("CC" %in% present) ggplot2::annotate("text", x = centers$xmid[centers$Ontology=="CC"], y = y_top,
+                                                 label = "Cellular Component", fontface = "bold", size = 3.6) } +
+      { if ("MF" %in% present) ggplot2::annotate("text", x = centers$xmid[centers$Ontology=="MF"], y = y_top,
+                                                 label = "Molecular Function", fontface = "bold", size = 3.6) } +
+      ggplot2::labs(
+        x = NULL, y = "Number of genes",
+        title = paste0("Gene Function Classification (GO slim generic) — ", sel_label)
+      ) +
+      ggplot2::theme_minimal(base_size = 10) +
+      ggplot2::theme(
+        plot.title   = ggplot2::element_text(size = 11, face = "bold"),
+        axis.text.x  = ggplot2::element_text(angle = 90, size = 7, vjust = 0.5, hjust = 1),
+        legend.position = "none",
+        plot.margin  = grid::unit(c(28,10,35,10), "pt")
+      ) +
+      ggplot2::scale_fill_manual(values = c(BP = "darkgreen", CC = "orange", MF = "darkblue"), guide = "none")
+    
+    plotly::ggplotly(p, tooltip = "text")
+  })
+  
+  output$enrich_bg_note <- renderUI({
+    main_tab <- input$enrich_main_tabs %||% "tab_enrich_func"
+    tab_func <- input$enrich_tabs %||% "tab_enrich_go"
+    bg       <- input$enrich_background %||% "dataset"
+    
+    # target
+    cancer  <- input$cancer_sel  %||% ""
+    disease <- input$disease_sel %||% ""
+    target_lbl <- if (nzchar(as.character(cancer))) {
+      paste0("Tumor: <b>", htmltools::htmlEscape(as.character(cancer)), "</b>")
+    } else if (nzchar(as.character(disease))) {
+      paste0("Disease: <b>", htmltools::htmlEscape(as.character(disease)), "</b>")
+    } else {
+      "Target: <b>(not selected)</b>"
+    }
+    
+    # helpers counts (safe)
+    n_fg <- tryCatch({
+      if (exists("entrez_scope", mode = "function")) length(entrez_scope())
+      else if (exists("genes_for_enrich", mode = "function")) length(genes_for_enrich())
+      else NA_integer_
+    }, error = function(e) NA_integer_)
+    
+    n_uni_dataset <- tryCatch({
+      if (exists("universe_entrez_dataset", mode = "function")) length(universe_entrez_dataset())
+      else NA_integer_
+    }, error = function(e) NA_integer_)
+    
+    n_uni_orgdb <- tryCatch(
+      length(AnnotationDbi::keys(org.Hs.eg.db::org.Hs.eg.db, keytype = "ENTREZID")),
+      error = function(e) NA_integer_
+    )
+    
+    sc <- input$func_scope %||% "global"
+    sc_txt <- if (identical(sc, "cluster")) {
+      cid <- input$func_cluster_id %||% ""
+      if (nzchar(as.character(cid))) {
+        paste0("Foreground: genes in <b>", htmltools::htmlEscape(as.character(cid)), "</b>.")
+      } else "Foreground: genes in <b>selected cluster</b>."
+    } else {
+      "Foreground: genes in <b>global</b> (current EWAS selection)."
+    }
+    
+    fg_cnt_txt <- if (is.finite(n_fg)) paste0("<br><b>Foreground size:</b> n=", as.integer(n_fg), " genes.") else ""
+    
+    uni_txt <- function(default_name) {
+      if (identical(bg, "dataset")) {
+        if (is.finite(n_uni_dataset)) paste0("<b>Background (universe):</b> dataset-mapped genes (N=", as.integer(n_uni_dataset), ").")
+        else "<b>Background (universe):</b> dataset-mapped genes."
+      } else {
+        if (is.finite(n_uni_orgdb)) paste0("<b>Background (universe):</b> ", default_name, " (N≈", as.integer(n_uni_orgdb), ").")
+        else paste0("<b>Background (universe):</b> ", default_name, ".")
+      }
+    }
+    
+    gs_txt <- "<b>GSSize:</b> number of genes per term in the selected universe (filtered by minGSSize / maxGSSize)."
+    
+    # -----------------------------
+    # Disease/Trait tab note
+    # -----------------------------
+    if (identical(main_tab, "tab_enrich_disease")) {
+      msg <- paste0(
+        "<b>Disease/Trait enrichment</b><br>",
+        target_lbl, "<br>",
+        "<b>Foreground:</b> EWAS significant bins/regions for the selected target (and cluster if applicable).<br>",
+        "<b>Background (universe):</b> all tested bins/regions available in the EWAS dataset for the selected target.<br>",
+        "<b>Test unit:</b> EWAS bins/regions (not unique genes).<br>",
+        "<b>Method:</b> over-representation test within the Disease/Trait module (see module settings/results)."
+      )
+      
+      return(htmltools::HTML(paste0(
+        "<div style='background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>",
+        msg, "</div>"
+      )))
+    }
+    
+    # -----------------------------
+    # GO/KEGG/GoSlim tab note
+    # -----------------------------
+    tip_goslim <- "<br><br><b>Tip:</b> If you get no GoSlim terms, try setting <code>minGSSize</code> to <b>1–3</b>."
+    
+    msg <- if (identical(tab_func, "tab_enrich_go")) {
+      paste0(
+        "<b>GO enrichment</b><br>",
+        target_lbl, "<br>",
+        sc_txt, fg_cnt_txt, "<br>",
+        uni_txt("OrgDb annotated genes (org.Hs.eg.db)"), "<br>",
+        "<b>Test unit:</b> genes (ENTREZID).<br>",
+        gs_txt, "<br>",
+        "<b>Method:</b> clusterProfiler::enrichGO (pAdjustMethod=BH; filtered by FDR cutoff)."
+      )
+    } else if (identical(tab_func, "tab_enrich_kegg")) {
+      paste0(
+        "<b>KEGG enrichment</b><br>",
+        target_lbl, "<br>",
+        sc_txt, fg_cnt_txt, "<br>",
+        uni_txt("KEGG default background (organism-specific, hsa)"), "<br>",
+        "<b>Test unit:</b> genes (ENTREZID).<br>",
+        gs_txt, "<br>",
+        "<b>Method:</b> clusterProfiler::enrichKEGG (organism=hsa; pAdjustMethod=BH; filtered by FDR cutoff)."
+      )
+    } else if (identical(tab_func, "tab_enrich_goslim")) {
+      paste0(
+        "<b>GoSlim enrichment</b><br>",
+        target_lbl, "<br>",
+        sc_txt, fg_cnt_txt, "<br>",
+        if (identical(bg, "dataset")) {
+          paste0("<b>Background (universe):</b> dataset-mapped genes",
+                 if (is.finite(n_uni_dataset)) paste0(" (N=", as.integer(n_uni_dataset), ").") else ".",
+                 " (recommended in cluster mode).")
+        } else {
+          "<b>Background (universe):</b> default OrgDb-based universe unless a dataset universe is provided.<br>GoSlim categories come from GO→GoSlim mapping (<i>goslim_generic</i>; TERM2GENE)."
+        },
+        "<br><b>Test unit:</b> genes (ENTREZID).<br>",
+        gs_txt, "<br>",
+        "<b>Method:</b> clusterProfiler::enricher with GoSlim TERM2GENE.",
+        tip_goslim
+      )
+    } else {
+      paste0("<b>Background:</b> ", if (identical(bg, "dataset")) "Dataset genes" else "Default background")
+    }
+    
+    htmltools::HTML(paste0(
+      "<div style='background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>",
+      msg, "</div>"
+    ))
+  })
+#-------------------------------------------------------------------------------
+  
 }
 
 shinyApp(ui, server)

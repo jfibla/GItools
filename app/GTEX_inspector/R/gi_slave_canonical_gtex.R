@@ -1,11 +1,11 @@
-# R/gi_slave_canonical.R
+# R/gi_slave_canonical_gtex.R
 # ------------------------------------------------------------
-# GItools CANONICAL SLAVE SYNC (common to ALL apps)
-# - Reads SID from input$gi_qs or url_search
-# - Polls state JSON
-# - Loads standardized GWAS + CLUSTERS from RDS
+# GItools CANONICAL SLAVE SYNC (GTEx slave)
+# - Reads SID from input$gi_qs, url_search, url_hash
+# - Polls state JSON (mtime)
+# - Loads GWAS + CLUSTERS RDS
 # - Applies UI params (best effort)
-# - Exposes gwas_shared_r(), clusters_shared_r()
+# - Exposes: gwas_shared(), clusters_shared(), state_shared(), sid()
 # ------------------------------------------------------------
 
 `%||%` <- function(a, b) if (!is.null(a) && length(a) && !all(is.na(a))) a else b
@@ -16,40 +16,30 @@ gi_sanitize_sid <- function(s) {
   if (!nzchar(s)) NULL else s
 }
 
-# IMPORTANT: adapt these roots to your project
-# Portable defaults: use options if set, else globals from gi_state.R, else cfg, else infer.
-gi_get_shared_root <- function() {
-  x <- getOption("gi_shared_root", "")
-  if (nzchar(x)) return(x)
-  if (exists("gi_shared_root")) return(gi_shared_root)
-  if (exists("gi_cfg", mode = "function")) return(gi_cfg()$shared)
-  this_dir <- tryCatch(dirname(sys.frame(1)$ofile), error = function(e) "")
-  if (nzchar(this_dir)) return(normalizePath(this_dir, winslash = "/", mustWork = FALSE))
-  ""
+sid_ok <- function(x) {
+  if (is.null(x)) return(FALSE)
+  x <- as.character(x)
+  if (length(x) != 1) return(FALSE)
+  x <- trimws(x)
+  isTRUE(nzchar(x)) && !is.na(x)
 }
 
+# Prefer options() roots (portable + hub)
 gi_get_state_root <- function() {
   x <- getOption("gi_state_root", "")
   if (nzchar(x)) return(x)
-  if (exists("gi_state_root")) return(gi_state_root)
-  if (exists("gi_cfg", mode = "function")) return(file.path(gi_cfg()$root, "app", "_state"))
-  this_dir <- tryCatch(dirname(sys.frame(1)$ofile), error = function(e) "")
-  if (nzchar(this_dir)) {
-    root_guess <- normalizePath(file.path(this_dir, ".."), winslash = "/", mustWork = FALSE)
-    return(file.path(root_guess, "app", "_state"))
-  }
+  # fallback very conservative
   ""
 }
-
 
 gi_state_paths <- function(sid) {
   root <- gi_get_state_root()
   root <- normalizePath(root, winslash = "/", mustWork = FALSE)
   
   list(
-    json   = file.path(root, paste0("state_",    sid, ".json")),
-    gwas   = file.path(root, paste0("gwas_",     sid, ".rds")),
-    clus   = file.path(root, paste0("clusters_", sid, ".rds")),
+    json = file.path(root, paste0("state_",    sid, ".json")),
+    gwas = file.path(root, paste0("gwas_",     sid, ".rds")),
+    clus = file.path(root, paste0("clusters_", sid, ".rds")),
     params = file.path(root, paste0("params_",   sid, ".rds"))  # <-- NEW
   )
 }
@@ -62,45 +52,27 @@ gi_read_state <- function(sid) {
 
 gi_std_gwas <- function(df) {
   if (!is.data.frame(df) || !nrow(df)) return(NULL)
-  
-  # tolerate various incoming formats
   nms <- names(df)
   
-  # accept P / p as p-value
-  if (!"Pval" %in% nms && "P" %in% nms) df$Pval <- df$P
-  if (!"Pval" %in% nms && "p" %in% nms) df$Pval <- df$p
-  if (!"Pval" %in% nms && "p_value" %in% nms) df$Pval <- df$p_value
-  if (!"Pval" %in% nms && "pvalue" %in% nms) df$Pval <- df$pvalue
-  
-  # ensure required names exist
-  if (!"CHR" %in% nms && "chr" %in% nms) df$CHR <- df$chr
-  if (!"BP"  %in% nms && "bp"  %in% nms) df$BP  <- df$bp
+  if (!"CHR"  %in% nms && "chr"  %in% nms) df$CHR  <- df$chr
+  if (!"BP"   %in% nms && "bp"   %in% nms) df$BP   <- df$bp
   if (!"Pval" %in% nms && "pval" %in% nms) df$Pval <- df$pval
   if (!"logp" %in% nms && "LOGP" %in% nms) df$logp <- df$LOGP
-  
-  if (!"snp" %in% nms && "SNP" %in% nms) df$snp <- df$SNP
+  if (!"snp"  %in% nms && "SNP"  %in% nms) df$snp  <- df$SNP
   if (!"rsid" %in% nms && "RSID" %in% nms) df$rsid <- df$RSID
   
-  # robust coercion (handles factor/character safely)
-  df$CHR  <- suppressWarnings(as.integer(as.character(df$CHR)))
-  df$BP   <- suppressWarnings(as.integer(as.character(df$BP)))
-  
-  # Pval: factor/character scientific notation safe
-  p_chr   <- trimws(as.character(df$Pval))
-  p_chr   <- gsub("\\s+", "", p_chr)
-  p_chr   <- ifelse(!grepl("\\.", p_chr) & grepl(",", p_chr), gsub(",", ".", p_chr, fixed = TRUE), p_chr)
-  df$Pval <- suppressWarnings(as.numeric(p_chr))
-  
+  df$CHR  <- suppressWarnings(as.integer(df$CHR))
+  df$BP   <- suppressWarnings(as.integer(df$BP))
+  df$Pval <- suppressWarnings(as.numeric(df$Pval))
   if (!"logp" %in% names(df)) df$logp <- -log10(df$Pval)
   
-  if (!"snp" %in% names(df))  df$snp  <- NA_character_
+  if (!"snp"  %in% names(df)) df$snp  <- NA_character_
   if (!"rsid" %in% names(df)) df$rsid <- NA_character_
   
   df <- df[is.finite(df$CHR) & is.finite(df$BP) & is.finite(df$Pval) & df$Pval > 0, , drop = FALSE]
   if (!nrow(df)) return(NULL)
   
-  # fallback snp display
-  df$snp <- ifelse(is.na(df$snp) | !nzchar(df$snp), paste0("chr", df$CHR, ":", df$BP), as.character(df$snp))
+  df$snp  <- ifelse(is.na(df$snp)  | !nzchar(df$snp),  paste0("chr", df$CHR, ":", df$BP), as.character(df$snp))
   df$rsid <- as.character(df$rsid)
   
   df[, intersect(c("CHR","BP","snp","rsid","Pval","logp","BPcum"), names(df)), drop = FALSE]
@@ -110,13 +82,14 @@ gi_std_clusters <- function(cl0) {
   if (!is.data.frame(cl0) || !nrow(cl0)) return(NULL)
   cl <- as.data.frame(cl0)
   
-  if (!"chr" %in% names(cl) && "CHR" %in% names(cl)) cl$chr <- cl$CHR
+  if (!"chr"   %in% names(cl) && "CHR"      %in% names(cl)) cl$chr   <- cl$CHR
   if (!"start" %in% names(cl) && "start_bp" %in% names(cl)) cl$start <- cl$start_bp
-  if (!"end" %in% names(cl) && "end_bp" %in% names(cl)) cl$end <- cl$end_bp
+  if (!"end"   %in% names(cl) && "end_bp"   %in% names(cl)) cl$end   <- cl$end_bp
   
   cl$chr   <- suppressWarnings(as.integer(cl$chr))
   cl$start <- suppressWarnings(as.integer(cl$start))
   cl$end   <- suppressWarnings(as.integer(cl$end))
+  
   cl <- cl[is.finite(cl$chr) & is.finite(cl$start) & is.finite(cl$end) & cl$end >= cl$start, , drop = FALSE]
   if (!nrow(cl)) return(NULL)
   
@@ -129,51 +102,29 @@ gi_std_clusters <- function(cl0) {
   cl$center <- as.integer(round((cl$start + cl$end) / 2))
   cl$cluster_size_kb <- round((cl$end - cl$start + 1) / 1000, 2)
   
-  # keep only canonical cols + any extras
   keep <- unique(c(
     "chr","start","end",
     "cluster_id","cluster_chr","cluster_chr_n",
     "center","cluster_size_kb",
-    "n_snps","top_snp","top_logp"
+    "n_snps","top_snp","top_logp",
+    "n_gtex"
   ))
   cl[, intersect(keep, names(cl)), drop = FALSE]
 }
 
+# ------------------------------------------------------------
+# MAIN INIT
+# ------------------------------------------------------------
 gi_slave_canonical_init <- function(session) {
-  
-  # -------------------------------------------------------------------
-  # Helpers (local)
-  # -------------------------------------------------------------------
-  `%||%` <- function(a, b) {
-    if (!is.null(a) && length(a) && !is.na(a) && nzchar(as.character(a))) a else b
-  }
   
   safe_update <- function(expr) {
     tryCatch(force(expr), error = function(e) NULL)
     invisible(TRUE)
   }
   
-  update_num_like <- function(id, value) {
-    if (is.null(value) || !is.finite(suppressWarnings(as.numeric(value)))) return(invisible(FALSE))
-    v <- as.numeric(value)
-    
-    # 1) if it's a sliderInput
-    safe_update(if (id %in% names(session$input))
-      shiny::updateSliderInput(session, id, value = v))
-    
-    # 2) if it's a numericInput (fallback)
-    safe_update(if (id %in% names(session$input))
-      shiny::updateNumericInput(session, id, value = v))
-    
-    invisible(TRUE)
-  }
-  
-  # -------------------------------------------------------------------
-  # SID (shared session identifier)
-  # -------------------------------------------------------------------
   sid_rv <- shiny::reactiveVal(NULL)
   
-  # 1) Preferred: input$gi_qs (ngrok/caddy). IGNORE empty.
+  # 1) Preferred: input$gi_qs (Hub/ngrok/caddy)
   shiny::observeEvent(session$input$gi_qs, {
     qs <- as.character(session$input$gi_qs %||% "")
     if (!nzchar(qs)) return()
@@ -182,7 +133,7 @@ gi_slave_canonical_init <- function(session) {
     if (!is.null(s0)) sid_rv(s0)
   }, ignoreInit = FALSE)
   
-  # 2) Fallback: url_search (local). IGNORE empty.
+  # 2) Fallback: url_search (?sid=...)
   shiny::observe({
     if (!is.null(sid_rv())) return()
     qs <- as.character(session$clientData$url_search %||% "")
@@ -192,79 +143,54 @@ gi_slave_canonical_init <- function(session) {
     if (!is.null(s0)) sid_rv(s0)
   })
   
-# # Debug SID when it becomes available
-# shiny::observeEvent(sid_rv(), {
-#   s <- sid_rv()
-#   if (is.null(s)) {
-#     cat("[SLAVE] sid = <NULL> (waiting)\n")
-#     return()
-#   }
-#   p <- gi_state_paths(s)
-#   cat("[SLAVE] sid =", s, "\n")
-#   cat("[SLAVE] json =", p$json, "exists=", file.exists(p$json), "\n")
-#   cat("[SLAVE] gwas =", p$gwas, "exists=", file.exists(p$gwas), "\n")
-#   cat("[SLAVE] clus =", p$clus, "exists=", file.exists(p$clus), "\n")
-# }, ignoreInit = FALSE)
+  # 3) Extra fallback: url_hash (#?sid=...)
+  shiny::observe({
+    if (!is.null(sid_rv())) return()
+    hs <- as.character(session$clientData$url_hash %||% "")
+    if (!nzchar(hs)) return()
+    hs <- sub("^#", "", hs)
+    q  <- shiny::parseQueryString(sub("^\\?", "", hs))
+    s0 <- gi_sanitize_sid(q$sid %||% "")
+    if (!is.null(s0)) sid_rv(s0)
+  })
   
-  # Debug SID when it becomes available (SAFE)
+  # Debug when sid becomes available
   shiny::observeEvent(sid_rv(), {
     s <- sid_rv()
-    
-    # IMPORTANT: Hub can momentarily give NA/"" while booting
-    if (is.null(s) || is.na(s) || !nzchar(trimws(as.character(s)))) {
-      cat("[SLAVE] sid not ready yet: ", s, "\n")
+    if (!sid_ok(s)) {
+      cat("[SLAVE] sid not ready yet:", s, "\n")
       return()
     }
-    
-    p <- tryCatch(
-      gi_state_paths(s),
-      error = function(e) {
-        cat("[SLAVE] gi_state_paths ERROR for sid=", s, " | ", conditionMessage(e), "\n")
-        return(NULL)
-      }
-    )
-    
-    if (is.null(p)) return()
-    
+    p <- gi_state_paths(s)
     cat("[SLAVE] sid =", s, "\n")
-    cat("[SLAVE] json =", p$json, "exists=", !is.na(p$json) && file.exists(p$json), "\n")
-    cat("[SLAVE] gwas =", p$gwas, "exists=", !is.na(p$gwas) && file.exists(p$gwas), "\n")
-    cat("[SLAVE] clus =", p$clus, "exists=", !is.na(p$clus) && file.exists(p$clus), "\n")
-    
-  }, ignoreInit = TRUE)  # <— clau: no disparar a l’inici
+    cat("[SLAVE] json =", p$json, "exists=", file.exists(p$json), "\n")
+    cat("[SLAVE] gwas =", p$gwas, "exists=", file.exists(p$gwas), "\n")
+    cat("[SLAVE] clus =", p$clus, "exists=", file.exists(p$clus), "\n")
+  }, ignoreInit = TRUE)
   
-  
-  # -------------------------------------------------------------------
-  # Poll state JSON (mtime)
-  # -------------------------------------------------------------------
+  # Poll JSON mtime
   gi_state <- shiny::reactivePoll(
-    intervalMillis = 4000,
+    intervalMillis = 2000,
     session = session,
     checkFunc = function() {
       s <- sid_rv()
-      if (is.null(s)) return(0)
+      if (!sid_ok(s)) return(0)
       pj <- gi_state_paths(s)$json
       if (!file.exists(pj)) return(0)
       as.numeric(file.info(pj)$mtime)
     },
     valueFunc = function() {
       s <- sid_rv()
-      if (is.null(s)) return(NULL)
+      if (!sid_ok(s)) return(NULL)
       gi_read_state(s)
     }
   )
   
-  # -------------------------------------------------------------------
-  # Shared RVs exported to apps
-  # -------------------------------------------------------------------
-  gi_last_stamp   <- shiny::reactiveVal(NA_integer_)
-  gi_state_rv     <- shiny::reactiveVal(NULL)   # 
-  gwas_shared_rv  <- shiny::reactiveVal(NULL)
-  clus_shared_rv  <- shiny::reactiveVal(NULL)
+  gi_last_stamp  <- shiny::reactiveVal(NA_integer_)
+  gi_state_rv    <- shiny::reactiveVal(NULL)
+  gwas_shared_rv <- shiny::reactiveVal(NULL)
+  clus_shared_rv <- shiny::reactiveVal(NULL)
   
-  # -------------------------------------------------------------------
-  # Apply state when JSON changes
-  # -------------------------------------------------------------------
   shiny::observeEvent(gi_state(), {
     
     s <- sid_rv()
@@ -418,15 +344,12 @@ gi_slave_canonical_init <- function(session) {
     
   }, ignoreInit = FALSE)
   
-  # -------------------------------------------------------------------
-  # Return "handle" used by apps
-  # -------------------------------------------------------------------
+  
   list(
     sid            = sid_rv,
     gi_state       = gi_state,
-    state_shared    = gi_state_rv,     #
+    state_shared   = gi_state_rv,
     gwas_shared    = gwas_shared_rv,
-    clusters_shared = clus_shared_rv
+    clusters_shared= clus_shared_rv
   )
 }
-

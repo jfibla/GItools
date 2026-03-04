@@ -152,18 +152,6 @@ gi_state_root <- function() {
   normalizePath(file.path(dirname(getwd()), "_state"), winslash = "/", mustWork = FALSE)
 }
 
-
-
-#gi_state_paths <- function(sid) {
-#  gi_ensure_dirs()
-#  sid <- gi_sanitize_sid(sid)
-#  list(
-#    json = file.path(gi_state_root, paste0("state_", sid, ".json")),
-#    gwas = file.path(gi_state_root, paste0("gwas_", sid, ".rds")),
-#    clus = file.path(gi_state_root, paste0("clusters_", sid, ".rds"))
-#  )
-#}
-
 gi_state_paths <- function(sid) {
   root <- gi_state_root()
   dir.create(root, showWarnings = FALSE, recursive = TRUE)
@@ -172,7 +160,8 @@ gi_state_paths <- function(sid) {
     root = root,
     json = file.path(root, paste0("state_", sid, ".json")),
     gwas = file.path(root, paste0("gwas_", sid, ".rds")),
-    clus = file.path(root, paste0("clusters_", sid, ".rds"))
+    clus = file.path(root, paste0("clusters_", sid, ".rds")),
+    params = file.path(root, paste0("params_",  sid, ".rds"))
   )
 }
 

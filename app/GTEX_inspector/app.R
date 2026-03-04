@@ -30,7 +30,10 @@ library(IRanges)
 library(AnnotationDbi)
 library(org.Hs.eg.db)
 
+library("this.path")
+
 txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
 # --- Fixar dplyr com a select/mutate/arrange oficial ---
 select     <- dplyr::select
 filter     <- dplyr::filter
@@ -38,6 +41,29 @@ mutate     <- dplyr::mutate
 arrange    <- dplyr::arrange
 summarise  <- dplyr::summarise
 rename     <- dplyr::rename
+# ===========================
+# ------------------------------------------------------------
+# APP_DIR robust (no depèn de getwd)
+# ------------------------------------------------------------
+APP_DIR <- tryCatch({
+  # quan s'executa amb runApp("path"), this.path funciona; si no, fallback
+  if (requireNamespace("this.path", quietly = TRUE)) {
+    normalizePath(dirname(this.path::this.path()), winslash = "/", mustWork = FALSE)
+  } else {
+    ""
+  }
+}, error = function(e) "")
+
+# Fallback si this.path no està disponible:
+if (!nzchar(APP_DIR)) {
+
+    cand <- normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+  if (dir.exists(file.path(cand, "R")) && dir.exists(file.path(cand, "www"))) APP_DIR <- cand
+}
+
+cat("[GTEX] APP_DIR=", APP_DIR, "\n")
+
+# ===========================
 
 # ===========================
 # GTEx file logging (early)
@@ -71,8 +97,17 @@ if (nzchar(gi_root_guess)) {
 }
 
 # 3) Final root: prefer gi_cfg() if present; else fallback to guess
-BASE <- if (exists("gi_cfg", mode = "function")) gi_cfg()$root else gi_root_guess
-BASE <- normalizePath(BASE, winslash = "/", mustWork = TRUE)
+
+BASE <- Sys.getenv("GITOOLS_ROOT", "")
+if (!nzchar(BASE)) {
+  BASE <- if (exists("gi_cfg", mode="function")) gi_cfg()$root else gi_root_guess
+}
+
+BASE <- normalizePath(BASE, winslash="/", mustWork = FALSE)
+if (!nzchar(BASE) || !dir.exists(BASE)) {
+  glog("[GTEx] ERROR: BASE not found. wd=", getwd(), " gi_root_guess=", gi_root_guess, " env_GITOOLS_ROOT=", Sys.getenv("GITOOLS_ROOT",""))
+  stop("GItools BASE not found (check HUB working dir/env vars).")
+}
 
 # 4) Load GI shared state (defines gi_shared_root / gi_state_root)
 state_file <- file.path(BASE, "_shared", "gi_state.R")
@@ -81,7 +116,6 @@ source(state_file, local = TRUE)
 
 cat("[GI] using gi_state.R at:", state_file, "\n")
 cat("[GI] gi_shared_root =", gi_shared_root, "\n")
-# cat("[GI] gi_state_root  =", gi_state_root, "\n")
 cat("[GI] gi_state_root  = ", gi_state_root(), "\n")
 
 
@@ -411,9 +445,79 @@ add_cluster_stats_from_hits <- function(clusters_df, df_sig) {
   
   as.data.frame(cl)
 }
+# ------------------------------------------------------------
+#### Helpers ORA + mapa gene_id→gene_name
+# ------------------------------------------------------------
+# ORA Fisher per files (eQTL rows)
+# ------------------------------------------------------------
+`%||%` <- function(a, b) if (!is.null(a)) a else b
 
+ora_fisher_rows <- function(universe_vec, foreground_vec) {
+  U <- na.omit(as.character(universe_vec))
+  F <- na.omit(as.character(foreground_vec))
+  
+  if (!length(F) || !length(U)) {
+    return(data.table::data.table(
+      term=character(), k=integer(), K=integer(), n=integer(), N=integer(),
+      odds=numeric(), pvalue=numeric(), padj=numeric()
+    ))
+  }
+  
+  N <- length(U)
+  n <- length(F)
+  
+  tabU <- table(U)
+  tabF <- table(F)
+  
+  terms <- names(tabU)
+  
+  out <- data.table::rbindlist(lapply(terms, function(t) {
+    K <- as.integer(tabU[[t]])
+    k <- as.integer(tabF[[t]] %||% 0L)
+    
+    a <- k
+    b <- n - k
+    c <- K - k
+    d <- (N - K) - (n - k)
+    if (any(c(a,b,c,d) < 0)) return(NULL)
+    
+    ft <- stats::fisher.test(matrix(c(a,c,b,d), nrow = 2), alternative = "greater")
+    data.table::data.table(
+      term=t, k=a, K=K, n=n, N=N,
+      odds=unname(ft$estimate), pvalue=ft$p.value
+    )
+  }), fill = TRUE)
+  
+  if (!nrow(out)) return(out)
+  out[, padj := p.adjust(pvalue, method = "BH")]
+  out[order(padj, pvalue)]
+}
+##############################################################################
+# ------------------------------------------------------------
+# Helpers label (Catalog-style)
+# ------------------------------------------------------------
+short_label <- function(x, max_chars = 30, wrap_width = 12) {
+  x <- as.character(x)
+  x <- stringr::str_squish(x)
+  x <- ifelse(nchar(x) > max_chars, paste0(substr(x, 1, max_chars - 1), "…"), x)
+  stringr::str_wrap(x, width = wrap_width)
+}
+
+pick_col <- function(df, candidates) {
+  nm <- names(df)
+  hit <- candidates[candidates %in% nm]
+  if (length(hit)) hit[1] else NULL
+}
+##############################################################################
+
+
+##############################################################################
+############################### UI ###########################################
+##############################################################################
 # ===========================
-# UI  (FULL)
+# UI (FULL) — TOP NAV: Analysis / Enrichment / LD
+# - Global grey background for plots + tables
+# - Enrichment moved OUT of Analysis main_tabs (now its own navbar tab)
 # ===========================
 
 ui <- navbarPage(
@@ -424,7 +528,7 @@ ui <- navbarPage(
   id = "topnav",
   
   # -----------------------------
-  # Global light-grey panels for plots/tables
+  # Global QS push + global grey styling
   # -----------------------------
   tags$head(
     tags$script(HTML(
@@ -448,11 +552,11 @@ ui <- navbarPage(
     return false;
   }
 
-  // Try now + retries (Shiny may not be ready at DOMContentLoaded behind proxy)
+  # Try now + retries (Shiny may not be ready at DOMContentLoaded behind proxy)
   var tries = 0;
   var iv = setInterval(function(){
     tries++;
-    if (pushQS() || tries > 50) clearInterval(iv); // ~5s max
+    if (pushQS() || tries > 50) clearInterval(iv); # ~5s max
   }, 100);
 
   window.addEventListener('pageshow', function(){ pushQS(); });
@@ -460,14 +564,61 @@ ui <- navbarPage(
     if (!document.hidden) pushQS();
   });
 })();
-  "))
+    ")),
+    tags$style(HTML("
+/* ----------------------------------------------------
+   Global light-gray background for plots + tables
+   ---------------------------------------------------- */
+
+/* Plotly widgets */
+.plotly.html-widget {
+  background: #f2f2f2 !important;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+/* Base R plots / ggplot outputs */
+.shiny-plot-output {
+  background: #f2f2f2 !important;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+/* DT tables (wrapper container) */
+.dataTables_wrapper {
+  background: #f2f2f2 !important;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+/* Keep DT inner bits cohesive (optional) */
+table.dataTable,
+table.dataTable thead th,
+table.dataTable tbody td {
+  background-color: transparent !important;
+}
+
+/* Spinner wrapper container */
+.shiny-spinner-output-container {
+  background: #f2f2f2 !important;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+/* Optional: panel-lite shouldn't fight the global padding */
+.panel-lite {
+  background: transparent !important;
+}
+    "))
   ),
   
+  # ========================================================================
+  # NAV TAB 1: Analysis
+  # ========================================================================
   tabPanel(
     title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>Analysis</span>"),
     
     sidebarLayout(
-      
       sidebarPanel(
         width = 3,
         
@@ -513,7 +664,8 @@ ui <- navbarPage(
             "Reset",
             icon = icon("rotate-left"),
             class = "btn-warning"
-          ))),
+          ))
+        ),
         fileInput(
           "gwas_file",
           "GWAS p-value table (TSV/CSV)",
@@ -555,7 +707,7 @@ ui <- navbarPage(
             
             conditionalPanel(
               condition = "input.cluster_method == 'window'",
-              sliderInput("pthr", "-log10(P) threshold", min = 2, max = 20, value = 5, step = 0.5),
+              sliderInput("pthr", "-log10(P) threshold", min = 2, max = 20, value = 8, step = 0.5),
               numericInput("flank", "Flank (+/- bp)", value = 10000, min = 0, max = 10000000, step = 1000)
             ),
             
@@ -575,7 +727,7 @@ ui <- navbarPage(
               sliderInput(
                 "min_logp",
                 "-log10(P) threshold (hit significance)",
-                min = 2, max = 20, value = 5, step = 0.1
+                min = 2, max = 20, value = 8, step = 0.5
               ),
               
               numericInput(
@@ -611,15 +763,6 @@ ui <- navbarPage(
             tags$hr(),
             
             # ---- Step 3
-        #    h3(
-        #      "Step 3 · Load GTEx eQTL resource",
-        #      style = "color:#1A4E8A; font-size:22px; font-weight:700; margin-top:10px;"
-        #    ),
-        #    helpText("By default the app tries to load 'www/gtex_eqtl_light.rds' at startup."),
-        #    textOutput("gtex_status"),
-        #    tags$hr(),
-            
-            # ---- Step 3
             h3(
               "Step 3 · Extract eQTLs in all clusters",
               style = "color:#1A4E8A; font-size:22px; font-weight:700; margin-top:10px;"
@@ -647,7 +790,7 @@ ui <- navbarPage(
           tabPanel(
             title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>📈 Manhattan</span>"),
             h4("Top: GWAS p-values · Bottom: GTEx eQTLs inside all clusters"),
-            div(class = "panel-lite", plotlyOutput("manhattan_combo", height = "700px")),
+            div(class = "panel-lite", shinycssloaders::withSpinner(plotlyOutput("manhattan_combo", height = "700px"))),
             tags$hr(),
             helpText("Select a window on 'GTEx hits' to obtain a link to UCSC browser (see below)"),
             
@@ -707,124 +850,151 @@ ui <- navbarPage(
                 div(class = "panel-lite", verbatimTextOutput("gtex_interpret"))
               )
             )
+          )
+        )
+      )
+    )
+  ),
+  
+  # ========================================================================
+  # NAV TAB 2: Enrichment (GO / KEGG / GoSlim)
+  # ========================================================================
+  tabPanel(
+    title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>✳️ Enrichment</span>"),
+    value = "tab_enrich",
+    
+    sidebarLayout(
+      sidebarPanel(
+        width = 3,
+        
+        radioButtons(
+          "func_scope", "Scope",
+          choices  = c("Global" = "global", "Cluster" = "cluster"),
+          selected = "global"
+        ),
+        conditionalPanel(
+          condition = "input.func_scope == 'cluster'",
+          selectInput("func_cluster_id", "Cluster", choices = NULL)
+        ),
+        tags$hr(),
+        
+        selectInput(
+          "enrich_background", "Background",
+          choices  = c("Reference annotated genes" = "orgdb",
+                       "Dataset genes"            = "dataset"),
+          selected = "orgdb"
+        ),
+        
+        numericInput(
+          "enrich_pcut",
+          "FDR cutoff",
+          value = 0.05,
+          min   = 0,
+          max   = 1,
+          step  = 0.01
+        ),
+        
+        conditionalPanel(
+          condition = "input.enrich_tabs == 'tab_enrich_go' || input.enrich_tabs == 'tab_enrich_goslim'",
+          checkboxGroupInput(
+            "go_ontos",
+            "GO ontologies",
+            choices  = c("BP", "CC", "MF"),
+            selected = c("BP", "CC", "MF"),
+            inline   = TRUE
+          ),
+          numericInput("go_topn", "Top terms per ontology", value = 10, min = 1, max = 50, step = 1)
+        ),
+        
+        conditionalPanel(
+          condition = "input.enrich_tabs == 'tab_enrich_go'",
+          checkboxInput("go_simplify", "Simplify GO terms (optional)", value = FALSE)
+        ),
+        
+        conditionalPanel(
+          condition = "input.enrich_tabs == 'tab_enrich_kegg'",
+          numericInput("enrich_kegg_top", "Top KEGG pathways", value = 15, min = 1, max = 50, step = 1)
+        ),
+        
+        tags$hr(),
+        
+        actionButton("info_12", "ℹ️ GSSize"),
+        numericInput("enrich_min_gs", "minGSSize", value = 10, min = 1, step = 1),
+        numericInput("enrich_max_gs", "maxGSSize", value = 500, min = 10, step = 10),
+        
+        tags$hr(),
+        
+        actionButton(
+          "run_enrich",
+          label = "Run enrichment",
+          icon  = icon("play"),
+          class = "btn btn-primary"
+        )
+      ),
+      
+      mainPanel(
+        width = 9,
+        
+        div(class = "panel-lite", uiOutput("enrich_bg_note")),
+        
+        tabsetPanel(
+          id = "enrich_tabs",
+          tabPanel(
+            title = HTML("<span style='font-size:15px; font-weight:600;'>GTEx (Gene/Tissue)</span>"),
+            value = "tab_enrich_gtex_terms",
+            fluidRow(
+              column(6, h4("Tissue enrichment"), shinycssloaders::withSpinner(plotOutput("enrich_tissue_plot", height=350))),
+              column(6, h4("Gene enrichment"),   shinycssloaders::withSpinner(plotOutput("enrich_gene_plot",   height=350)))
+            ),
+            tags$hr(),
+            fluidRow(
+              column(6, DT::DTOutput("enrich_tissue_table")),
+              column(6, DT::DTOutput("enrich_gene_table"))
+            )
+          ),
+          tabPanel(
+            title = HTML("<span style='font-size:15px; font-weight:600;'>GO</span>"),
+            value = "tab_enrich_go",
+            div(class = "panel-lite",
+                shinycssloaders::withSpinner(plotOutput("go_bar", height = 400))
+            ),
+            tags$hr(),
+            div(class = "panel-lite",
+                shinycssloaders::withSpinner(DT::DTOutput("go_table"))
+            )
           ),
           
-          # ============================================================
-          # UI — GTEx Enrichment (Catalog/NonSyn-style)
-          # ============================================================
           tabPanel(
-            title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>🧬 Enrichment</span>"),
-            value = "tab_enrich",
-            
-            sidebarLayout(
-              sidebarPanel(
-                width = 3,
-                
-                radioButtons(
-                  "func_scope", "Scope",
-                  choices  = c("Global" = "global", "Cluster" = "cluster"),
-                  selected = "global"
-                ),
-                
-                conditionalPanel(
-                  condition = "input.func_scope == 'cluster'",
-                  uiOutput("func_cluster_ui")
-                ),
-                
-                tags$hr(),
-                
-                selectInput(
-                  "enrich_background", "Background",
-                  choices  = c("Reference annotated genes" = "orgdb",
-                               "Dataset genes"            = "dataset"),
-                  selected = "orgdb"
-                ),
-                
-                numericInput(
-                  "enrich_pcut",
-                  "FDR cutoff",
-                  value = 0.05,
-                  min   = 0,
-                  max   = 1,
-                  step  = 0.01
-                ),
-                
-                conditionalPanel(
-                  condition = "input.enrich_tabs == 'tab_enrich_go'",
-                  checkboxGroupInput(
-                    "go_ontos",
-                    "GO ontologies",
-                    choices  = c("BP", "CC", "MF"),
-                    selected = c("BP", "CC", "MF"),
-                    inline   = TRUE
-                  ),
-                  numericInput("go_topn", "Top GO terms per ontology", value = 10, min = 1, max = 50, step = 1),
-                  checkboxInput("go_simplify", "Simplify GO terms (optional)", value = FALSE)
-                ),
-                
-                conditionalPanel(
-                  condition = "input.enrich_tabs == 'tab_enrich_kegg'",
-                  numericInput("enrich_kegg_top", "Top KEGG pathways", value = 15, min = 1, max = 50, step = 1)
-                ),
-                
-                tags$hr(),
-                
-                actionButton("info_12", "ℹ️ GSSize"),
-                numericInput("enrich_min_gs", "minGSSize", value = 10, min = 1, step = 1),
-                numericInput("enrich_max_gs", "maxGSSize", value = 500, min = 10, step = 10),
-                
-                tags$hr(),
-                
-                actionButton(
-                  "run_enrich",
-                  label = "Run enrichment",
-                  icon  = icon("play"),
-                  class = "btn btn-primary"
-                )
-              ),
-              
-              mainPanel(
-                width = 9,
-                
-                div(class = "panel-lite", uiOutput("enrich_bg_note")),
-                
-                tabsetPanel(
-                  id = "enrich_tabs",
-                  
-                  tabPanel(
-                    title = HTML("<span style='font-size:15px; font-weight:600;'>GO</span>"),
-                    value = "tab_enrich_go",
-                    div(class = "panel-lite",
-                        shinycssloaders::withSpinner(plotOutput("go_bar", height = 400))
-                    ),
-                    tags$hr(),
-                    div(class = "panel-lite",
-                        shinycssloaders::withSpinner(DT::DTOutput("go_table"))
-                    )
-                  ),
-                  
-                  tabPanel(
-                    title = HTML("<span style='font-size:15px; font-weight:600;'>KEGG</span>"),
-                    value = "tab_enrich_kegg",
-                    div(class = "panel-lite",
-                        shinycssloaders::withSpinner(plotOutput("kegg_bar", height = 400))
-                    ),
-                    tags$hr(),
-                    div(class = "panel-lite",
-                        shinycssloaders::withSpinner(DT::DTOutput("kegg_table"))
-                    )
-                  )
-                )
-              )
+            title = HTML("<span style='font-size:15px; font-weight:600;'>KEGG</span>"),
+            value = "tab_enrich_kegg",
+            div(class = "panel-lite",
+                shinycssloaders::withSpinner(plotOutput("kegg_bar", height = 400))
+            ),
+            tags$hr(),
+            div(class = "panel-lite",
+                shinycssloaders::withSpinner(DT::DTOutput("kegg_table"))
+            )
+          ),
+          
+          tabPanel(
+            title = HTML("<span style='font-size:15px; font-weight:600;'>GoSlim</span>"),
+            value = "tab_enrich_goslim",
+            div(class = "panel-lite",
+                shinycssloaders::withSpinner(plotlyOutput("goslim_bar", height = 450))
+            ),
+            tags$hr(),
+            div(class = "panel-lite",
+                shinycssloaders::withSpinner(DT::DTOutput("goslim_table"))
             )
           )
         )
       )
     )
-  ),  
-  # ==========================
-  # TAB PRINCIPAL 2 (LD)
-  # ==========================
+  ),
+  
+  # ========================================================================
+  # NAV TAB 3: LD
+  # ========================================================================
   tabPanel(
     title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>🧩 LD</span>"),
     ld_module_ui("ld")
@@ -832,36 +1002,34 @@ ui <- navbarPage(
 )
 
 
-# ===========================
-# SERVER
-# ===========================
+
+
+##############################################################################
+############################### SERVER #######################################
+##############################################################################
 
 server <- function(input, output, session){
   
-# # ============================================================
-# # CANONICAL shared objects (always exist)
-# # ============================================================
-# # These are used across the app (UI previews, plots, tables, LD, etc.)
-# gwas_shared_rv <- shiny::reactiveVal(tibble::tibble())   # standardized GWAS table (may come from HUB/master)
-# clusters_cur   <- shiny::reactiveVal(NULL)   # standardized clusters table (may come from HUB/master OR local clustering)
-# intervals_raw  <- shiny::reactiveVal(NULL)   # canonical intervals derived from clusters (chr/start/end/label)
-# 
-# # Ensure 'rv' exists for legacy parts that still expect it
-# if (!exists("rv", inherits = FALSE)) rv <- shiny::reactiveValues()
-# 
-# # ============================================================
-# # 0) deeplink (after clusters_cur exists)
-# # ============================================================
-# source(file.path(gi_shared_root, "GItools_local_deeplinks_ALL_IN_ONE.R"), local = TRUE)
-# gitools_deeplink_gtex(session, clusters_cur)
-# 
-# source(file.path(gi_shared_root, "gi_slave_canonical.R"), local = TRUE)
-# gi_sync <- gi_slave_canonical_init(session)
-# 
-# source(file.path(gi_shared_root, "gi_clusters_canonical.R"), local = TRUE)
-
-  SHARED <- gi_shared_root  # definit a gi_state.R
+  # ------------------------------------------------------------
+  # Canonical roots for SLAVE sync (MUST match MASTER)
+  #   state : <GItools>/app/_state
+  #   shared: <GItools>/_shared
+  # ------------------------------------------------------------
+  STATE_ROOT  <- normalizePath(file.path(BASE, "app", "_state"), winslash = "/", mustWork = FALSE)
+  SHARED_ROOT <- normalizePath(file.path(BASE, "_shared"),       winslash = "/", mustWork = FALSE)
   
+  options(gi_state_root  = STATE_ROOT)
+  options(gi_shared_root = SHARED_ROOT)
+  
+  dir.create(STATE_ROOT,  recursive = TRUE, showWarnings = FALSE)
+  
+  cat("[GTEX][ROOTS] BASE      =", BASE, "\n")
+  cat("[GTEX][ROOTS] STATE_ROOT =", STATE_ROOT, " exists=", dir.exists(STATE_ROOT), "\n")
+  cat("[GTEX][ROOTS] SHARED_ROOT=", SHARED_ROOT," exists=", dir.exists(SHARED_ROOT), "\n")
+  #-----------------------------------------------
+  
+ # SHARED <- gi_shared_root  # definit a gi_state.R
+  SHARED <- getOption("gi_shared_root")
   # -----------------------------
   # Shared reactive holders (Hub OR local)
   # -----------------------------
@@ -870,1523 +1038,1723 @@ server <- function(input, output, session){
   # -----------------------------
   # Canonical cluster engine (ALWAYS available)
   # -----------------------------
-  source(file.path(SHARED, "gi_clusters_canonical.R"), local = TRUE)
+  # ------------------------------------------------------------
+  # Resolve SHARED root robust (Hub OR standalone OR ngroc layout)
+  # ------------------------------------------------------------
+  SHARED <- NULL
   
-  # Proxy: prioritat al gwas_df() local si existeix; sinó al Hub
+  # 1) canonical: gi_shared_root (from gi_state.R) if exists
+  if (exists("gi_shared_root", inherits = TRUE)) {
+    SHARED <- tryCatch(get("gi_shared_root", inherits = TRUE), error = function(e) NULL)
+  }
+  
+  # 2) option
+  if (is.null(SHARED) || !is.character(SHARED) || !nzchar(SHARED)) {
+    SHARED <- getOption("gi_shared_root", "")
+  }
+  
+  # 3) env var
+  if (!nzchar(SHARED)) {
+    SHARED <- Sys.getenv("GITOOLS_SHARED", "")
+  }
+  
+  # 4) fallback: relative to app dir (works if repo has _shared next to app/)
+  if (!nzchar(SHARED)) {
+    # getwd() when running app is typically the app folder
+    cand <- normalizePath(file.path(getwd(), "..", "_shared"), winslash = "/", mustWork = FALSE)
+    if (dir.exists(cand)) SHARED <- cand
+  }
+  
+  # Final check + source canonical
+  canon_file <- file.path(SHARED, "gi_clusters_canonical.R")
+  validate(need(nzchar(SHARED) && file.exists(canon_file),
+                paste0("Missing gi_clusters_canonical.R. Resolved SHARED='", SHARED, "'")))
+  source(canon_file, local = TRUE)
+  
+  #-------------------------------
+  # Stable proxy: never returns NULL after first valid GWAS
+  # -----------------------------
+  gwas_last_good <- shiny::reactiveVal(NULL)
+  
   gwas_df_proxy <- shiny::reactive({
+    df <- NULL
+    
+    # 1) prefer local gwas_df() si existeix i és bo
     if (exists("gwas_df", inherits = TRUE) && is.function(gwas_df)) {
       df2 <- tryCatch(gwas_df(), error = function(e) NULL)
-      if (is.data.frame(df2) && nrow(df2) > 0) return(df2)
+      if (is.data.frame(df2) && nrow(df2) > 0) df <- df2
     }
-    df <- gwas_shared_rv()
+    
+    # 2) sinó, Hub GWAS
+    if (is.null(df)) {
+      df3 <- gwas_shared_rv()
+      if (is.data.frame(df3) && nrow(df3) > 0) df <- df3
+    }
+    
+    # 3) cache
+    if (is.data.frame(df) && nrow(df) > 0) {
+      gwas_last_good(df)
+      return(df)
+    }
+    
+    # 4) fallback: últim GWAS bo (evita flicker)
+    gwas_last_good()
+  })
+  
+  # -----------------------------
+  source(file.path("R", "gi_slave_canonical_gtex.R"), local = TRUE)
+  gi_sync <- gi_slave_canonical_init(session)
+  
+  observe({
+    cat("[DBG] gi_sync names:", paste(names(gi_sync), collapse=", "), "\n")
+    cat("[DBG] has gwas_shared:", "gwas_shared" %in% names(gi_sync), "\n")
+    cat("[DBG] has clusters_shared:", "clusters_shared" %in% names(gi_sync), "\n")
+  })
+  
+  observe({
+    sid <- gi_sid(session)
+    p   <- gi_state_paths(sid)
+    cat("[GTEX][SYNC] sid=", sid, "\n")
+    cat("[GTEX][SYNC] json=", p$json, " exists=", file.exists(p$json), "\n")
+    cat("[GTEX][SYNC] gwas=", p$gwas, " exists=", file.exists(p$gwas), "\n")
+    cat("[GTEX][SYNC] clus=", p$clus, " exists=", file.exists(p$clus), "\n")
+    cat("[GTEX][SYNC] params=", p$params, " exists=", file.exists(p$params), "\n")
+  })
+  # ------------------------------------------------------------
+  # HUB sync -> GWAS input (fills gwas_shared_rv)
+  # ------------------------------------------------------------
+  observeEvent(gi_sync$gwas_shared(), {
+    
+    df <- gi_sync$gwas_shared()
+    req(is.data.frame(df), nrow(df) > 0)
+    
+    gwas_shared_rv(df)
+    
+    cat("[GTEx][HUB] GWAS synced rows=", nrow(df), " cols=", ncol(df), "\n")
+    showNotification(sprintf("✅ HUB: GWAS sincronitzat (%d files).", nrow(df)),
+                     type = "message", duration = 2)
+    
+  }, ignoreInit = FALSE)
+  
+  # -----------------------------
+  # Step 1: GWAS reader + p selector (stable)
+  # - Prioritza master (gwas_shared_rv)
+  # - Fallback upload
+  # -----------------------------
+  
+  dat_raw <- reactive({
+    df_shared <- gwas_shared_rv()
+    if (is.data.frame(df_shared) && nrow(df_shared) > 0) {
+      return(df_shared)
+    }
+    
+    req(input$gwas_file)
+    readr::read_delim(
+      file   = input$gwas_file$datapath,
+      delim  = input$gwas_sep %||% "\t",
+      col_names = isTRUE(input$gwas_header),
+      locale = readr::locale(decimal_mark = ".", grouping_mark = ","),
+      show_col_types = FALSE,
+      na = c("", "NA")
+    )
+  })
+  
+  output$gwas_p_selector <- renderUI({
+    df <- dat_raw()
+    validate(need(is.data.frame(df) && nrow(df) > 0, "Could not read GWAS."))
+    
+    cols <- names(df)
+    
+    guess <- c(
+      grep("^p$|pval|pvalue|p_value|p\\.value", cols, ignore.case = TRUE, value = TRUE),
+      intersect(cols, c("Pval","PVAL","pval","pvalue","P","p","P_VALUE","p_value"))
+    )
+    guess <- guess[!is.na(guess) & nzchar(guess)]
+    guess1 <- if (length(guess)) guess[1] else cols[1]
+    
+    selectInput(
+      "gwas_col_p",
+      "Select P-value column:",
+      choices  = cols,
+      selected = guess1
+    )
+  })
+  
+  gwas_df <- reactive({
+    df_shared <- gwas_shared_rv()
+    if (is.data.frame(df_shared) && nrow(df_shared) > 0) return(df_shared)
+    
+    df <- dat_raw()
+    validate(need(is.data.frame(df) && nrow(df) > 0, "Empty GWAS table."))
+    
+    validate(need(!is.null(input$gwas_col_p) && nzchar(input$gwas_col_p), "Select a P-value column."))
+    validate(need(input$gwas_col_p %in% names(df), "Selected P column not found in GWAS."))
+    
+    # 1) agafa rawP ABANS de tolower, amb el nom original seleccionat
+    rawP <- df[[ input$gwas_col_p ]]
+    validate(
+      need(!is.null(rawP), "Selected P column is NULL."),
+      need(length(rawP) == nrow(df), "Selected P column length mismatch.")
+    )
+    
+    # 2) Ara sí: normalitza noms per detectar chr/bp/rsid
+    df2 <- df
+    names(df2) <- tolower(names(df2))
+    
+    validate(need(all(c("chr","bp") %in% names(df2)), "GWAS must contain columns chr and bp (case-insensitive)."))
+    
+    if (!"snp" %in% names(df2)) df2$snp <- NA_character_
+    
+    # rsid (si existeix)
+    rscol <- detect_rsid_col(df2)
+    if (!is.null(rscol) && rscol %in% names(df2)) {
+      df2$rsid <- as.character(df2[[rscol]])
+    } else {
+      if ("snp" %in% names(df2) && any(grepl("^rs[0-9]+$", df2$snp))) {
+        df2$rsid <- as.character(df2$snp)
+      } else {
+        df2$rsid <- NA_character_
+      }
+    }
+    
+    BP   <- if (is.numeric(df2$bp)) df2$bp else suppressWarnings(readr::parse_number(as.character(df2$bp)))
+    Pval <- parse_p_robust(rawP)
+    CHR  <- chr_map_plink19(df2$chr)
+    
+    out <- df2 %>%
+      dplyr::mutate(
+        CHR  = CHR,
+        BP   = as.numeric(BP),
+        Pval = as.numeric(Pval),
+        logp = -log10(Pval)
+      ) %>%
+      dplyr::filter(is.finite(CHR), is.finite(BP), is.finite(Pval), Pval > 0)
+    
+    validate(need(nrow(out) > 0, "GWAS parsed but 0 valid rows (check columns/format)."))
+    out
+  })
+  # ------------------------------------------------------------
+  # GWAS STABLE (anti-flicker): fixa el primer GWAS vàlid
+  # ------------------------------------------------------------
+  gwas_df_stable_rv <- shiny::reactiveVal(NULL)
+  
+  observeEvent(gwas_df(), {
+    df <- tryCatch(gwas_df(), error = function(e) NULL)
+    if (!is.data.frame(df) || nrow(df) == 0) return()
+    if (is.data.frame(gwas_df_stable_rv()) && nrow(gwas_df_stable_rv()) > 0) return()
+    gwas_df_stable_rv(df)
+    cat("[GTEx] GWAS_STABLE locked rows=", nrow(df), "\n")
+  }, ignoreInit = FALSE)
+  
+  gwas_df_stable <- reactive({
+    df <- gwas_df_stable_rv()
     if (is.data.frame(df) && nrow(df) > 0) return(df)
+    # fallback mentre encara no s'ha “lockejat”
+    df2 <- tryCatch(gwas_df(), error = function(e) NULL)
+    if (is.data.frame(df2) && nrow(df2) > 0) return(df2)
     NULL
   })
   
-  gi_cl <- gi_clusters_canonical_init(
-    session, input, output,
-    gwas_df = gwas_df_proxy,
+  # ------------------------------------------------------------
+  # Canonical clusters engine (local build_ranges)
+  # - provides: intervals_raw(), clusters_cur(), selected_cluster()
+  # ------------------------------------------------------------
+
+  gi_clust <- gi_clusters_canonical_init(
+    session = session, input = input, output = output,
+    gwas_df = gwas_df_stable,          # <-- AIXÒ
     build_btn_id   = "build_ranges",
     clusters_dt_id = "cluster_dt",
     hits_rows_id   = "hits_tbl_rows_selected",
-    app_count_col  = "n_gtex"   # <-- usa el nom real de la columna de recompte a GTEx
+    app_count_col  = "n_gtex"
   )
   
-  # Expose canonical names (la resta de l’app ha d’usar aquests)
-  clusters_cur  <- gi_cl$clusters_cur
-  intervals_raw <- gi_cl$intervals_raw
+  intervals_raw    <- gi_clust$intervals_raw
+  clusters_cur     <- gi_clust$clusters_cur
+  selected_cluster <- gi_clust$selected_cluster
+  # ------------------------------------------------------------
+  # --- stable latch for clusters (anti-flicker) ---
+  clusters_stable_rv <- shiny::reactiveVal(NULL)
   
-  # -----------------------------
-  # Slave canonical sync (Hub -> this app)
-  # -----------------------------
-  source(file.path(SHARED, "gi_slave_canonical.R"), local = TRUE)
-  gi_sync <- tryCatch(gi_slave_canonical_init(session), error = function(e) NULL)
+  observe({
+    cl <- tryCatch(clusters_cur(), error = function(e) NULL)
+    if (is.data.frame(cl) && nrow(cl) > 0) clusters_stable_rv(cl)
+  })
   
-  # -----------------------------
-# Step 1: GWAS reader + p selector (stable)
-# - Prioritza master (gwas_shared_rv)
-# - Fallback upload
-# -----------------------------
-
-dat_raw <- reactive({
-  df_shared <- gwas_shared_rv()
-  if (is.data.frame(df_shared) && nrow(df_shared) > 0) {
-    return(df_shared)
-  }
+  clusters_stable <- shiny::reactive({
+    cl <- clusters_stable_rv()
+    if (is.data.frame(cl) && nrow(cl) > 0) return(cl)
+    # fallback: si encara no hi ha latch
+    cl2 <- tryCatch(clusters_cur(), error = function(e) NULL)
+    if (is.data.frame(cl2) && nrow(cl2) > 0) return(cl2)
+    NULL
+  })
   
-  req(input$gwas_file)
-  readr::read_delim(
-    file   = input$gwas_file$datapath,
-    delim  = input$gwas_sep %||% "\t",
-    col_names = isTRUE(input$gwas_header),
-    locale = readr::locale(decimal_mark = ".", grouping_mark = ","),
-    show_col_types = FALSE,
-    na = c("", "NA")
-  )
-})
-
-output$gwas_p_selector <- renderUI({
-  df <- dat_raw()
-  validate(need(is.data.frame(df) && nrow(df) > 0, "Could not read GWAS."))
-  
-  cols <- names(df)
-  
-  # tolerància: si ve del master pot tenir Pval o p-value original
-  guess <- c(
-    grep("^p$|pval|pvalue|p_value|p\\.value", cols, ignore.case = TRUE, value = TRUE),
-    intersect(cols, c("Pval","PVAL","pval","pvalue","P","p","P_VALUE","p_value"))
-  )
-  guess <- guess[!is.na(guess) & nzchar(guess)]
-  guess1 <- if (length(guess)) guess[1] else cols[1]
-  
-  selectInput(
-    "gwas_col_p",
-    "Select P-value column:",
-    choices  = cols,
-    selected = guess1
-  )
-})
-
-gwas_df <- reactive({
-  df <- dat_raw()
-  validate(need(is.data.frame(df) && nrow(df) > 0, "Empty GWAS table."))
-  
-  validate(need(!is.null(input$gwas_col_p) && nzchar(input$gwas_col_p), "Select a P-value column."))
-  validate(need(input$gwas_col_p %in% names(df), "Selected P column not found in GWAS."))
-  
-  # 1) agafa rawP ABANS de tolower, amb el nom original seleccionat
-  rawP <- df[[ input$gwas_col_p ]]
-  validate(
-    need(!is.null(rawP), "Selected P column is NULL."),
-    need(length(rawP) == nrow(df), "Selected P column length mismatch.")
-  )
-  
-  # 2) Ara sí: normalitza noms per detectar chr/bp/rsid
-  df2 <- df
-  names(df2) <- tolower(names(df2))
-  
-  validate(need(all(c("chr","bp") %in% names(df2)), "GWAS must contain columns chr and bp (case-insensitive)."))
-  
-  if (!"snp" %in% names(df2)) df2$snp <- NA_character_
-  
-  # rsid (si existeix)
-  rscol <- detect_rsid_col(df2)
-  if (!is.null(rscol) && rscol %in% names(df2)) {
-    df2$rsid <- as.character(df2[[rscol]])
-  } else {
-    if ("snp" %in% names(df2) && any(grepl("^rs[0-9]+$", df2$snp))) {
-      df2$rsid <- as.character(df2$snp)
-    } else {
-      df2$rsid <- NA_character_
+  # ------------------------------------------------------------
+  # CLUSTERS DT (ROBUST): shows errors instead of failing silently
+  # ------------------------------------------------------------
+  output$cluster_dt <- DT::renderDT({
+    cl <- clusters_stable()
+    
+    if (!is.data.frame(cl) || nrow(cl) == 0) {
+      return(DT::datatable(
+        data.frame(Message = "No clusters yet (waiting Hub or click: Generate intervals + clusters)"),
+        options = list(dom = "t"),
+        rownames = FALSE
+      ))
     }
+    
+    show_cols <- c("cluster_chr_n","cluster_id","chr","start","end","n_snps","top_snp","top_logp","n_gtex")
+    keep <- intersect(show_cols, names(cl))
+    cl2  <- cl[, keep, drop = FALSE]
+    
+    DT::datatable(
+      cl2, rownames = FALSE,
+      extensions = "Buttons",
+      options = list(dom="Bfrtip", buttons=c("copy","csv","excel","pdf","print"),
+                     pageLength=10, scrollX=TRUE)
+    ) %>% DT::formatRound(columns = intersect("top_logp", names(cl2)), digits = 2)
+  })
+  
+  # ------------------------------------------------------------
+  # ---- Preview text (Step 2) ----
+  output$ranges_preview <- renderPrint({
+   # cl <- clusters_cur()
+    cl <- clusters_stable()
+    if (!is.data.frame(cl) || nrow(cl) == 0) {
+      cat("No clusters yet. Click: ➊ Generate intervals + clusters\n")
+      return(invisible())
+    }
+    
+    cat("Clusters generated:", nrow(cl), "\n\n")
+    print(utils::head(cl, 10))
+  })
+  
+  ###########################################
+  # ------------------------------------------------------------
+  # HUB sync -> apply CLUSTERS into canonical engine (FINAL)
+  # - NO polling extra
+  # - 1 sola font de veritat: gi_slave_canonical_init()
+  # ------------------------------------------------------------
+  
+  # Helper: aplica clusters + intervals al motor canònic
+  .apply_hub_clusters_to_engine <- function(cl) {
+    if (!is.data.frame(cl) || !nrow(cl)) return(FALSE)
+    cl <- as.data.frame(cl)
+    
+    # Normalitza camps mínims
+    if (!"chr" %in% names(cl) && "CHR" %in% names(cl)) cl$chr <- cl$CHR
+    
+    if (!"start" %in% names(cl)) {
+      if ("cluster_start" %in% names(cl)) cl$start <- cl$cluster_start
+      if ("start_bp"      %in% names(cl)) cl$start <- cl$start_bp
+    }
+    if (!"end" %in% names(cl)) {
+      if ("cluster_end" %in% names(cl)) cl$end <- cl$cluster_end
+      if ("end_bp"      %in% names(cl)) cl$end <- cl$end_bp
+    }
+    
+    if (!all(c("chr","start","end") %in% names(cl))) return(FALSE)
+    
+    cl$chr   <- suppressWarnings(as.integer(cl$chr))
+    cl$start <- suppressWarnings(as.integer(cl$start))
+    cl$end   <- suppressWarnings(as.integer(cl$end))
+    cl <- cl[is.finite(cl$chr) & is.finite(cl$start) & is.finite(cl$end) & cl$end >= cl$start, , drop = FALSE]
+    if (!nrow(cl)) return(FALSE)
+    
+    # IDs canònics (necessaris per DT + highlights)
+    if (!"cluster_chr_n" %in% names(cl) || all(!nzchar(as.character(cl$cluster_chr_n)))) {
+      cl$cluster_chr_n <- paste0("chr", chr_label_plink(cl$chr), "_", ave(cl$chr, cl$chr, FUN = seq_along))
+    } else {
+      cl$cluster_chr_n <- sub("^cluster_", "", as.character(cl$cluster_chr_n))
+    }
+    
+    if (!"cluster_id" %in% names(cl) || all(!nzchar(as.character(cl$cluster_id)))) {
+      cl$cluster_id <- cl$cluster_chr_n
+    } else {
+      cl$cluster_id <- sub("^cluster_", "", as.character(cl$cluster_id))
+    }
+    
+    if (!"cluster" %in% names(cl)) cl$cluster <- seq_len(nrow(cl))
+    
+    # intervals canònics per a bandes/plot inferior
+    iv <- dplyr::transmute(
+      cl,
+      chr   = .data$chr,
+      start = .data$start,
+      end   = .data$end,
+      label = .data$cluster_id
+    )
+    
+    ok1 <- FALSE; ok2 <- FALSE
+    
+    # 1) Preferit: setters del motor canònic
+    if (is.list(gi_clust) && !is.null(gi_clust$set_clusters) && is.function(gi_clust$set_clusters)) {
+      gi_clust$set_clusters(cl); ok1 <- TRUE
+    } else {
+      # 2) Fallback: reactiveVal exposada (clusters_cur)
+      try({ gi_clust$clusters_cur(cl); ok1 <- TRUE }, silent = TRUE)
+    }
+    
+    if (is.list(gi_clust) && !is.null(gi_clust$set_intervals) && is.function(gi_clust$set_intervals)) {
+      gi_clust$set_intervals(iv); ok2 <- TRUE
+    } else {
+      # 2) Fallback: reactiveVal exposada (intervals_raw)
+      try({ gi_clust$intervals_raw(iv); ok2 <- TRUE }, silent = TRUE)
+    }
+    
+    cat("[GTEx][HUB] applied CLUSTERS rows=", nrow(cl),
+        " set_clusters=", ok1, " set_intervals=", ok2, "\n")
+    
+    ok1 && ok2
   }
   
-  BP   <- if (is.numeric(df2$bp)) df2$bp else suppressWarnings(readr::parse_number(as.character(df2$bp)))
-  Pval <- parse_p_robust(rawP)
-  CHR  <- chr_map_plink19(df2$chr)
+  # IMPORTANT:
+  # - NO fem polling manual de fitxers _state aquí
+  # - ens fiem de gi_sync$clusters_shared() (ja fa polling del JSON del Hub)
+  observeEvent(gi_sync$clusters_shared(), {
+    cl <- gi_sync$clusters_shared()
+    req(is.data.frame(cl), nrow(cl) > 0)
+    
+    .apply_hub_clusters_to_engine(cl)
+    
+    showNotification(sprintf("✅ HUB: CLUSTERS sincronitzats (%d).", nrow(cl)),
+                     type = "message", duration = 2)
+  }, ignoreInit = FALSE)
   
-  out <- df2 %>%
-    dplyr::mutate(
-      CHR  = CHR,
-      BP   = as.numeric(BP),
-      Pval = as.numeric(Pval),
-      logp = -log10(Pval)
-    ) %>%
-    dplyr::filter(is.finite(CHR), is.finite(BP), is.finite(Pval), Pval > 0)
+   ###########################################
   
-  validate(need(nrow(out) > 0, "GWAS parsed but 0 valid rows (check columns/format)."))
-  out
-})
-
-# ------------------------------------------------------------
-# Canonical clusters engine (local build_ranges)
-# - provides: intervals_raw(), clusters_cur(), selected_cluster()
-# ------------------------------------------------------------
-gi_clust <- gi_clusters_canonical_init(
-  session = session, input = input, output = output,
-  gwas_df = gwas_df,
-  build_btn_id   = "build_ranges",
-  clusters_dt_id = "cluster_dt",
-  hits_rows_id   = "hits_tbl_rows_selected",
-  app_count_col  = "n_gtex"
-)
-
-intervals_raw    <- gi_clust$intervals_raw
-clusters_cur     <- gi_clust$clusters_cur
-selected_cluster <- gi_clust$selected_cluster
-
-
-# ---- Preview text (Step 2) ----
-output$ranges_preview <- renderPrint({
-  cl <- clusters_cur()
-  if (!is.data.frame(cl) || nrow(cl) == 0) {
-    cat("No clusters yet. Click: ➊ Generate intervals + clusters\n")
-    return(invisible())
-  }
+  # carpeta per aquesta sessió
+  workdir <- file.path(tempdir(), paste0("gtex_inspector_", Sys.getpid()))
+  dir.create(workdir, showWarnings = FALSE, recursive = TRUE)
+  session$onSessionEnded(function(...) {
+    if (dir.exists(workdir)) unlink(workdir, recursive = TRUE, force = TRUE)
+  })
   
-  cat("Clusters generated:", nrow(cl), "\n\n")
-  print(utils::head(cl, 10))
-})
-
-# ---- Clusters DT (Manhattan tab) ----
-output$cluster_dt <- DT::renderDT({
-  cl <- clusters_cur()
-  
-  if (!is.data.frame(cl) || nrow(cl) == 0) {
-    return(DT::datatable(
-      data.frame(Message = "No clusters yet. Click: ➊ Generate intervals + clusters"),
-      options = list(dom = "t"),
-      rownames = FALSE
-    ))
-  }
-  
-  # ordre i columnes “amables”
-  show_cols <- c(
-    "cluster_chr_n","cluster_id","chr","start","end",
-    "n_snps","top_snp","top_logp",
-    "n_gtex"
+  # === Tissue family definitions (GTEx v10 robust) ===
+  tissue_families <- list(
+    Brain = c(
+      "Brain_Anterior_cingulate_cortex_BA24", "Brain_Caudate_basal_ganglia",
+      "Brain_Cerebellar_Hemisphere", "Brain_Cerebellum", "Brain_Cortex",
+      "Brain_Frontal_Cortex_BA9", "Brain_Hippocampus", "Brain_Hypothalamus",
+      "Brain_Nucleus_accumbens_basal_ganglia", "Brain_Putamen_basal_ganglia",
+      "Brain_Spinal_cord_cervical_c-1", "Brain_Substantia_nigra"
+    ),
+    Cardiovascular = c(
+      "Artery_Aorta", "Artery_Coronary", "Artery_Tibial",
+      "Heart_Atrial_Appendage", "Heart_Left_Ventricle"
+    ),
+    Immune = c("Whole_Blood", "Spleen"),
+    Digestive = c(
+      "Esophagus_Gastroesophageal_Junction", "Esophagus_Mucosa",
+      "Esophagus_Muscularis", "Stomach", "Colon_Sigmoid",
+      "Colon_Transverse", "Small_Intestine_Terminal_Ileum", "Liver"
+    ),
+    Endocrine = c("Pancreas", "Pituitary", "Thyroid", "Adrenal_Gland"),
+    Adipose = c("Adipose_Subcutaneous", "Adipose_Visceral_Omentum"),
+    Muscle = c("Muscle_Skeletal"),
+    Skin = c("Skin_Sun_Exposed_Lower_leg", "Skin_Not_Sun_Exposed_Suprapubic"),
+    Lung = c("Lung"),
+    Kidney = c("Kidney_Cortex"),
+    Others = NULL
   )
-  keep <- intersect(show_cols, names(cl))
-  cl2 <- cl[, keep, drop = FALSE]
   
-  DT::datatable(
-    cl2,
-    rownames  = FALSE,
-    extensions = "Buttons",
-    options    = list(
-      dom        = "Bfrtip",
-      buttons    = c("copy", "csv", "excel", "pdf", "print"),
-      pageLength = 10,
-      scrollX    = TRUE
-    )
-  ) %>%
-    formatRound(columns = c("top_logp"), digits = 2)
-})
-
-# ------------------------------------------------------------
-# Apply MASTER sync -> overwrite GWAS/clusters into canonical state
-# (keeps local build_ranges available too)
-# ------------------------------------------------------------
-observeEvent(gi_sync$gwas_shared(), {
-  id <- paste0("hub_sync_", as.integer(Sys.time()))
-  showNotification("🔄 HUB: sincronitzant GWAS…", type = "message", duration = NULL, id = id)
-  
-  df <- gi_sync$gwas_shared()
-  req(is.data.frame(df), nrow(df) > 0)
-  
-  gwas_shared_rv(df)
-  cat("[SLAVE] applied GWAS rows=", nrow(df), "\n")
-  
-  removeNotification(id)
-  showNotification(sprintf("✅ HUB: GWAS sincronitzat (%d files).", nrow(df)),
-                   type = "message", duration = 2)
-  
-}, ignoreInit = FALSE)
-
-
-# Cluster assign from hub
-observeEvent(gi_sync$clusters_shared(), {
-  # avís curt i clar
-  id <- paste0("hub_sync_", as.integer(Sys.time()))
-  showNotification("🔄 HUB: sincronitzant CLUSTERS…", type = "message", duration = NULL, id = id)
-  
-  cl <- gi_sync$clusters_shared()
-  req(is.data.frame(cl), nrow(cl) > 0)
-  
-  cl <- standardize_cluster_ids(cl)
-  clusters_cur(cl)
-  
-  # intervals per passos downstream
-  intervals_raw(cl |> dplyr::transmute(
-    chr = chr, start = start, end = end,
-    label = dplyr::coalesce(as.character(cluster_chr_n), as.character(cluster_id))
-  ))
-  
-  cat("[SLAVE] applied CLUSTERS rows=", nrow(cl), "\n")
-  
-  removeNotification(id)
-  showNotification(sprintf("✅ HUB: clusters sincronitzats (%d).", nrow(cl)),
-                   type = "message", duration = 2)
-  
-}, ignoreInit = FALSE)
-
-
-
-
-
-###########################################
-
-# carpeta per aquesta sessió
-workdir <- file.path(tempdir(), paste0("gtex_inspector_", Sys.getpid()))
-dir.create(workdir, showWarnings = FALSE, recursive = TRUE)
-session$onSessionEnded(function(...) {
-  if (dir.exists(workdir)) unlink(workdir, recursive = TRUE, force = TRUE)
-})
-
-# === Tissue family definitions (GTEx v10 robust) ===
-tissue_families <- list(
-  Brain = c(
-    "Brain_Anterior_cingulate_cortex_BA24", "Brain_Caudate_basal_ganglia",
-    "Brain_Cerebellar_Hemisphere", "Brain_Cerebellum", "Brain_Cortex",
-    "Brain_Frontal_Cortex_BA9", "Brain_Hippocampus", "Brain_Hypothalamus",
-    "Brain_Nucleus_accumbens_basal_ganglia", "Brain_Putamen_basal_ganglia",
-    "Brain_Spinal_cord_cervical_c-1", "Brain_Substantia_nigra"
-  ),
-  Cardiovascular = c(
-    "Artery_Aorta", "Artery_Coronary", "Artery_Tibial",
-    "Heart_Atrial_Appendage", "Heart_Left_Ventricle"
-  ),
-  Immune = c("Whole_Blood", "Spleen"),
-  Digestive = c(
-    "Esophagus_Gastroesophageal_Junction", "Esophagus_Mucosa",
-    "Esophagus_Muscularis", "Stomach", "Colon_Sigmoid",
-    "Colon_Transverse", "Small_Intestine_Terminal_Ileum", "Liver"
-  ),
-  Endocrine = c("Pancreas", "Pituitary", "Thyroid", "Adrenal_Gland"),
-  Adipose = c("Adipose_Subcutaneous", "Adipose_Visceral_Omentum"),
-  Muscle = c("Muscle_Skeletal"),
-  Skin = c("Skin_Sun_Exposed_Lower_leg", "Skin_Not_Sun_Exposed_Suprapubic"),
-  Lung = c("Lung"),
-  Kidney = c("Kidney_Cortex"),
-  Others = NULL
-)
-
-map_tissue_family <- function(tissue) {
-  for (fam in names(tissue_families)) {
-    tis_list <- tissue_families[[fam]]
-    if (!is.null(tis_list) && tissue %in% tis_list) return(fam)
+  map_tissue_family <- function(tissue) {
+    for (fam in names(tissue_families)) {
+      tis_list <- tissue_families[[fam]]
+      if (!is.null(tis_list) && tissue %in% tis_list) return(fam)
+    }
+    return("Others")
   }
-  return("Others")
-}
-
-dfp_manhattan <- reactive({
-  df <- gwas_df(); req(nrow(df) > 0)
-  # filter pval < 0.0 to a easely plot
-  df <- df %>% dplyr::filter(Pval < 0.05)
   
-  ref <- .ref_hg38
-  df$chrN <- norm_chr_generic(df$CHR)
+  # ------------------------------------------------------------
+  # GWAS for plots (HUB-first, robust)
+  # ------------------------------------------------------------
+  gwas_for_plot <- reactive({
+    # 1) HUB (canonical) si existeix
+    df <- NULL
+    if (exists("gi_sync", inherits = TRUE) && is.list(gi_sync) &&
+        "gwas_shared" %in% names(gi_sync) && is.function(gi_sync$gwas_shared)) {
+      df <- tryCatch(gi_sync$gwas_shared(), error = function(e) NULL)
+    }
+    
+    # 2) App-level cached GWAS (si el tens)
+    if (is.null(df) || !is.data.frame(df) || !nrow(df)) {
+      df <- tryCatch(gwas_shared_rv(), error = function(e) NULL)
+    }
+    
+    # 3) Últim recurs: el teu gwas_df_stable() (si existeix)
+    if (is.null(df) || !is.data.frame(df) || !nrow(df)) {
+      if (exists("gwas_df_stable", inherits = TRUE) && is.function(gwas_df_stable)) {
+        df <- tryCatch(gwas_df_stable(), error = function(e) NULL)
+      }
+    }
+    
+    validate(need(is.data.frame(df) && nrow(df) > 0,
+                  "GWAS not available yet (Hub GWAS not loaded)."))
+    
+    # Normalitza tipus mínims
+    df <- as.data.frame(df)
+    validate(need(all(c("CHR","BP","Pval") %in% names(df)),
+                  "GWAS must contain CHR, BP, Pval (from master)."))
+    
+    df$CHR  <- suppressWarnings(as.integer(df$CHR))
+    df$BP   <- suppressWarnings(as.numeric(df$BP))
+    df$Pval <- suppressWarnings(as.numeric(df$Pval))
+    if (!"logp" %in% names(df)) df$logp <- -log10(df$Pval)
+    if (!"snp"  %in% names(df)) df$snp  <- NA_character_
+    
+    df <- df[is.finite(df$CHR) & is.finite(df$BP) & is.finite(df$Pval) & df$Pval > 0, , drop = FALSE]
+    validate(need(nrow(df) > 0, "GWAS arrived but became empty after coercion."))
+    
+    df
+  })
   
-  df %>%
-    inner_join(ref %>% select(chr, chr_cum), by = c("chrN" = "chr")) %>%
-    arrange(chrN, BP) %>%
-    mutate(
-      BPcum = BP + chr_cum,
-      colgrp = CHR %% 2
-    )
-})
-
-axis_df <- reactive({
-  dfp <- dfp_manhattan()
-  dfp %>%
-    group_by(chrN) %>%
-    summarise(center = mean(BPcum, na.rm = TRUE), .groups = "drop")
-})
-
-# ---------- Hits (window mode) ----------
-hits_df <- reactive({
-  df <- gwas_df()
-  req(is.data.frame(df), nrow(df) > 0)
-  req(input$pthr)
+  dfp_manhattan <- reactive({
+    df <- gwas_for_plot()
+    ref <- .ref_hg38
+    
+    # IMPORTANT: no filtris aquí si vols veure “sempre alguna cosa”
+    # (si filtres a Pval < 0.05 i el master et passa un subset estrany, et quedes a 0)
+    # Si vols filtrar, fes-ho amb validate fallback:
+    df2 <- df
+    # df2 <- df2 %>% dplyr::filter(Pval < 0.05)
+    
+    df2$chrN <- norm_chr_generic(df2$CHR)
+    
+    out <- df2 %>%
+      dplyr::inner_join(ref %>% dplyr::select(chr, chr_cum), by = c("chrN" = "chr")) %>%
+      dplyr::arrange(chrN, BP) %>%
+      dplyr::mutate(BPcum = BP + chr_cum)
+    
+    validate(need(nrow(out) > 0, "GWAS available but dfp_manhattan became empty (chr join/filter)."))
+    out
+  })
   
-  # garantir rsid (si no existeix, usa snp)
-  if (!"rsid" %in% names(df)) df$rsid <- NA_character_
-  if (!"snp"  %in% names(df)) df$snp  <- NA_character_
-  df$rsid <- as.character(df$rsid)
-  df$snp  <- as.character(df$snp)
-  df$rsid <- dplyr::coalesce(df$rsid, df$snp)
+  axis_df <- reactive({
+    dfp <- dfp_manhattan()
+    dfp %>%
+      group_by(chrN) %>%
+      summarise(center = mean(BPcum, na.rm = TRUE), .groups = "drop")
+  })
   
-  df %>%
-    dplyr::filter(.data$logp >= as.numeric(input$pthr)) %>%
-    dplyr::arrange(dplyr::desc(.data$logp)) %>%
-    dplyr::select(
-      dplyr::all_of(c("CHR", "BP", "snp")),
-      dplyr::any_of("rsid"),
-      p = Pval,
-      logp
-    )
-})
-
-
-hits_enriched <- reactive({
-  df <- hits_df()
-  if (is.null(df) || !nrow(df)) return(df)
-  
-  if ("p" %in% names(df)) df$p <- formatC(df$p, format = "e", digits = 2)
-  if ("logp" %in% names(df)) df$logp <- sprintf("%.2f", df$logp)
-  
-  rscol <- "rsid"
-  df$dbSNP <- ifelse(
-    !is.na(df[[rscol]]) & df[[rscol]] != "",
-    paste0("<a href='https://www.ncbi.nlm.nih.gov/snp/", df[[rscol]], "' target='_blank'>", df[[rscol]], "</a>"),
-    NA
-  )
-  df
-})
-
-output$hits_tbl <- renderDT({
-  df <- hits_enriched()
-  if (is.null(df) || !nrow(df)) {
-    return(datatable(data.frame(Message="No GWAS hits above threshold yet."), options=list(dom="t"), rownames=FALSE))
-  }
-  datatable(
-    df %>% select(CHR, BP, snp, rsid, dbSNP, p, logp),
-    selection = "multiple",
-    rownames = FALSE,
-    escape = FALSE,
-    extensions = "Buttons",
-    options    = list(
-      dom        = "Bfrtip",
-      buttons    = c("copy", "csv", "excel", "pdf", "print"),
-      pageLength = 10,
-      scrollX    = TRUE
-    )
-  )
-})
-
-# ---------- Step 3: carregar GTEx (www/gtex_eqtl_light.rds) ----------
-gtex_all <- reactiveVal(NULL)
-
-observe({
-  path <- "www/gtex_eqtl_light.rds"
-  if (file.exists(path)) {
-    df <- tryCatch(readRDS(path), error = function(e) NULL)
-    if (!is.null(df) && is.data.frame(df)) {
-      
-      # Normalització mínima robusta (clau per evitar “taula buida” per mismatch chr)
-      if ("chr" %in% names(df)) df$chr <- norm_chr_generic(df$chr)
-      if ("pos" %in% names(df)) df$pos <- suppressWarnings(as.integer(df$pos))
-      
-      gtex_all(df)
-      output$gtex_status <- renderText(
-        sprintf("GTEx loaded: %s (rows: %d, cols: %d)",
-                path, nrow(df), ncol(df))
+  # ---------- Hits (window mode) ----------
+  hits_df <- reactive({
+    df <- gwas_df()
+    req(is.data.frame(df), nrow(df) > 0)
+    req(input$pthr)
+    
+    # garantir rsid (si no existeix, usa snp)
+    if (!"rsid" %in% names(df)) df$rsid <- NA_character_
+    if (!"snp"  %in% names(df)) df$snp  <- NA_character_
+    df$rsid <- as.character(df$rsid)
+    df$snp  <- as.character(df$snp)
+    df$rsid <- dplyr::coalesce(df$rsid, df$snp)
+    
+    df %>%
+      dplyr::filter(.data$logp >= as.numeric(input$pthr)) %>%
+      dplyr::arrange(dplyr::desc(.data$logp)) %>%
+      dplyr::select(
+        dplyr::all_of(c("CHR", "BP", "snp")),
+        dplyr::any_of("rsid"),
+        p = Pval,
+        logp
       )
-    } else {
-      output$gtex_status <- renderText("Could not read www/gtex_eqtl_light.rds.")
+  })
+  
+  
+  hits_enriched <- reactive({
+    df <- hits_df()
+    if (is.null(df) || !nrow(df)) return(df)
+    
+    if ("p" %in% names(df)) df$p <- formatC(df$p, format = "e", digits = 2)
+    if ("logp" %in% names(df)) df$logp <- sprintf("%.2f", df$logp)
+    
+    rscol <- "rsid"
+    df$dbSNP <- ifelse(
+      !is.na(df[[rscol]]) & df[[rscol]] != "",
+      paste0("<a href='https://www.ncbi.nlm.nih.gov/snp/", df[[rscol]], "' target='_blank'>", df[[rscol]], "</a>"),
+      NA
+    )
+    df
+  })
+  
+  output$hits_tbl <- renderDT({
+    df <- hits_enriched()
+    if (is.null(df) || !nrow(df)) {
+      return(datatable(data.frame(Message="No GWAS hits above threshold yet."), options=list(dom="t"), rownames=FALSE))
     }
-  } else {
-    output$gtex_status <- renderText("GTEx file not found: www/gtex_eqtl_light.rds")
-  }
-})
-
-# ===========================
-# Step 4: extreure GTEx dins clusters + assignar cluster/cluster_chr_n a cada hit
-# ===========================
-
-gtex_hits_val <- reactiveVal(NULL)
-
-extract_gtex_from_clusters <- function(clusters_df, gtex_df) {
-  if (is.null(clusters_df) || !is.data.frame(clusters_df) || !nrow(clusters_df)) {
-    return(gtex_df[0, , drop = FALSE])
-  }
-  if (is.null(gtex_df) || !is.data.frame(gtex_df) || !nrow(gtex_df)) {
-    return(gtex_df[0, , drop = FALSE])
-  }
+    datatable(
+      df %>% select(CHR, BP, snp, rsid, dbSNP, p, logp),
+      selection = "multiple",
+      rownames = FALSE,
+      escape = FALSE,
+      extensions = "Buttons",
+      options    = list(
+        dom        = "Bfrtip",
+        buttons    = c("copy", "csv", "excel", "pdf", "print"),
+        pageLength = 10,
+        scrollX    = TRUE
+      )
+    )
+  })
   
-  shiny::validate(
-    shiny::need(all(c("chr","pos") %in% colnames(gtex_df)),
-                "GTEx table must contain columns 'chr' and 'pos'.")
-  )
+  # ---------- Step 3: carregar GTEx (www/gtex_eqtl_light.rds) ----------
+  gtex_all <- reactiveVal(NULL)
   
-  cl <- as.data.frame(clusters_df)
+  observe({
+    path <- "www/gtex_eqtl_light.rds"
+    if (file.exists(path)) {
+      df <- tryCatch(readRDS(path), error = function(e) NULL)
+      if (!is.null(df) && is.data.frame(df)) {
+        
+        # Normalització mínima robusta (clau per evitar “taula buida” per mismatch chr)
+        if ("chr" %in% names(df)) df$chr <- norm_chr_generic(df$chr)
+        if ("pos" %in% names(df)) df$pos <- suppressWarnings(as.integer(df$pos))
+        
+        gtex_all(df)
+        output$gtex_status <- renderText(
+          sprintf("GTEx loaded: %s (rows: %d, cols: %d)",
+                  path, nrow(df), ncol(df))
+        )
+      } else {
+        output$gtex_status <- renderText("Could not read www/gtex_eqtl_light.rds.")
+      }
+    } else {
+      output$gtex_status <- renderText("GTEx file not found: www/gtex_eqtl_light.rds")
+    }
+  })
   
-  # assegura chr/start/end
-  if (!"chr" %in% names(cl) && "CHR" %in% names(cl)) cl$chr <- cl$CHR
-  if (!"start" %in% names(cl) && "start_bp" %in% names(cl)) cl$start <- cl$start_bp
-  if (!"end" %in% names(cl) && "end_bp" %in% names(cl)) cl$end <- cl$end_bp
+  # ===========================
+  # Step 4: extreure GTEx dins clusters + assignar cluster/cluster_chr_n a cada hit
+  # ===========================
   
-  cl$chr   <- suppressWarnings(as.integer(cl$chr))
-  cl$start <- suppressWarnings(as.integer(cl$start))
-  cl$end   <- suppressWarnings(as.integer(cl$end))
+  gtex_hits_val <- reactiveVal(NULL)
   
-  # cluster_chr_n / cluster_id (string) + normalitza prefix "cluster_"
-  if (!"cluster_chr_n" %in% names(cl)) {
-    if ("cluster_id" %in% names(cl)) cl$cluster_chr_n <- as.character(cl$cluster_id)
-    else cl$cluster_chr_n <- NA_character_
-  }
-  if (!"cluster_id" %in% names(cl)) {
-    cl$cluster_id <- cl$cluster_chr_n
-  }
-  
-  cl$cluster_id    <- sub("^cluster_", "", as.character(cl$cluster_id))
-  cl$cluster_chr_n <- sub("^cluster_", "", as.character(cl$cluster_chr_n))
-  
-  # cluster (num) si no existeix
-  if (!"cluster" %in% names(cl)) {
-    cl$cluster <- seq_len(nrow(cl))
-  } else {
-    cl$cluster <- suppressWarnings(as.integer(cl$cluster))
-    if (any(!is.finite(cl$cluster))) {
-      # si ve trencat, força seq
+  extract_gtex_from_clusters <- function(clusters_df, gtex_df) {
+    if (is.null(clusters_df) || !is.data.frame(clusters_df) || !nrow(clusters_df)) {
+      return(gtex_df[0, , drop = FALSE])
+    }
+    if (is.null(gtex_df) || !is.data.frame(gtex_df) || !nrow(gtex_df)) {
+      return(gtex_df[0, , drop = FALSE])
+    }
+    
+    shiny::validate(
+      shiny::need(all(c("chr","pos") %in% colnames(gtex_df)),
+                  "GTEx table must contain columns 'chr' and 'pos'.")
+    )
+    
+    cl <- as.data.frame(clusters_df)
+    
+    # assegura chr/start/end
+    if (!"chr" %in% names(cl) && "CHR" %in% names(cl)) cl$chr <- cl$CHR
+    if (!"start" %in% names(cl) && "start_bp" %in% names(cl)) cl$start <- cl$start_bp
+    if (!"end" %in% names(cl) && "end_bp" %in% names(cl)) cl$end <- cl$end_bp
+    
+    cl$chr   <- suppressWarnings(as.integer(cl$chr))
+    cl$start <- suppressWarnings(as.integer(cl$start))
+    cl$end   <- suppressWarnings(as.integer(cl$end))
+    
+    # cluster_chr_n / cluster_id (string) + normalitza prefix "cluster_"
+    if (!"cluster_chr_n" %in% names(cl)) {
+      if ("cluster_id" %in% names(cl)) cl$cluster_chr_n <- as.character(cl$cluster_id)
+      else cl$cluster_chr_n <- NA_character_
+    }
+    if (!"cluster_id" %in% names(cl)) {
+      cl$cluster_id <- cl$cluster_chr_n
+    }
+    
+    cl$cluster_id    <- sub("^cluster_", "", as.character(cl$cluster_id))
+    cl$cluster_chr_n <- sub("^cluster_", "", as.character(cl$cluster_chr_n))
+    
+    # cluster (num) si no existeix
+    if (!"cluster" %in% names(cl)) {
       cl$cluster <- seq_len(nrow(cl))
+    } else {
+      cl$cluster <- suppressWarnings(as.integer(cl$cluster))
+      if (any(!is.finite(cl$cluster))) {
+        # si ve trencat, força seq
+        cl$cluster <- seq_len(nrow(cl))
+      }
     }
+    
+    # etiqueta chr per comparar amb gtex_df$chr (que és "1","2","X"? o "chr1"?)
+    # tu estàs fent chr_label_plink() i després compares amb gtex_df$chr
+    # deixem-ho igual però robust
+    cl$chr_i <- vapply(cl$chr, function(x) chr_label_plink(as.integer(x)), character(1))
+    
+    out <- vector("list", length = 0)
+    
+    for (i in seq_len(nrow(cl))) {
+      chr_i   <- cl$chr_i[i]
+      start_i <- cl$start[i]
+      end_i   <- cl$end[i]
+      
+      if (!is.finite(start_i) || !is.finite(end_i) || end_i < start_i) next
+      if (is.na(chr_i) || !nzchar(chr_i)) next
+      
+      sub <- gtex_df %>%
+        dplyr::filter(.data$chr == chr_i, .data$pos >= start_i, .data$pos <= end_i)
+      
+      if (nrow(sub) > 0) {
+        # assignacions sempre de longitud 1
+        sub$cluster       <- cl$cluster[i]
+        sub$cluster_chr_n <- cl$cluster_chr_n[i] %||% cl$cluster_id[i] %||% paste0("chr", chr_i, "_", i)
+        sub$cluster_start <- start_i
+        sub$cluster_end   <- end_i
+        out[[length(out) + 1]] <- sub
+      }
+    }
+    
+    if (!length(out)) return(gtex_df[0, , drop = FALSE])
+    dplyr::bind_rows(out)
   }
   
-  # etiqueta chr per comparar amb gtex_df$chr (que és "1","2","X"? o "chr1"?)
-  # tu estàs fent chr_label_plink() i després compares amb gtex_df$chr
-  # deixem-ho igual però robust
-  cl$chr_i <- vapply(cl$chr, function(x) chr_label_plink(as.integer(x)), character(1))
   
-  out <- vector("list", length = 0)
-  
-  for (i in seq_len(nrow(cl))) {
-    chr_i   <- cl$chr_i[i]
-    start_i <- cl$start[i]
-    end_i   <- cl$end[i]
+  observeEvent(input$run_gtex, {
     
-    if (!is.finite(start_i) || !is.finite(end_i) || end_i < start_i) next
-    if (is.na(chr_i) || !nzchar(chr_i)) next
+    req(gtex_all())
     
-    sub <- gtex_df %>%
-      dplyr::filter(.data$chr == chr_i, .data$pos >= start_i, .data$pos <= end_i)
+  #  cl <- clusters_cur()
+    cl <- clusters_stable()
+    validate(need(is.data.frame(cl) && nrow(cl) > 0, "No clusters. Generate intervals + clusters first."))
     
-    if (nrow(sub) > 0) {
-      # assignacions sempre de longitud 1
-      sub$cluster       <- cl$cluster[i]
-      sub$cluster_chr_n <- cl$cluster_chr_n[i] %||% cl$cluster_id[i] %||% paste0("chr", chr_i, "_", i)
-      sub$cluster_start <- start_i
-      sub$cluster_end   <- end_i
-      out[[length(out) + 1]] <- sub
+    # ------------------------------------------------------------
+    # 1) Normalitza GTEx chr/pos perquè el filtre dins extract funcioni
+    #    (la teva funció extract_gtex_from_clusters compara `chr` amb chr_label_plink())
+    #    - gtex_all() pot venir com "chr1" -> passa a "1"
+    #    - "chrX" -> "X" (si chr_label_plink retorna "X")
+    # ------------------------------------------------------------
+    gtex_norm <- gtex_all() %>%
+      dplyr::mutate(
+        chr = as.character(chr),
+        chr = gsub("^CHR", "chr", chr),
+        chr = gsub("^chr", "", chr),          # "1","X","23"...
+        chr = toupper(chr),
+        chr = dplyr::if_else(chr == "23", "X", chr),
+        chr = dplyr::if_else(chr == "24", "Y", chr),
+        pos = suppressWarnings(as.integer(pos))
+      ) %>%
+      dplyr::filter(!is.na(chr), !is.na(pos))
+    
+    # ------------------------------------------------------------
+    # 2) Extract: usa la teva funció, però ara ja li passen chr coherent
+    # ------------------------------------------------------------
+    hits <- tryCatch(
+      extract_gtex_from_clusters(cl, gtex_norm),
+      error = function(e) {
+        cat("[GTEx][run_gtex] extract_gtex_from_clusters ERROR:", conditionMessage(e), "\n")
+        NULL
+      }
+    )
+    
+    if (is.null(hits) || !is.data.frame(hits)) {
+      hits <- gtex_norm[0, , drop = FALSE]
     }
-  }
-  
-  if (!length(out)) return(gtex_df[0, , drop = FALSE])
-  dplyr::bind_rows(out)
-}
-
-
-observeEvent(input$run_gtex, {
-  
-  req(gtex_all())
-  
-  cl <- clusters_cur()
-  validate(need(is.data.frame(cl) && nrow(cl) > 0, "No clusters. Generate intervals + clusters first."))
-  
-  # ------------------------------------------------------------
-  # 1) Normalitza GTEx chr/pos perquè el filtre dins extract funcioni
-  #    (la teva funció extract_gtex_from_clusters compara `chr` amb chr_label_plink())
-  #    - gtex_all() pot venir com "chr1" -> passa a "1"
-  #    - "chrX" -> "X" (si chr_label_plink retorna "X")
-  # ------------------------------------------------------------
-  gtex_norm <- gtex_all() %>%
-    dplyr::mutate(
-      chr = as.character(chr),
-      chr = gsub("^CHR", "chr", chr),
-      chr = gsub("^chr", "", chr),          # "1","X","23"...
-      chr = toupper(chr),
-      chr = dplyr::if_else(chr == "23", "X", chr),
-      chr = dplyr::if_else(chr == "24", "Y", chr),
-      pos = suppressWarnings(as.integer(pos))
-    ) %>%
-    dplyr::filter(!is.na(chr), !is.na(pos))
-  
-  # ------------------------------------------------------------
-  # 2) Extract: usa la teva funció, però ara ja li passen chr coherent
-  # ------------------------------------------------------------
-  hits <- tryCatch(
-    extract_gtex_from_clusters(cl, gtex_norm),
-    error = function(e) {
-      cat("[GTEx][run_gtex] extract_gtex_from_clusters ERROR:", conditionMessage(e), "\n")
-      NULL
-    }
-  )
-  
-  if (is.null(hits) || !is.data.frame(hits)) {
-    hits <- gtex_norm[0, , drop = FALSE]
-  }
-  
-  gtex_hits_val(hits)
-  
-  # ------------------------------------------------------------
-  # 3) Actualitza n_gtex (robust)
-  #    IMPORTANT: no comptis per `cluster` perquè pot fallar quan:
-  #      - hits buit
-  #      - al HUB els noms venen com "cluster_chr1_1" vs "chr1_1"
-  #    Fem servir cluster_chr_n quan existeix, i normalitzem prefix.
-  # ------------------------------------------------------------
-  cl_base <- cl %>% dplyr::select(-dplyr::any_of("n_gtex"))
-  
-  if (nrow(hits) > 0) {
     
-    # assegura columna clau:
-    # preferim cluster_chr_n si existeix; si no, fem fallback a cluster (numeric)
-    if ("cluster_chr_n" %in% names(hits)) {
+    gtex_hits_val(hits)
+    
+    # ------------------------------------------------------------
+    # 3) Actualitza n_gtex (robust)
+    #    IMPORTANT: no comptis per `cluster` perquè pot fallar quan:
+    #      - hits buit
+    #      - al HUB els noms venen com "cluster_chr1_1" vs "chr1_1"
+    #    Fem servir cluster_chr_n quan existeix, i normalitzem prefix.
+    # ------------------------------------------------------------
+    cl_base <- cl %>% dplyr::select(-dplyr::any_of("n_gtex"))
+    
+    if (nrow(hits) > 0) {
       
-      hits2 <- hits %>%
-        dplyr::mutate(
-          cluster_chr_n = as.character(cluster_chr_n),
-          cluster_chr_n = sub("^cluster_", "", cluster_chr_n)  # HUB fix
-        )
-      
-      # cl també normalitzat
-      cl_key <- cl_base %>%
-        dplyr::mutate(
-          cluster_chr_n = dplyr::coalesce(
-            as.character(.data$cluster_chr_n),
-            as.character(.data$cluster_id)
-          ),
-          cluster_chr_n = sub("^cluster_", "", cluster_chr_n)
-        )
-      
-      cnt <- hits2 %>%
-        dplyr::count(cluster_chr_n, name = "n_gtex") %>%
-        dplyr::mutate(n_gtex = as.integer(n_gtex))
-      
-      cl2 <- cl_key %>%
-        dplyr::left_join(cnt, by = "cluster_chr_n") %>%
-        dplyr::mutate(n_gtex = dplyr::coalesce(.data$n_gtex, 0L))
-      
-      # retorna a l'estructura original (no forces canvis de columnes)
-      # però mantén n_gtex
-      clusters_cur(cl2)
-      
-    } else if ("cluster" %in% names(hits) && "cluster" %in% names(cl_base)) {
-      
-      cnt <- hits %>%
-        dplyr::count(cluster, name = "n_gtex") %>%
-        dplyr::mutate(n_gtex = as.integer(n_gtex))
-      
-      cl2 <- cl_base %>%
-        dplyr::left_join(cnt, by = "cluster") %>%
-        dplyr::mutate(n_gtex = dplyr::coalesce(.data$n_gtex, 0L))
-      
-      clusters_cur(cl2)
+      # assegura columna clau:
+      # preferim cluster_chr_n si existeix; si no, fem fallback a cluster (numeric)
+      if ("cluster_chr_n" %in% names(hits)) {
+        
+        hits2 <- hits %>%
+          dplyr::mutate(
+            cluster_chr_n = as.character(cluster_chr_n),
+            cluster_chr_n = sub("^cluster_", "", cluster_chr_n)  # HUB fix
+          )
+        
+        # cl també normalitzat
+        cl_key <- cl_base %>%
+          dplyr::mutate(
+            cluster_chr_n = dplyr::coalesce(
+              as.character(.data$cluster_chr_n),
+              as.character(.data$cluster_id)
+            ),
+            cluster_chr_n = sub("^cluster_", "", cluster_chr_n)
+          )
+        
+        cnt <- hits2 %>%
+          dplyr::count(cluster_chr_n, name = "n_gtex") %>%
+          dplyr::mutate(n_gtex = as.integer(n_gtex))
+        
+        cl2 <- cl_key %>%
+          dplyr::left_join(cnt, by = "cluster_chr_n") %>%
+          dplyr::mutate(n_gtex = dplyr::coalesce(.data$n_gtex, 0L))
+        
+        # retorna a l'estructura original (no forces canvis de columnes)
+        # però mantén n_gtex
+        clusters_cur(cl2)
+        
+      } else if ("cluster" %in% names(hits) && "cluster" %in% names(cl_base)) {
+        
+        cnt <- hits %>%
+          dplyr::count(cluster, name = "n_gtex") %>%
+          dplyr::mutate(n_gtex = as.integer(n_gtex))
+        
+        cl2 <- cl_base %>%
+          dplyr::left_join(cnt, by = "cluster") %>%
+          dplyr::mutate(n_gtex = dplyr::coalesce(.data$n_gtex, 0L))
+        
+        clusters_cur(cl2)
+        
+      } else {
+        
+        # no tenim cap clau fiable -> posa 0 i no trenquis res
+        clusters_cur(cl_base %>% dplyr::mutate(n_gtex = 0L))
+      }
       
     } else {
-      
-      # no tenim cap clau fiable -> posa 0 i no trenquis res
       clusters_cur(cl_base %>% dplyr::mutate(n_gtex = 0L))
     }
     
-  } else {
-    clusters_cur(cl_base %>% dplyr::mutate(n_gtex = 0L))
-  }
+    output$gtex_summary <- renderText({
+      sprintf("GTEx eQTLs inside all clusters: %d hits (clusters: %d)",
+              nrow(hits), nrow(cl))
+    })
+    
+    if (!nrow(hits)) {
+      showNotification("No GTEx eQTLs found inside the current clusters.", type = "warning")
+    } else {
+      showNotification("GTEx eQTLs extracted successfully.", type = "message")
+    }
+    
+  }, ignoreInit = TRUE)
   
-  output$gtex_summary <- renderText({
-    sprintf("GTEx eQTLs inside all clusters: %d hits (clusters: %d)",
-            nrow(hits), nrow(cl))
+  ###  
+  gtex_data <- reactive({
+    dt <- gtex_hits_val()
+    if (!is.data.frame(dt) || !nrow(dt)) return(dt)
+    
+    if (!"tissue" %in% names(dt)) dt$tissue <- NA_character_
+    dt$tissue <- trimws(as.character(dt$tissue))
+    
+    if (!"gene_id" %in% names(dt)) dt$gene_id <- NA_character_
+    dt$gene_id <- as.character(dt$gene_id)
+    
+    dt
   })
   
-  if (!nrow(hits)) {
-    showNotification("No GTEx eQTLs found inside the current clusters.", type = "warning")
-  } else {
-    showNotification("GTEx eQTLs extracted successfully.", type = "message")
-  }
+  # ===========================
+  # GTEx table (cluster-aware)
+  # ===========================
   
-}, ignoreInit = TRUE)
-
-
-
-###  
-gtex_data <- reactive({
-  gtex_hits_val()
-})
-
-# ===========================
-# GTEx table (cluster-aware)
-# ===========================
-
-gtex_table_filtered <- reactive({
-  dt <- gtex_data()
-  if (is.null(dt) || !nrow(dt)) return(dt)
+  gtex_table_filtered <- reactive({
+    dt <- gtex_data()
+    if (is.null(dt) || !nrow(dt)) return(dt)
+    
+    cl <- selected_cluster()
+    if (is.null(cl) || !nrow(cl)) return(dt)
+    
+    filter(dt, cluster == cl$cluster[1])
+  })
   
-  cl <- selected_cluster()
-  if (is.null(cl) || !nrow(cl)) return(dt)
+  gtex_table_all <- reactive({
+    dt <- gtex_data()
+    if (is.null(dt) || !nrow(dt)) return(dt)
+    dt
+  })
   
-  filter(dt, cluster == cl$cluster[1])
-})
-
-gtex_table_all <- reactive({
-  dt <- gtex_data()
-  if (is.null(dt) || !nrow(dt)) return(dt)
-  dt
-})
-
-output$gtex_table <- renderDT({
-  
-  dt <- gtex_table_filtered()
-  
-  if (is.null(dt) || !nrow(dt)) {
-    return(datatable(
-      data.frame(Message = "Run Step 4 to extract GTEx eQTLs."),
-      options = list(dom = "t")
-    ))
-  }
-  
-  # --- assegura columnes per evitar errors quan faltin ---
-  if (!"gene_name"  %in% names(dt)) dt$gene_name <- NA_character_
-  if (!"gene_id"    %in% names(dt)) dt$gene_id   <- NA_character_
-  if (!"variant_id" %in% names(dt)) dt$variant_id <- NA_character_
-  if (!"ref"        %in% names(dt)) dt$ref <- NA_character_
-  if (!"alt"        %in% names(dt)) dt$alt <- NA_character_
-  if (!"pval"       %in% names(dt)) {
-    if ("pval_nominal" %in% names(dt)) dt$pval <- dt$pval_nominal
-    else if ("pvalue"  %in% names(dt)) dt$pval <- dt$pvalue
-    else dt$pval <- NA_real_
-  }
-  if (!"slope" %in% names(dt)) dt$slope <- NA_real_
-  
-  dt <- dt %>%
-    mutate(
-      chr_clean = gsub("^chr", "", chr, ignore.case = TRUE),
-      
-      # si variant_id ja ve ple (GTEx), fem-lo servir; si no, el construïm
-      gtex_variant = dplyr::if_else(
-        !is.na(variant_id) & variant_id != "",
-        variant_id,
-        paste0("chr", chr_clean, "_", pos, "_", ref, "_", alt, "_b38")
-      ),
-      
-      gtex_var_url = paste0("https://www.gtexportal.org/home/snp/", gtex_variant),
-      
-      # IMPORTANT: condició vectorial (NO &&)
-      gtex_gene_url = dplyr::if_else(
-        !is.na(gene_name) & gene_name != "",
-        paste0("https://www.gtexportal.org/home/locusBrowserPage/", gene_name),
-        NA_character_
-      ),
-      
-      gtex_geneid_url = dplyr::if_else(
-        !is.na(gene_id) & gene_id != "",
-        paste0("https://www.gtexportal.org/home/gene/", gene_id),
-        NA_character_
-      ),
-      
-      Gene = dplyr::if_else(
-        !is.na(gene_name) & gene_name != "",
-        sprintf("<a href='%s' target='_blank'>%s</a>", gtex_gene_url, gene_name),
-        gene_name
-      ),
-      
-      Gene_ID = dplyr::if_else(
-        !is.na(gene_id) & gene_id != "",
-        sprintf("<a href='%s' target='_blank'>%s</a>", gtex_geneid_url, gene_id),
-        gene_id
-      ),
-      
-      Variant = sprintf("<a href='%s' target='_blank'>%s</a>", gtex_var_url, gtex_variant),
-      
-      pval_fmt  = dplyr::if_else(is.na(pval), NA_character_, formatC(pval, format = "e", digits = 2)),
-      slope_fmt = dplyr::if_else(is.na(slope), NA_character_, sprintf("%.3f", slope))
-    )
-  
-  datatable(
-    dt %>% select(chr, pos, tissue, Gene, Gene_ID, Variant,
-                  pval = pval_fmt, slope = slope_fmt, variant_id),
-    escape = FALSE,
-    rownames = FALSE,
-    options = list(pageLength = 15, scrollX = TRUE)
-  )
-})
-
-
-# ===========================
-# Visualitzacions GTEx (cluster-aware)
-# ===========================
-
-gtex_vis_df <- reactive({
-  dt <- gtex_table_filtered()
-  if (is.null(dt) || !nrow(dt)) return(NULL)
-  
-  # yval
-  if ("pval" %in% names(dt)) {
-    dt$yval <- -log10(dt$pval)
-  } else if ("pval_nominal" %in% names(dt)) {
-    dt$yval <- -log10(dt$pval_nominal)
-  } else if ("pvalue" %in% names(dt)) {
-    dt$yval <- -log10(dt$pvalue)
-  } else {
-    num_cols <- names(dt)[vapply(dt, is.numeric, logical(1))]
-    num_cols <- setdiff(num_cols, c("pos","BPcum","chr_cum","cluster","cluster_start","cluster_end"))
-    first <- num_cols[1]
-    dt$yval <- if (!is.null(first)) dt[[first]] else NA_real_
-  }
-  
-  # slope sign
-  if ("slope" %in% names(dt)) {
-    dt$slope_sign <- case_when(
-      dt$slope > 0  ~ "positive",
-      dt$slope < 0  ~ "negative",
-      TRUE          ~ "zero"
-    )
-  } else {
-    dt$slope_sign <- "unknown"
-  }
-  
-  # tissue family
-  if ("tissue" %in% names(dt)) {
-    dt$tissue_family <- vapply(dt$tissue, map_tissue_family, FUN.VALUE = character(1))
-  } else {
-    dt$tissue_family <- "Unknown"
-  }
-  
-  dt
-})
-
-output$tissue_family_bar <- renderPlot({
-  dt <- gtex_vis_df()
-  if (is.null(dt) || !nrow(dt) || !"tissue_family" %in% names(dt)) return(NULL)
-  
-  df_bar <- dt %>%
-    mutate(
-      slope_cat = case_when(
-        slope_sign == "positive" ~ "Positive slope",
-        slope_sign == "negative" ~ "Negative slope",
-        TRUE                     ~ "Other / unknown"
+  output$gtex_table <- renderDT({
+    
+    dt <- gtex_table_filtered()
+    
+    if (is.null(dt) || !nrow(dt)) {
+      return(datatable(
+        data.frame(Message = "Run Step 4 to extract GTEx eQTLs."),
+        options = list(dom = "t")
+      ))
+    }
+    
+    # --- assegura columnes per evitar errors quan faltin ---
+    if (!"gene_name"  %in% names(dt)) dt$gene_name <- NA_character_
+    if (!"gene_id"    %in% names(dt)) dt$gene_id   <- NA_character_
+    if (!"variant_id" %in% names(dt)) dt$variant_id <- NA_character_
+    if (!"ref"        %in% names(dt)) dt$ref <- NA_character_
+    if (!"alt"        %in% names(dt)) dt$alt <- NA_character_
+    if (!"pval"       %in% names(dt)) {
+      if ("pval_nominal" %in% names(dt)) dt$pval <- dt$pval_nominal
+      else if ("pvalue"  %in% names(dt)) dt$pval <- dt$pvalue
+      else dt$pval <- NA_real_
+    }
+    if (!"slope" %in% names(dt)) dt$slope <- NA_real_
+    
+    dt <- dt %>%
+      mutate(
+        chr_clean = gsub("^chr", "", chr, ignore.case = TRUE),
+        
+        # si variant_id ja ve ple (GTEx), fem-lo servir; si no, el construïm
+        gtex_variant = dplyr::if_else(
+          !is.na(variant_id) & variant_id != "",
+          variant_id,
+          paste0("chr", chr_clean, "_", pos, "_", ref, "_", alt, "_b38")
+        ),
+        
+        gtex_var_url = paste0("https://www.gtexportal.org/home/snp/", gtex_variant),
+        
+        # IMPORTANT: condició vectorial (NO &&)
+        gtex_gene_url = dplyr::if_else(
+          !is.na(gene_name) & gene_name != "",
+          paste0("https://www.gtexportal.org/home/locusBrowserPage/", gene_name),
+          NA_character_
+        ),
+        
+        gtex_geneid_url = dplyr::if_else(
+          !is.na(gene_id) & gene_id != "",
+          paste0("https://www.gtexportal.org/home/gene/", gene_id),
+          NA_character_
+        ),
+        
+        Gene = dplyr::if_else(
+          !is.na(gene_name) & gene_name != "",
+          sprintf("<a href='%s' target='_blank'>%s</a>", gtex_gene_url, gene_name),
+          gene_name
+        ),
+        
+        Gene_ID = dplyr::if_else(
+          !is.na(gene_id) & gene_id != "",
+          sprintf("<a href='%s' target='_blank'>%s</a>", gtex_geneid_url, gene_id),
+          gene_id
+        ),
+        
+        Variant = sprintf("<a href='%s' target='_blank'>%s</a>", gtex_var_url, gtex_variant),
+        
+        pval_fmt  = dplyr::if_else(is.na(pval), NA_character_, formatC(pval, format = "e", digits = 2)),
+        slope_fmt = dplyr::if_else(is.na(slope), NA_character_, sprintf("%.3f", slope))
       )
-    ) %>%
-    count(tissue_family, slope_cat, name = "n_hits")
-  
-  ggplot(df_bar, aes(x = tissue_family, y = n_hits, fill = slope_cat)) +
-    geom_col(position = "stack") +
-    labs(x = "Tissue family", y = "Number of eQTLs", fill = "Slope sign") +
-    theme_minimal(base_size = 12) +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-})
-
-output$tissue_dotplot <- renderPlot({
-  dt <- gtex_vis_df()
-  if (is.null(dt) || !nrow(dt) || !"tissue" %in% names(dt)) return(NULL)
-  
-  dt2 <- dt %>% arrange(desc(yval)) %>% slice_head(n = 200)
-  
-  ggplot(
-    dt2,
-    aes(
-      x = tissue,
-      y = yval,
-      size = if ("slope" %in% names(dt2)) abs(slope) else 1,
-      color = slope_sign
-    )
-  ) +
-    geom_point(alpha = 0.7) +
-    coord_flip() +
-    labs(x = "Tissue", y = "-log10(p)", size = "|slope|", color = "Slope sign") +
-    theme_minimal(base_size = 12)
-})
-
-output$tissue_heatmap <- renderPlot({
-  dt <- gtex_vis_df()
-  if (is.null(dt) || !nrow(dt) || !"gene_name" %in% names(dt)) return(NULL)
-  
-  df_hm <- dt %>%
-    group_by(gene_name, tissue_family) %>%
-    summarise(max_yval = max(yval, na.rm = TRUE), .groups = "drop")
-  
-  top_genes <- df_hm %>%
-    group_by(gene_name) %>%
-    summarise(max_gene = max(max_yval), .groups = "drop") %>%
-    arrange(desc(max_gene)) %>%
-    slice_head(n = 40) %>%
-    pull(gene_name)
-  
-  df_hm <- df_hm %>% filter(gene_name %in% top_genes)
-  
-  ggplot(df_hm, aes(x = tissue_family, y = gene_name, fill = max_yval)) +
-    geom_tile() +
-    scale_fill_viridis_c(option = "C", name = "max -log10(p)") +
-    labs(x = "Tissue family", y = "Gene") +
-    theme_minimal(base_size = 11) +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-})
-
-output$gtex_interpret <- renderText({
-  dt <- gtex_vis_df()
-  if (is.null(dt) || !nrow(dt)) {
-    return("No GTEx eQTLs available yet. Run Step 4 and/or select a cluster.")
-  }
-  
-  n_hits     <- nrow(dt)
-  n_genes    <- length(unique(dt$gene_name %||% NA))
-  n_tissues  <- length(unique(dt$tissue %||% NA))
-  n_families <- length(unique(dt$tissue_family %||% NA))
-  
-  fam_summary <- dt %>%
-    group_by(tissue_family) %>%
-    summarise(n = n(), max_yval = max(yval, na.rm = TRUE), .groups = "drop") %>%
-    arrange(desc(n)) %>%
-    slice_head(n = 3)
-  
-  fam_text <- if (nrow(fam_summary)) {
-    paste(sprintf("- %s: %d hits (max -log10(p) ≈ %.2f)",
-                  fam_summary$tissue_family, fam_summary$n, fam_summary$max_yval),
-          collapse = "\n")
-  } else {
-    "No tissue-family information."
-  }
-  
-  slope_tab <- dt %>% count(slope_sign, name = "n") %>% arrange(desc(n))
-  slope_text <- if (nrow(slope_tab)) paste(slope_tab$slope_sign, slope_tab$n, collapse = "; ") else "N/A"
-  
-  top_genes <- dt %>%
-    filter(!is.na(gene_name) & gene_name != "") %>%
-    group_by(gene_name, chr, pos) %>%
-    summarise(max_yval = max(yval, na.rm = TRUE), .groups = "drop") %>%
-    arrange(desc(max_yval)) %>%
-    slice_head(n = 5)
-  
-  top5_text <- if (nrow(top_genes)) {
-    paste(
-      sprintf("%d. %s (chr %s:%d, max -log10(p) ≈ %.2f)",
-              seq_len(nrow(top_genes)),
-              top_genes$gene_name,
-              top_genes$chr,
-              top_genes$pos,
-              top_genes$max_yval),
-      collapse = "\n"
-    )
-  } else {
-    "No gene name available."
-  }
-  
-  paste0(
-    "GTEx eQTLs summary (current view)\n",
-    "--------------------------------\n",
-    "Total eQTL hits: ", n_hits, "\n",
-    "Distinct genes:  ", n_genes, "\n",
-    "Tissues:         ", n_tissues, "\n",
-    "Tissue families: ", n_families, "\n\n",
-    "🔎 Top 5 most relevant genes (highest GTEx significance):\n",
-    top5_text, "\n\n",
-    "Most represented tissue families:\n",
-    fam_text, "\n\n",
-    "Slope sign distribution (positive/negative):\n",
-    slope_text, "\n"
-  )
-})
-
-# ===========================
-# Manhattan combinat (GWAS + GTEx)
-# ===========================
-
-get_xref <- function(p) {
-  xs <- unique(na.omit(vapply(p$x$data, function(tr) tr$xaxis %||% NA_character_, character(1))))
-  if (length(xs) == 0) "x" else xs[1]
-}
-
-output$manhattan_combo <- renderPlotly({
-  src_combo <- "manhattan_combo"
-  
-  dfp     <- tryCatch(dfp_manhattan(), error = function(e) NULL)
-  gtex_dt <- tryCatch(gtex_data(),     error = function(e) NULL)
-  
-  if (is.null(dfp) || !is.data.frame(dfp) || !nrow(dfp)) {
-    return(plotly_message("⚠️ GWAS table missing or incomplete. Load CHR, BP and P-values in Step 1."))
-  }
-  
-  ref <- .ref_hg38
-  ax  <- axis_df()
-  axis_breaks <- ax$center
-  axis_labels <- paste0("chr", ax$chrN)
-  GENOME_END  <- max(ref$chr_cum + ref$len)
-  
-  # --- ref_map (chr_num -> chr_cum) per poder projectar coordenades a BPcum ---
-  chr_key <- if ("chrN" %in% names(ref)) "chrN" else if ("chr" %in% names(ref)) "chr" else if ("CHR" %in% names(ref)) "CHR" else NA_character_
-  
-  ref_map <- NULL
-  if (!is.na(chr_key) && "chr_cum" %in% names(ref)) {
-    ref_map <- ref %>%
-      dplyr::transmute(
-        chr_num = suppressWarnings(as.integer(.data[[chr_key]])),
-        chr_cum = as.numeric(.data$chr_cum)
-      ) %>%
-      dplyr::filter(is.finite(chr_num), is.finite(chr_cum))
-  }
-  
-  thr_y <- if ((input$cluster_method %||% "window") == "window") (input$pthr %||% 5) else (input$min_logp %||% 6)
-  
-  # ----------------------------
-  # p1: GWAS (robust)
-  # ----------------------------
-  dfp <- dfp %>%
-    dplyr::arrange(CHR, BP) %>%
-    dplyr::mutate(
-      rs_show = dplyr::if_else(!is.na(snp) & nzchar(snp), snp, paste0("chr", CHR, ":", BP)),
-      chr_lab = chr_label_plink(as.integer(CHR)),
-      col     = ifelse((as.integer(CHR) %% 2) == 0, "darkgreen", "#ff7f00")
-    )
-  
-  dfp$tooltip <- paste0(
-    "<b>GWAS hit</b>",
-    "<br><b>rs:</b> ", dfp$rs_show,
-    "<br><b>CHR:</b> ", dfp$chr_lab,
-    "<br><b>BP:</b> ", dfp$BP,
-    "<br><b>P:</b> ", signif(dfp$Pval, 3),
-    "<br><b>-log10(P):</b> ", round(dfp$logp, 2)
-  )
-  
-  p1 <- ggplot2::ggplot(dfp, ggplot2::aes(x = BPcum, y = logp, text = tooltip)) +
-    ggplot2::geom_point(ggplot2::aes(color = col), size = 1)
-  
-  # Show threshold line only in "new" mode (or any mode NOT "old")
-  if (!identical(input$use_preloaded_catalog, "old")) {
-    p1 <- p1 + ggplot2::geom_hline(yintercept = thr_y, linetype = "dashed")
-  }
-  
-  p1 <- p1 +
-    ggplot2::scale_color_identity(guide = "none") +
-    ggplot2::scale_x_continuous(
-      limits = c(0, GENOME_END),
-      breaks = axis_breaks,
-      labels = axis_labels,
-      expand = c(0, 0)
-    ) +
-    ggplot2::labs(x = NULL, y = "-log10(P)") +
-    ggplot2::theme_minimal(base_size = 10) +
-    ggplot2::theme(
-      axis.text.x  = ggplot2::element_blank(),
-      axis.ticks.x = ggplot2::element_blank(),
-      legend.position = "none"
-    )
-  
-  
-  p1_pl <- plotly::ggplotly(p1, tooltip = "text", source = src_combo)
-  
-  # ----------------------------
-  # p2 base: eixos correctes sempre (evita autoscale)
-  # ----------------------------
-  p2_base <- ggplot2::ggplot(data.frame(x = 0, y = 0), ggplot2::aes(x = x, y = y)) +
-    ggplot2::geom_blank() +
-    ggplot2::scale_x_continuous(
-      limits = c(0, GENOME_END),
-      breaks = axis_breaks,
-      labels = axis_labels,
-      expand = c(0, 0)
-    ) +
-    ggplot2::scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
-    ggplot2::labs(x = "Genome", y = "GTEx signal") +
-    ggplot2::theme_minimal(base_size = 12) +
-    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1))
-  
-  
-  p2_pl <- plotly::ggplotly(p2_base, source = src_combo)
-  
-  y_max <- 1
-  
-  # ----------------------------
-  # p2: GTEx hits (si n'hi ha)
-  # ----------------------------
-  gtex_ok <- !is.null(gtex_dt) && is.data.frame(gtex_dt) && nrow(gtex_dt) > 0
-  if (gtex_ok) {
     
-    # columnes mínimes
-    validate(need(all(c("chr","pos") %in% names(gtex_dt)), "GTEx data must have 'chr' and 'pos' columns."))
+    datatable(
+      dt %>% select(chr, pos, tissue, Gene, Gene_ID, Variant,
+                    pval = pval_fmt, slope = slope_fmt, variant_id),
+      escape = FALSE,
+      rownames = FALSE,
+      options = list(pageLength = 15, scrollX = TRUE)
+    )
+  })
+  
+  # ===========================
+  # Visualitzacions GTEx (cluster-aware)
+  # ===========================
+  
+  gtex_vis_df <- reactive({
+    dt <- gtex_table_filtered()
+    if (is.null(dt) || !nrow(dt)) return(NULL)
     
-    g2 <- gtex_dt %>%
-      dplyr::mutate(
-        chrN = norm_chr_generic(chr)
-      ) %>%
-      dplyr::inner_join(ref %>% dplyr::select(chr, chr_cum), by = c("chrN" = "chr")) %>%
-      dplyr::mutate(BPcum = as.numeric(pos) + as.numeric(chr_cum))
-    
-    # yval + label (mateixa lògica que ja feies)
-    if ("pval" %in% names(g2)) {
-      g2$yval <- -log10(g2$pval)
-      ylab <- "-log10(p_GTEx)"
-    } else if ("pval_nominal" %in% names(g2)) {
-      g2$yval <- -log10(g2$pval_nominal)
-      ylab <- "-log10(p_GTEx)"
-    } else if ("pvalue" %in% names(g2)) {
-      g2$yval <- -log10(g2$pvalue)
-      ylab <- "-log10(p_GTEx)"
-    } else if ("slope" %in% names(g2)) {
-      g2$yval <- g2$slope
-      ylab <- "Slope"
+    # yval
+    if ("pval" %in% names(dt)) {
+      dt$yval <- -log10(dt$pval)
+    } else if ("pval_nominal" %in% names(dt)) {
+      dt$yval <- -log10(dt$pval_nominal)
+    } else if ("pvalue" %in% names(dt)) {
+      dt$yval <- -log10(dt$pvalue)
     } else {
-      num_cols <- names(g2)[vapply(g2, is.numeric, logical(1))]
+      num_cols <- names(dt)[vapply(dt, is.numeric, logical(1))]
       num_cols <- setdiff(num_cols, c("pos","BPcum","chr_cum","cluster","cluster_start","cluster_end"))
-      first <- num_cols[1] %||% "pos"
-      g2$yval <- g2[[first]]
-      ylab <- first
+      first <- num_cols[1]
+      dt$yval <- if (!is.null(first)) dt[[first]] else NA_real_
     }
     
-    # highlight cluster seleccionat (si existeix columna cluster)
-    cl_sel <- selected_cluster()
-    if (!is.null(cl_sel) && nrow(cl_sel) == 1 && "cluster" %in% names(g2) && "cluster" %in% names(cl_sel)) {
-      g2$highlight <- ifelse(g2$cluster == cl_sel$cluster[1], "cluster", "other")
+    # slope sign
+    if ("slope" %in% names(dt)) {
+      dt$slope_sign <- case_when(
+        dt$slope > 0  ~ "positive",
+        dt$slope < 0  ~ "negative",
+        TRUE          ~ "zero"
+      )
     } else {
-      g2$highlight <- "other"
+      dt$slope_sign <- "unknown"
     }
     
-    g2$tooltip <- paste0(
-      "<b>GTEx hit</b>",
-      "<br><b>chr:</b> ", g2$chr,
-      "<br><b>pos:</b> ", g2$pos,
-      if ("variant_id" %in% names(g2)) paste0("<br><b>variant_id:</b> ", g2$variant_id) else "",
-      if ("tissue" %in% names(g2))     paste0("<br><b>tissue:</b> ", g2$tissue) else "",
-      if ("gene_name" %in% names(g2))  paste0("<br><b>gene:</b> ", g2$gene_name) else "",
-      if ("cluster_chr_n" %in% names(g2)) paste0("<br><b>cluster:</b> ", g2$cluster_chr_n) else ""
+    # tissue family
+    if ("tissue" %in% names(dt)) {
+      dt$tissue_family <- vapply(dt$tissue, map_tissue_family, FUN.VALUE = character(1))
+    } else {
+      dt$tissue_family <- "Unknown"
+    }
+    
+    dt
+  })
+  
+  output$tissue_family_bar <- renderPlot({
+    dt <- gtex_vis_df()
+    if (is.null(dt) || !nrow(dt) || !"tissue_family" %in% names(dt)) return(NULL)
+    
+    df_bar <- dt %>%
+      mutate(
+        slope_cat = case_when(
+          slope_sign == "positive" ~ "Positive slope",
+          slope_sign == "negative" ~ "Negative slope",
+          TRUE                     ~ "Other / unknown"
+        )
+      ) %>%
+      count(tissue_family, slope_cat, name = "n_hits")
+    
+    ggplot(df_bar, aes(x = tissue_family, y = n_hits, fill = slope_cat)) +
+      geom_col(position = "stack") +
+      labs(x = "Tissue family", y = "Number of eQTLs", fill = "Slope sign") +
+      theme_minimal(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+  
+  output$tissue_dotplot <- renderPlot({
+    dt <- gtex_vis_df()
+    if (is.null(dt) || !nrow(dt) || !"tissue" %in% names(dt)) return(NULL)
+    
+    dt2 <- dt %>% arrange(desc(yval)) %>% slice_head(n = 200)
+    
+    ggplot(
+      dt2,
+      aes(
+        x = tissue,
+        y = yval,
+        size = if ("slope" %in% names(dt2)) abs(slope) else 1,
+        color = slope_sign
+      )
+    ) +
+      geom_point(alpha = 0.7) +
+      coord_flip() +
+      labs(x = "Tissue", y = "-log10(p)", size = "|slope|", color = "Slope sign") +
+      theme_minimal(base_size = 12)
+  })
+  
+  output$tissue_heatmap <- renderPlot({
+    dt <- gtex_vis_df()
+    if (is.null(dt) || !nrow(dt) || !"gene_name" %in% names(dt)) return(NULL)
+    
+    df_hm <- dt %>%
+      group_by(gene_name, tissue_family) %>%
+      summarise(max_yval = max(yval, na.rm = TRUE), .groups = "drop")
+    
+    top_genes <- df_hm %>%
+      group_by(gene_name) %>%
+      summarise(max_gene = max(max_yval), .groups = "drop") %>%
+      arrange(desc(max_gene)) %>%
+      slice_head(n = 40) %>%
+      pull(gene_name)
+    
+    df_hm <- df_hm %>% filter(gene_name %in% top_genes)
+    
+    ggplot(df_hm, aes(x = tissue_family, y = gene_name, fill = max_yval)) +
+      geom_tile() +
+      scale_fill_viridis_c(option = "C", name = "max -log10(p)") +
+      labs(x = "Tissue family", y = "Gene") +
+      theme_minimal(base_size = 11) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+  
+  output$gtex_interpret <- renderText({
+    dt <- gtex_vis_df()
+    if (is.null(dt) || !nrow(dt)) {
+      return("No GTEx eQTLs available yet. Run Step 4 and/or select a cluster.")
+    }
+    
+    n_hits     <- nrow(dt)
+    n_genes    <- length(unique(dt$gene_name %||% NA))
+    n_tissues  <- length(unique(dt$tissue %||% NA))
+    n_families <- length(unique(dt$tissue_family %||% NA))
+    
+    fam_summary <- dt %>%
+      group_by(tissue_family) %>%
+      summarise(n = n(), max_yval = max(yval, na.rm = TRUE), .groups = "drop") %>%
+      arrange(desc(n)) %>%
+      slice_head(n = 3)
+    
+    fam_text <- if (nrow(fam_summary)) {
+      paste(sprintf("- %s: %d hits (max -log10(p) ≈ %.2f)",
+                    fam_summary$tissue_family, fam_summary$n, fam_summary$max_yval),
+            collapse = "\n")
+    } else {
+      "No tissue-family information."
+    }
+    
+    slope_tab <- dt %>% count(slope_sign, name = "n") %>% arrange(desc(n))
+    slope_text <- if (nrow(slope_tab)) paste(slope_tab$slope_sign, slope_tab$n, collapse = "; ") else "N/A"
+    
+    top_genes <- dt %>%
+      filter(!is.na(gene_name) & gene_name != "") %>%
+      group_by(gene_name, chr, pos) %>%
+      summarise(max_yval = max(yval, na.rm = TRUE), .groups = "drop") %>%
+      arrange(desc(max_yval)) %>%
+      slice_head(n = 5)
+    
+    top5_text <- if (nrow(top_genes)) {
+      paste(
+        sprintf("%d. %s (chr %s:%d, max -log10(p) ≈ %.2f)",
+                seq_len(nrow(top_genes)),
+                top_genes$gene_name,
+                top_genes$chr,
+                top_genes$pos,
+                top_genes$max_yval),
+        collapse = "\n"
+      )
+    } else {
+      "No gene name available."
+    }
+    
+    paste0(
+      "GTEx eQTLs summary (current view)\n",
+      "--------------------------------\n",
+      "Total eQTL hits: ", n_hits, "\n",
+      "Distinct genes:  ", n_genes, "\n",
+      "Tissues:         ", n_tissues, "\n",
+      "Tissue families: ", n_families, "\n\n",
+      "🔎 Top 5 most relevant genes (highest GTEx significance):\n",
+      top5_text, "\n\n",
+      "Most represented tissue families:\n",
+      fam_text, "\n\n",
+      "Slope sign distribution (positive/negative):\n",
+      slope_text, "\n"
+    )
+  })
+  
+  # ===========================
+  # Manhattan combinat (GWAS + GTEx)
+  # ===========================
+  
+  get_xref <- function(p) {
+    xs <- unique(na.omit(vapply(p$x$data, function(tr) tr$xaxis %||% NA_character_, character(1))))
+    if (length(xs) == 0) "x" else xs[1]
+  }
+  
+  output$manhattan_combo <- renderPlotly({
+    src_combo <- "manhattan_combo"
+    
+    dfp     <- tryCatch(dfp_manhattan(), error = function(e) NULL)
+    gtex_dt <- tryCatch(gtex_data(),     error = function(e) NULL)
+    
+    if (is.null(dfp) || !is.data.frame(dfp) || !nrow(dfp)) {
+      return(plotly_message("⚠️ GWAS table missing or incomplete. Load CHR, BP and P-values in Step 1."))
+    }
+    
+    ref <- .ref_hg38
+    ax  <- axis_df()
+    axis_breaks <- ax$center
+    axis_labels <- paste0("chr", ax$chrN)
+    GENOME_END  <- max(ref$chr_cum + ref$len)
+    
+    # --- ref_map correcte (no factor->integer) ---
+    ref_map <- .ref_hg38 %>%
+      dplyr::mutate(
+        chr_chr = as.character(chr),
+        chr_chr = gsub("^chr", "", chr_chr, ignore.case = TRUE),
+        chr_num = dplyr::case_when(
+          chr_chr %in% as.character(1:22) ~ suppressWarnings(as.integer(chr_chr)),
+          chr_chr == "X"  ~ 23L,
+          chr_chr == "Y"  ~ 24L,
+          chr_chr == "MT" ~ 26L,
+          TRUE ~ NA_integer_
+        )
+      ) %>%
+      dplyr::select(chr_num, chr_cum) %>%
+      dplyr::filter(is.finite(chr_num), is.finite(chr_cum))
+    
+    #-----------
+    thr_y <- if ((input$cluster_method %||% "window") == "window") (input$pthr %||% 5) else (input$min_logp %||% 6)
+    
+    # ----------------------------
+    # p1: GWAS (robust)
+    # ----------------------------
+    dfp <- dfp %>%
+      dplyr::arrange(CHR, BP) %>%
+      dplyr::mutate(
+        rs_show = dplyr::if_else(!is.na(snp) & nzchar(snp), snp, paste0("chr", CHR, ":", BP)),
+        chr_lab = chr_label_plink(as.integer(CHR)),
+        col     = ifelse((as.integer(CHR) %% 2) == 0, "darkgreen", "#ff7f00")
+      )
+    
+    dfp$tooltip <- paste0(
+      "<b>GWAS hit</b>",
+      "<br><b>rs:</b> ", dfp$rs_show,
+      "<br><b>CHR:</b> ", dfp$chr_lab,
+      "<br><b>BP:</b> ", dfp$BP,
+      "<br><b>P:</b> ", signif(dfp$Pval, 3),
+      "<br><b>-log10(P):</b> ", round(dfp$logp, 2)
     )
     
-    y_max <- max(g2$yval[is.finite(g2$yval)], na.rm = TRUE)
-    if (!is.finite(y_max) || y_max <= 0) y_max <- 1
+    p1 <- ggplot2::ggplot(dfp, ggplot2::aes(x = BPcum, y = logp, text = tooltip)) +
+      ggplot2::geom_point(ggplot2::aes(color = col), size = 1)
     
-    p2 <- ggplot2::ggplot(g2, ggplot2::aes(x = BPcum, y = yval, text = tooltip)) +
-      ggplot2::geom_point(ggplot2::aes(color = highlight), size = 0.7) +
-      ggplot2::scale_color_manual(values = c("other" = "grey50", "cluster" = "red"), guide = "none") +
+    # Show threshold line only in "new" mode (or any mode NOT "old")
+    if (!identical(input$use_preloaded_catalog, "old")) {
+      p1 <- p1 + ggplot2::geom_hline(yintercept = thr_y, linetype = "dashed")
+    }
+    
+    p1 <- p1 +
+      ggplot2::scale_color_identity(guide = "none") +
       ggplot2::scale_x_continuous(
         limits = c(0, GENOME_END),
         breaks = axis_breaks,
         labels = axis_labels,
         expand = c(0, 0)
       ) +
-      ggplot2::scale_y_continuous(limits = c(min(0, min(g2$yval, na.rm = TRUE)), y_max * 1.25), expand = c(0, 0)) +
-      ggplot2::labs(x = "Genome", y = ylab) +
+      ggplot2::labs(x = NULL, y = "-log10(P)") +
+      ggplot2::theme_minimal(base_size = 10) +
+      ggplot2::theme(
+        axis.text.x  = ggplot2::element_blank(),
+        axis.ticks.x = ggplot2::element_blank(),
+        legend.position = "none"
+      )
+    
+    
+    p1_pl <- plotly::ggplotly(p1, tooltip = "text", source = src_combo)
+    
+    # ----------------------------
+    # p2 base: eixos correctes sempre (evita autoscale)
+    # ----------------------------
+    p2_base <- ggplot2::ggplot(data.frame(x = 0, y = 0), ggplot2::aes(x = x, y = y)) +
+      ggplot2::geom_blank() +
+      ggplot2::scale_x_continuous(
+        limits = c(0, GENOME_END),
+        breaks = axis_breaks,
+        labels = axis_labels,
+        expand = c(0, 0)
+      ) +
+      ggplot2::scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+      ggplot2::labs(x = "Genome", y = "GTEx signal") +
       ggplot2::theme_minimal(base_size = 12) +
       ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1))
     
-    p2_pl <- plotly::ggplotly(p2, tooltip = "text", source = src_combo)
-  }
-  
-  # ----------------------------
-  # CLUSTER SEGMENT band (sempre visible)
-  #   GTEx: clusters_cur() té chr/start/end i cluster_chr_n
-  # ----------------------------
-  # --- Cluster segment band (ROBUST) ---
-  
-  cat("[DBG] clusters_cur n=", if (is.data.frame(clusters_cur())) nrow(clusters_cur()) else -1, "\n")
-  
-  cl <- clusters_cur()
-  if (is.data.frame(cl) && nrow(cl) && is.data.frame(ref_map) && nrow(ref_map)) {
     
-    clseg <- as.data.frame(cl) %>%
-      dplyr::transmute(
-        cluster_id = dplyr::coalesce(
-          as.character(.data$cluster_id),
-          as.character(.data$cluster_chr_n)
-        ),
-        chr_num = suppressWarnings(as.integer(.data$chr)),
-        start_i = suppressWarnings(as.numeric(.data$start)),
-        end_i   = suppressWarnings(as.numeric(.data$end))
-      ) %>%
-      dplyr::filter(
-        !is.na(cluster_id), nzchar(cluster_id),
-        is.finite(chr_num), is.finite(start_i), is.finite(end_i),
-        end_i >= start_i
-      ) %>%
-      dplyr::distinct(cluster_id, chr_num, start_i, end_i) %>%
-      dplyr::left_join(ref_map, by = "chr_num") %>%
-      dplyr::filter(is.finite(chr_cum)) %>%
-      dplyr::transmute(
-        cluster_id = cluster_id,
-        x0   = pmax(0, start_i + chr_cum),
-        x1   = pmin(GENOME_END, end_i + chr_cum),
-        xmid = (x0 + x1) / 2,
-        text = paste0(
-          "Cluster: ", cluster_id,
-          "<br>chr", chr_label_plink(chr_num), ":",
-          format(start_i, scientific = FALSE), "-",
-          format(end_i, scientific = FALSE)
-        )
-      ) %>%
-      dplyr::filter(is.finite(x0), is.finite(x1), x1 >= x0) %>%
-      dplyr::arrange(x0)
+    p2_pl <- plotly::ggplotly(p2_base, source = src_combo)
+
+    y_max <- 1
     
-    # --- Després d'afegir els punts GTEx a p2_pl (o abans, és igual) ---
-    
-    if (nrow(clseg) > 0) {
+    # ----------------------------
+    # p2: GTEx hits (si n'hi ha)
+    # ----------------------------
+    gtex_ok <- !is.null(gtex_dt) && is.data.frame(gtex_dt) && nrow(gtex_dt) > 0
+    if (gtex_ok) {
       
-      # --- Posició dins el panell inferior ---
-      # Si hi ha GTEx hits, usem y_max (i queda prop de la part alta del panell).
-      # Si NO n'hi ha, p2_base té y=[0..1], així que ho fixem dins d'aquest rang.
-      if (isTRUE(gtex_ok)) {
-        y_seg  <- y_max * 1.10   # dins del límit y_max*1.25
-        y_tick <- y_max * 0.015
-        y_txt  <- y_max * 1.18
+      # columnes mínimes
+      validate(need(all(c("chr","pos") %in% names(gtex_dt)), "GTEx data must have 'chr' and 'pos' columns."))
+      
+      g2 <- gtex_dt %>%
+        dplyr::mutate(
+          chrN = norm_chr_generic(chr)
+        ) %>%
+        dplyr::inner_join(ref %>% dplyr::select(chr, chr_cum), by = c("chrN" = "chr")) %>%
+        dplyr::mutate(BPcum = as.numeric(pos) + as.numeric(chr_cum))
+      
+      # yval + label (mateixa lògica que ja feies)
+      if ("pval" %in% names(g2)) {
+        g2$yval <- -log10(g2$pval)
+        ylab <- "-log10(p_GTEx)"
+      } else if ("pval_nominal" %in% names(g2)) {
+        g2$yval <- -log10(g2$pval_nominal)
+        ylab <- "-log10(p_GTEx)"
+      } else if ("pvalue" %in% names(g2)) {
+        g2$yval <- -log10(g2$pvalue)
+        ylab <- "-log10(p_GTEx)"
+      } else if ("slope" %in% names(g2)) {
+        g2$yval <- g2$slope
+        ylab <- "Slope"
       } else {
-        y_seg  <- 0.90
-        y_tick <- 0.02
-        y_txt  <- 0.95
+        num_cols <- names(g2)[vapply(g2, is.numeric, logical(1))]
+        num_cols <- setdiff(num_cols, c("pos","BPcum","chr_cum","cluster","cluster_start","cluster_end"))
+        first <- num_cols[1] %||% "pos"
+        g2$yval <- g2[[first]]
+        ylab <- first
       }
       
-      clseg$y_seg  <- y_seg
-      clseg$y0tick <- y_seg - y_tick
-      clseg$y1tick <- y_seg + y_tick
-      clseg$y_txt  <- y_txt
+      # highlight cluster seleccionat (si existeix columna cluster)
+      cl_sel <- selected_cluster()
+      if (!is.null(cl_sel) && nrow(cl_sel) == 1 && "cluster" %in% names(g2) && "cluster" %in% names(cl_sel)) {
+        g2$highlight <- ifelse(g2$cluster == cl_sel$cluster[1], "cluster", "other")
+      } else {
+        g2$highlight <- "other"
+      }
       
-      # IMPORTANT: fem servir TRACES (add_segments) com al codi EWAS
-      # perquè subplot() les reassigna bé al panell inferior.
-      p2_pl <- p2_pl %>%
-        plotly::add_segments(
-          data = clseg,
-          x = ~x0, xend = ~x1,
-          y = ~y_seg, yend = ~y_seg,
-          inherit = FALSE,
-          line = list(width = 3),
-          hoverinfo = "text", text = ~text,
-          showlegend = FALSE
-        ) %>%
-        plotly::add_segments(
-          data = clseg,
-          x = ~x0, xend = ~x0,
-          y = ~y0tick, yend = ~y1tick,
-          inherit = FALSE, line = list(width = 2),
-          hoverinfo = "none", showlegend = FALSE
-        ) %>%
-        plotly::add_segments(
-          data = clseg,
-          x = ~x1, xend = ~x1,
-          y = ~y0tick, yend = ~y1tick,
-          inherit = FALSE, line = list(width = 2),
-          hoverinfo = "none", showlegend = FALSE
-        ) %>%
-        plotly::add_annotations(
-          data = clseg,
-          x = ~xmid, y = ~y_txt,
-          text = ~cluster_id,
-          xref = "x", yref = "y",
-          showarrow = FALSE,
-          textangle = 45,          # <- 90º com vols
-          font = list(size = 12),
-          xanchor = "center",
-          yanchor = "bottom"
-        )
+      g2$tooltip <- paste0(
+        "<b>GTEx hit</b>",
+        "<br><b>chr:</b> ", g2$chr,
+        "<br><b>pos:</b> ", g2$pos,
+        if ("variant_id" %in% names(g2)) paste0("<br><b>variant_id:</b> ", g2$variant_id) else "",
+        if ("tissue" %in% names(g2))     paste0("<br><b>tissue:</b> ", g2$tissue) else "",
+        if ("gene_name" %in% names(g2))  paste0("<br><b>gene:</b> ", g2$gene_name) else "",
+        if ("cluster_chr_n" %in% names(g2)) paste0("<br><b>cluster:</b> ", g2$cluster_chr_n) else ""
+      )
+      
+      y_max <- max(g2$yval[is.finite(g2$yval)], na.rm = TRUE)
+      if (!is.finite(y_max) || y_max <= 0) y_max <- 1
+      
+      p2 <- ggplot2::ggplot(g2, ggplot2::aes(x = BPcum, y = yval, text = tooltip)) +
+        ggplot2::geom_point(ggplot2::aes(color = highlight), size = 0.7) +
+        ggplot2::scale_color_manual(values = c("other" = "grey50", "cluster" = "red"), guide = "none") +
+        ggplot2::scale_x_continuous(
+          limits = c(0, GENOME_END),
+          breaks = axis_breaks,
+          labels = axis_labels,
+          expand = c(0, 0)
+        ) +
+        ggplot2::scale_y_continuous(limits = c(min(0, min(g2$yval, na.rm = TRUE)), y_max * 1.25), expand = c(0, 0)) +
+        ggplot2::labs(x = "Genome", y = ylab) +
+        ggplot2::theme_minimal(base_size = 12) +
+        ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1))
+      
+      p2_pl <- plotly::ggplotly(p2, tooltip = "text", source = src_combo)
     }
     
+    # ----------------------------
+    # CLUSTER SEGMENT band (sempre visible)
+    #   GTEx: clusters_cur() té chr/start/end i cluster_chr_n
+    # ----------------------------
+    # --- Cluster segment band (ROBUST) ---
     
+    ##### cl <- clusters_cur() 
+    cl <- clusters_stable()
+    if (is.data.frame(cl) && nrow(cl) && is.data.frame(ref_map) && nrow(ref_map)) {
+      
+      clseg <- as.data.frame(cl) %>%
+        dplyr::transmute(
+          cluster_id = dplyr::coalesce(
+            as.character(.data$cluster_id),
+            as.character(.data$cluster_chr_n)
+          ),
+          chr_num = suppressWarnings(as.integer(.data$chr)),
+          start_i = suppressWarnings(as.numeric(.data$start)),
+          end_i   = suppressWarnings(as.numeric(.data$end))
+        ) %>%
+        dplyr::filter(
+          !is.na(cluster_id), nzchar(cluster_id),
+          is.finite(chr_num), is.finite(start_i), is.finite(end_i),
+          end_i >= start_i
+        ) %>%
+        dplyr::distinct(cluster_id, chr_num, start_i, end_i) %>%
+        dplyr::left_join(ref_map, by = "chr_num") %>%
+        dplyr::filter(is.finite(chr_cum)) %>%
+        dplyr::transmute(
+          cluster_id = cluster_id,
+          x0   = pmax(0, start_i + chr_cum),
+          x1   = pmin(GENOME_END, end_i + chr_cum),
+          xmid = (x0 + x1) / 2,
+          text = paste0(
+            "Cluster: ", cluster_id,
+            "<br>chr", chr_label_plink(chr_num), ":",
+            format(start_i, scientific = FALSE), "-",
+            format(end_i, scientific = FALSE)
+          )
+        ) %>%
+        dplyr::filter(is.finite(x0), is.finite(x1), x1 >= x0) %>%
+        dplyr::arrange(x0)
+      
+      # --- Després d'afegir els punts GTEx a p2_pl (o abans, és igual) ---
+      
+      if (nrow(clseg) > 0) {
+        
+        # --- Posició dins el panell inferior ---
+        # Si hi ha GTEx hits, usem y_max (i queda prop de la part alta del panell).
+        # Si NO n'hi ha, p2_base té y=[0..1], així que ho fixem dins d'aquest rang.
+        if (isTRUE(gtex_ok)) {
+          y_seg  <- y_max * 1.10   # dins del límit y_max*1.25
+          y_tick <- y_max * 0.015
+          y_txt  <- y_max * 1.18
+        } else {
+          y_seg  <- 0.90
+          y_tick <- 0.02
+          y_txt  <- 0.95
+        }
+        
+        clseg$y_seg  <- y_seg
+        clseg$y0tick <- y_seg - y_tick
+        clseg$y1tick <- y_seg + y_tick
+        clseg$y_txt  <- y_txt
+        
+        # IMPORTANT: fem servir TRACES (add_segments) com al codi EWAS
+        # perquè subplot() les reassigna bé al panell inferior.
+        p2_pl <- p2_pl %>%
+          plotly::add_segments(
+            data = clseg,
+            x = ~x0, xend = ~x1,
+            y = ~y_seg, yend = ~y_seg,
+            inherit = FALSE,
+            line = list(width = 3),
+            hoverinfo = "text", text = ~text,
+            showlegend = FALSE
+          ) %>%
+          plotly::add_segments(
+            data = clseg,
+            x = ~x0, xend = ~x0,
+            y = ~y0tick, yend = ~y1tick,
+            inherit = FALSE, line = list(width = 2),
+            hoverinfo = "none", showlegend = FALSE
+          ) %>%
+          plotly::add_segments(
+            data = clseg,
+            x = ~x1, xend = ~x1,
+            y = ~y0tick, yend = ~y1tick,
+            inherit = FALSE, line = list(width = 2),
+            hoverinfo = "none", showlegend = FALSE
+          ) %>%
+          plotly::add_annotations(
+            data = clseg,
+            x = ~xmid, y = ~y_txt,
+            text = ~cluster_id,
+            xref = "x", yref = "y",
+            showarrow = FALSE,
+            textangle = 45,          # <- 90º com vols
+            font = list(size = 12),
+            xanchor = "center",
+            yanchor = "bottom"
+          )
+      }
+    }
+
+    out <- plotly::subplot(
+      p1_pl, p2_pl,
+      nrows = 2, shareX = TRUE,
+      heights = c(0.55, 0.45),
+      titleY = TRUE
+    )
     
+    # IMPORTANT: fixa source al widget FINAL (subplot sovint el "perd")
+    out$x$source <- src_combo
+    
+    # registra events al widget FINAL
+ #   out <- plotly::event_register(out, "plotly_click")
+    out <- plotly::event_register(out, "plotly_relayout")
+
+        out %>%
+      plotly::config(
+        displayModeBar = TRUE,
+        displaylogo = FALSE,
+        modeBarButtonsToRemove = c("select2d","lasso2d","hoverCompareCartesian")
+      ) %>%
+      plotly::layout(
+        margin = list(t = 60),
+        showlegend = FALSE,
+        annotations = list(
+          list(x=0.5, y=1.05, text="<b>GWAS Manhattan</b>", showarrow=FALSE, xref="paper", yref="paper"),
+          list(x=0.5, y=0.47, text="<b>GTEx eQTLs inside clusters</b>", showarrow=FALSE, xref="paper", yref="paper")
+        )
+      )
+  })
+  
+  
+  # ===========================
+  # UCSC viewer (GWAS + GTEx)  [ADAPTAT A subplot + source="manhattan_combo"]
+  # ===========================
+  
+  safe_label_rsid <- function(df) {
+    rscol <- if ("rsid" %in% names(df)) "rsid" else detect_rsid_col(df)
+    if (!is.null(rscol) && rscol %in% names(df)) {
+      out <- as.character(df[[rscol]])
+      bad <- is.na(out) | out == ""
+      out[bad] <- paste0("rs_unknown_", seq_len(sum(bad)))
+      return(out)
+    }
+    paste0("rs_unknown_", seq_len(nrow(df)))
   }
   
+  safe_label_gtex <- function(df) {
+    if ("variant_id" %in% names(df) && !all(is.na(df$variant_id))) {
+      out <- as.character(df$variant_id)
+      bad <- is.na(out) | out == ""
+      out[bad] <- paste0("gtex_hit_", seq_len(sum(bad)))
+      return(out)
+    }
+    paste0("gtex_hit_", seq_len(nrow(df)))
+  }
   
-  out <- plotly::subplot(
-    p1_pl, p2_pl,
-    nrows = 2, shareX = TRUE,
-    heights = c(0.55, 0.45),
-    titleY = TRUE
-  )
+  window_selected <- reactiveVal(NULL)
+  ucsc_region     <- reactiveVal(NULL)
   
-  # IMPORTANT: fixa source al widget FINAL (subplot sovint el "perd")
-  out$x$source <- src_combo
+  # --- helper robust: extreu rang X d'un relayout (accepta list o data.frame) ---
+  extract_xrange_from_relayout <- function(ev) {
+    
+    if (is.null(ev)) return(NULL)
+    
+    # event_data pot ser data.frame o llista
+    if (is.data.frame(ev)) {
+      if (nrow(ev) == 0) return(NULL)
+      getv <- function(nm) ev[[nm]][1]
+    } else if (is.list(ev)) {
+      getv <- function(nm) ev[[nm]]
+    } else {
+      return(NULL)
+    }
+    
+    # autorange pot ser TRUE/"TRUE"/1
+    is_autorange_true <- function(v) {
+      if (is.null(v)) return(FALSE)
+      if (length(v) >= 1) v <- v[1]
+      identical(v, TRUE) || identical(v, 1L) || identical(v, 1) ||
+        (is.character(v) && tolower(v) %in% c("true","t","1","yes","y"))
+    }
+    
+    if (is_autorange_true(getv("xaxis.autorange")) ||
+        is_autorange_true(getv("xaxis2.autorange"))) {
+      return(NULL)
+    }
+    
+    # subplot: pot venir per xaxis o xaxis2
+    x0 <- getv("xaxis.range[0]")
+    x1 <- getv("xaxis.range[1]")
+    
+    if (is.null(x0) || is.null(x1)) {
+      x0 <- getv("xaxis2.range[0]")
+      x1 <- getv("xaxis2.range[1]")
+    }
+    
+    # alguns plotly envien "xaxis.range" com vector length 2
+    if ((is.null(x0) || is.null(x1)) && !is.null(getv("xaxis.range"))) {
+      rr <- getv("xaxis.range")
+      if (length(rr) >= 2) { x0 <- rr[1]; x1 <- rr[2] }
+    }
+    if ((is.null(x0) || is.null(x1)) && !is.null(getv("xaxis2.range"))) {
+      rr <- getv("xaxis2.range")
+      if (length(rr) >= 2) { x0 <- rr[1]; x1 <- rr[2] }
+    }
+    
+    if (is.null(x0) || is.null(x1)) return(NULL)
+    
+    x0 <- suppressWarnings(as.numeric(x0))
+    x1 <- suppressWarnings(as.numeric(x1))
+    if (!is.finite(x0) || !is.finite(x1)) return(NULL)
+    
+    list(xmin = min(x0, x1), xmax = max(x0, x1))
+  }
   
-  # registra events al widget FINAL
-  out <- plotly::event_register(out, "plotly_click")
-  out <- plotly::event_register(out, "plotly_relayout")
+  # IMPORTANT: escolta el relayout del combo correcte
+  observeEvent(plotly::event_data("plotly_relayout", source = "manhattan_combo"), {
+    ev <- plotly::event_data("plotly_relayout", source = "manhattan_combo")
+    xr <- extract_xrange_from_relayout(ev)
+    if (is.null(xr)) {
+      window_selected(NULL)
+      ucsc_region(NULL)
+      session$userData$track_gwas_data <- NULL
+      session$userData$track_gtex_data <- NULL
+      return()
+    }
+    window_selected(xr)
+  }, ignoreInit = TRUE)
   
-  out %>%
-    plotly::config(
-      displayModeBar = TRUE,
-      displaylogo = FALSE,
-      modeBarButtonsToRemove = c("select2d","lasso2d","hoverCompareCartesian")
-    ) %>%
-    plotly::layout(
-      margin = list(t = 60),
-      showlegend = FALSE,
-      annotations = list(
-        list(x=0.5, y=1.05, text="<b>GWAS Manhattan</b>", showarrow=FALSE, xref="paper", yref="paper"),
-        list(x=0.5, y=0.47, text="<b>GTEx eQTLs inside clusters</b>", showarrow=FALSE, xref="paper", yref="paper")
+  get_window_hits_gwas <- reactive({
+    win <- window_selected(); req(win)
+    
+    dfp <- dfp_manhattan()
+    df  <- gwas_df()
+    req(is.data.frame(dfp), nrow(dfp) > 0)
+    req(is.data.frame(df),  nrow(df)  > 0)
+    
+    dfp2 <- dfp %>% dplyr::mutate(
+      CHR = suppressWarnings(as.integer(CHR)),
+      BP  = suppressWarnings(as.integer(BP))
+    )
+    
+    df2 <- df %>%
+      dplyr::mutate(
+        CHR = suppressWarnings(as.integer(CHR)),
+        BP  = suppressWarnings(as.integer(BP))
+      ) %>%
+      dplyr::select(dplyr::any_of(c("CHR","BP","rsid","snp")))
+    
+    dfp2 %>%
+      dplyr::filter(BPcum >= win$xmin, BPcum <= win$xmax) %>%
+      dplyr::left_join(df2, by = c("CHR","BP"))
+  })
+  
+  get_window_hits_gtex <- reactive({
+    win <- window_selected(); req(win)
+    gtex <- gtex_data()
+    req(!is.null(gtex), nrow(gtex) > 0)
+    
+    ref <- .ref_hg38
+    gtex2 <- gtex %>%
+      dplyr::mutate(chrN = norm_chr_generic(chr)) %>%
+      dplyr::inner_join(ref %>% dplyr::select(chr, chr_cum), by = c("chrN" = "chr")) %>%
+      dplyr::mutate(BPcum = as.numeric(pos) + as.numeric(chr_cum))
+    
+    gtex2 %>% dplyr::filter(BPcum >= win$xmin, BPcum <= win$xmax)
+  })
+  
+  make_track_df <- function(df, R, G, B, type = c("gwas", "gtex")) {
+    type <- match.arg(type)
+    if (is.null(df) || nrow(df) == 0) return(tibble::tibble())
+    
+    if (type == "gwas") {
+      if (!"CHR" %in% names(df) || !"BP" %in% names(df)) return(tibble::tibble())
+      chrom <- paste0("chr", chr_label_plink(as.integer(df$CHR)))
+      start <- as.numeric(df$BP) - 1
+      end   <- as.numeric(df$BP)
+      lbl   <- safe_label_rsid(df)
+    } else {
+      # GTEx: usa chrN si existeix (ja normalitzat a 1..22/23..)
+      if (!"pos" %in% names(df)) return(tibble::tibble())
+      chr_use <- if ("chrN" %in% names(df)) df$chrN else df$chr
+      chr_use <- as.character(chr_use)
+      chr_use <- gsub("^chr", "", chr_use, ignore.case = TRUE)
+      chrom   <- paste0("chr", chr_use)
+      
+      start <- as.numeric(df$pos) - 1
+      end   <- as.numeric(df$pos)
+      lbl   <- safe_label_gtex(df)
+    }
+    
+    start[is.na(start)] <- 0
+    end[is.na(end)]     <- start[is.na(end)] + 1
+    end <- ifelse(end < start, start + 1, end)
+    
+    tibble::tibble(
+      chrom       = chrom,
+      start       = start,
+      end         = end,
+      name        = lbl,
+      score       = 0L,
+      strand      = "+",
+      thickStart  = start,
+      thickEnd    = end,
+      itemRgb     = paste0(R, ",", G, ",", B),
+      blockCount  = 1L,
+      blockSizes  = end - start,
+      blockStarts = 0L
+    )
+  }
+  
+  clean_track <- function(df) {
+    if (is.null(df) || !nrow(df)) return(tibble::tibble())
+    df %>%
+      dplyr::filter(
+        !is.na(chrom),
+        chrom != "chrNA",
+        !is.na(start),
+        !is.na(end),
+        start >= 0,
+        end >= start
+      ) %>%
+      dplyr::mutate(
+        chrom      = as.character(chrom),
+        strand     = dplyr::if_else(strand %in% c("+", "-"), strand, "+"),
+        thickStart = ifelse(is.na(thickStart), start, thickStart),
+        thickEnd   = ifelse(is.na(thickEnd),   end,   thickEnd)
+      )
+  }
+  
+  observeEvent(window_selected(), {
+    win <- window_selected()
+    if (is.null(win)) return()
+    
+    left  <- coord_from_bp_cum(win$xmin)
+    right <- coord_from_bp_cum(win$xmax)
+    
+    # IMPORTANT: UCSC region ha d’estar en un sol cromosoma
+    if (is.null(left$chr) || is.null(right$chr) || left$chr != right$chr) {
+      ucsc_region(NULL)
+      session$userData$track_gwas_data <- NULL
+      session$userData$track_gtex_data <- NULL
+      return()
+    }
+    
+    region <- sprintf("chr%s:%d-%d", left$chr, left$pos, right$pos)
+    ucsc_region(region)
+    
+    gwas_hits <- try(get_window_hits_gwas(), silent = TRUE)
+    gtex_hits <- try(get_window_hits_gtex(), silent = TRUE)
+    if (inherits(gwas_hits, "try-error")) gwas_hits <- NULL
+    if (inherits(gtex_hits, "try-error")) gtex_hits <- NULL
+    
+    if ((is.null(gwas_hits) || nrow(gwas_hits) == 0) &&
+        (is.null(gtex_hits) || nrow(gtex_hits) == 0)) {
+      session$userData$track_gwas_data <- NULL
+      session$userData$track_gtex_data <- NULL
+      return()
+    }
+    
+    df_gwas <- clean_track(make_track_df(gwas_hits,  31,120,180, type = "gwas"))
+    df_gtex <- clean_track(make_track_df(gtex_hits, 227, 26, 28, type = "gtex"))
+    
+    session$userData$track_gwas_data <- df_gwas
+    session$userData$track_gtex_data <- df_gtex
+  }, ignoreInit = TRUE)
+  
+  make_ucsc_track_text_gwas <- function(name, df) {
+    header <- sprintf(
+      'track name="%s" description="%s" visibility=pack itemRgb=On url="https://www.ncbi.nlm.nih.gov/snp/$$"',
+      name, name
+    )
+    if (is.null(df) || !nrow(df)) return(header)
+    
+    cols_bed12 <- c("chrom","start","end","name","score","strand",
+                    "thickStart","thickEnd","itemRgb",
+                    "blockCount","blockSizes","blockStarts")
+    body <- apply(df[, cols_bed12], 1, paste, collapse = "\t")
+    paste(c(header, body), collapse = "\n")
+  }
+  
+  make_ucsc_track_text_gtex <- function(name, df) {
+    header <- sprintf(
+      'track name="%s" description="%s" visibility=pack itemRgb=On url="https://www.gtexportal.org/home/snp/$$"',
+      name, name
+    )
+    if (is.null(df) || !nrow(df)) return(header)
+    
+    cols_bed12 <- c("chrom","start","end","name","score","strand",
+                    "thickStart","thickEnd","itemRgb",
+                    "blockCount","blockSizes","blockStarts")
+    body <- apply(df[, cols_bed12], 1, paste, collapse = "\t")
+    paste(c(header, body), collapse = "\n")
+  }
+  
+  make_ucsc_url <- function(region, track_text) {
+    base <- "https://genome-euro.ucsc.edu/cgi-bin/hgTracks?db=hg38"
+    reg  <- paste0("&position=", utils::URLencode(region,  reserved = TRUE))
+    trk  <- paste0("&hgt.customText=", utils::URLencode(track_text, reserved = TRUE))
+    paste0(base, reg, trk)
+  }
+  
+  output$ucsc_link_gwas <- renderUI({
+    region <- ucsc_region()
+    df     <- session$userData$track_gwas_data
+    req(!is.null(region), !is.null(df), nrow(df) > 0)
+    
+    txt <- make_ucsc_track_text_gwas("GWAS_hits", df)
+    url <- make_ucsc_url(region, txt)
+    
+    tags$a(href = url, target = "_blank", "Open UCSC – GWAS hits (dbSNP links)")
+  })
+  
+  output$ucsc_link_gtex <- renderUI({
+    region <- ucsc_region()
+    df     <- session$userData$track_gtex_data
+    req(!is.null(region), !is.null(df), nrow(df) > 0)
+    
+    txt <- make_ucsc_track_text_gtex("GTEx_hits", df)
+    url <- make_ucsc_url(region, txt)
+    
+    tags$a(href = url, target = "_blank", "Open UCSC – GTEx hits (clickable)")
+  })
+  
+  output$debug_ucsc_state <- renderUI({
+    region <- ucsc_region() %||% "NULL"
+    gwas_n <- nrow(session$userData$track_gwas_data %||% tibble::tibble())
+    gtex_n <- nrow(session$userData$track_gtex_data %||% tibble::tibble())
+    tags$pre(
+      style="background-color:#f6f6f6; border:1px solid #ddd; padding:10px; font-family: 'Courier New', monospace;",
+      paste0(
+        "region = ", region,
+        "\nGWAS hits in track = ", gwas_n,
+        "\nGTEx hits in track = ", gtex_n
       )
     )
-})
-
-
-# ===========================
-# UCSC viewer (GWAS + GTEx)  [ADAPTAT A subplot + source="manhattan_combo"]
-# ===========================
-
-safe_label_rsid <- function(df) {
-  rscol <- if ("rsid" %in% names(df)) "rsid" else detect_rsid_col(df)
-  if (!is.null(rscol) && rscol %in% names(df)) {
-    out <- as.character(df[[rscol]])
-    bad <- is.na(out) | out == ""
-    out[bad] <- paste0("rs_unknown_", seq_len(sum(bad)))
-    return(out)
-  }
-  paste0("rs_unknown_", seq_len(nrow(df)))
-}
-
-safe_label_gtex <- function(df) {
-  if ("variant_id" %in% names(df) && !all(is.na(df$variant_id))) {
-    out <- as.character(df$variant_id)
-    bad <- is.na(out) | out == ""
-    out[bad] <- paste0("gtex_hit_", seq_len(sum(bad)))
-    return(out)
-  }
-  paste0("gtex_hit_", seq_len(nrow(df)))
-}
-
-window_selected <- reactiveVal(NULL)
-ucsc_region     <- reactiveVal(NULL)
-
-# --- helper: extreu rang X d'un relayout (subplot: xaxis o xaxis2) ---
-# --- helper robust: extreu rang X d'un relayout (accepta list o data.frame) ---
-extract_xrange_from_relayout <- function(ev) {
+  })
   
-  if (is.null(ev)) return(NULL)
-  
-  # event_data pot ser data.frame o llista
-  if (is.data.frame(ev)) {
-    if (nrow(ev) == 0) return(NULL)
-    getv <- function(nm) ev[[nm]][1]
-  } else if (is.list(ev)) {
-    getv <- function(nm) ev[[nm]]
-  } else {
-    return(NULL)
-  }
-  
-  # autorange pot ser TRUE/"TRUE"/1
-  is_autorange_true <- function(v) {
-    if (is.null(v)) return(FALSE)
-    if (length(v) >= 1) v <- v[1]
-    identical(v, TRUE) || identical(v, 1L) || identical(v, 1) ||
-      (is.character(v) && tolower(v) %in% c("true","t","1","yes","y"))
-  }
-  
-  if (is_autorange_true(getv("xaxis.autorange")) ||
-      is_autorange_true(getv("xaxis2.autorange"))) {
-    return(NULL)
-  }
-  
-  # subplot: pot venir per xaxis o xaxis2
-  x0 <- getv("xaxis.range[0]")
-  x1 <- getv("xaxis.range[1]")
-  
-  if (is.null(x0) || is.null(x1)) {
-    x0 <- getv("xaxis2.range[0]")
-    x1 <- getv("xaxis2.range[1]")
-  }
-  
-  # alguns plotly envien "xaxis.range" com vector length 2
-  if ((is.null(x0) || is.null(x1)) && !is.null(getv("xaxis.range"))) {
-    rr <- getv("xaxis.range")
-    if (length(rr) >= 2) { x0 <- rr[1]; x1 <- rr[2] }
-  }
-  if ((is.null(x0) || is.null(x1)) && !is.null(getv("xaxis2.range"))) {
-    rr <- getv("xaxis2.range")
-    if (length(rr) >= 2) { x0 <- rr[1]; x1 <- rr[2] }
-  }
-  
-  if (is.null(x0) || is.null(x1)) return(NULL)
-  
-  x0 <- suppressWarnings(as.numeric(x0))
-  x1 <- suppressWarnings(as.numeric(x1))
-  if (!is.finite(x0) || !is.finite(x1)) return(NULL)
-  
-  list(xmin = min(x0, x1), xmax = max(x0, x1))
-}
-
-# IMPORTANT: escolta el relayout del combo correcte
-observeEvent(plotly::event_data("plotly_relayout", source = "manhattan_combo"), {
-  ev <- plotly::event_data("plotly_relayout", source = "manhattan_combo")
-  xr <- extract_xrange_from_relayout(ev)
-  if (is.null(xr)) {
-    window_selected(NULL)
-    ucsc_region(NULL)
-    session$userData$track_gwas_data <- NULL
-    session$userData$track_gtex_data <- NULL
-    return()
-  }
-  window_selected(xr)
-}, ignoreInit = TRUE)
-
-get_window_hits_gwas <- reactive({
-  win <- window_selected(); req(win)
-  dfp <- dfp_manhattan()
-  df  <- gwas_df()
-  req(nrow(dfp) > 0, nrow(df) > 0)
-  
-  dfp2 <- dfp %>% dplyr::mutate(CHR = as.integer(CHR), BP = as.integer(BP))
-  df2  <- df  %>% dplyr::mutate(CHR = as.integer(CHR), BP = as.integer(BP)) %>%
-    dplyr::select(CHR, BP, rsid, snp)
-  
-  dfp2 %>%
-    dplyr::filter(BPcum >= win$xmin, BPcum <= win$xmax) %>%
-    dplyr::left_join(df2, by = c("CHR","BP"))
-})
-
-get_window_hits_gtex <- reactive({
-  win <- window_selected(); req(win)
-  gtex <- gtex_data()
-  req(!is.null(gtex), nrow(gtex) > 0)
-  
-  ref <- .ref_hg38
-  gtex2 <- gtex %>%
-    dplyr::mutate(chrN = norm_chr_generic(chr)) %>%
-    dplyr::inner_join(ref %>% dplyr::select(chr, chr_cum), by = c("chrN" = "chr")) %>%
-    dplyr::mutate(BPcum = as.numeric(pos) + as.numeric(chr_cum))
-  
-  gtex2 %>% dplyr::filter(BPcum >= win$xmin, BPcum <= win$xmax)
-})
-
-make_track_df <- function(df, R, G, B, type = c("gwas", "gtex")) {
-  type <- match.arg(type)
-  if (is.null(df) || nrow(df) == 0) return(tibble::tibble())
-  
-  if (type == "gwas") {
-    if (!"CHR" %in% names(df) || !"BP" %in% names(df)) return(tibble::tibble())
-    chrom <- paste0("chr", chr_label_plink(as.integer(df$CHR)))
-    start <- as.numeric(df$BP) - 1
-    end   <- as.numeric(df$BP)
-    lbl   <- safe_label_rsid(df)
-  } else {
-    # GTEx: usa chrN si existeix (ja normalitzat a 1..22/23..)
-    if (!"pos" %in% names(df)) return(tibble::tibble())
-    chr_use <- if ("chrN" %in% names(df)) df$chrN else df$chr
-    chr_use <- as.character(chr_use)
-    chr_use <- gsub("^chr", "", chr_use, ignore.case = TRUE)
-    chrom   <- paste0("chr", chr_use)
-    
-    start <- as.numeric(df$pos) - 1
-    end   <- as.numeric(df$pos)
-    lbl   <- safe_label_gtex(df)
-  }
-  
-  start[is.na(start)] <- 0
-  end[is.na(end)]     <- start[is.na(end)] + 1
-  end <- ifelse(end < start, start + 1, end)
-  
-  tibble::tibble(
-    chrom       = chrom,
-    start       = start,
-    end         = end,
-    name        = lbl,
-    score       = 0L,
-    strand      = "+",
-    thickStart  = start,
-    thickEnd    = end,
-    itemRgb     = paste0(R, ",", G, ",", B),
-    blockCount  = 1L,
-    blockSizes  = end - start,
-    blockStarts = 0L
-  )
-}
-
-clean_track <- function(df) {
-  if (is.null(df) || !nrow(df)) return(tibble::tibble())
-  df %>%
-    dplyr::filter(
-      !is.na(chrom),
-      chrom != "chrNA",
-      !is.na(start),
-      !is.na(end),
-      start >= 0,
-      end >= start
-    ) %>%
-    dplyr::mutate(
-      chrom      = as.character(chrom),
-      strand     = dplyr::if_else(strand %in% c("+", "-"), strand, "+"),
-      thickStart = ifelse(is.na(thickStart), start, thickStart),
-      thickEnd   = ifelse(is.na(thickEnd),   end,   thickEnd)
-    )
-}
-
-observeEvent(window_selected(), {
-  win <- window_selected()
-  if (is.null(win)) return()
-  
-  left  <- coord_from_bp_cum(win$xmin)
-  right <- coord_from_bp_cum(win$xmax)
-  
-  # IMPORTANT: UCSC region ha d’estar en un sol cromosoma
-  if (is.null(left$chr) || is.null(right$chr) || left$chr != right$chr) {
-    ucsc_region(NULL)
-    session$userData$track_gwas_data <- NULL
-    session$userData$track_gtex_data <- NULL
-    return()
-  }
-  
-  region <- sprintf("chr%s:%d-%d", left$chr, left$pos, right$pos)
-  ucsc_region(region)
-  
-  gwas_hits <- try(get_window_hits_gwas(), silent = TRUE)
-  gtex_hits <- try(get_window_hits_gtex(), silent = TRUE)
-  if (inherits(gwas_hits, "try-error")) gwas_hits <- NULL
-  if (inherits(gtex_hits, "try-error")) gtex_hits <- NULL
-  
-  if ((is.null(gwas_hits) || nrow(gwas_hits) == 0) &&
-      (is.null(gtex_hits) || nrow(gtex_hits) == 0)) {
-    session$userData$track_gwas_data <- NULL
-    session$userData$track_gtex_data <- NULL
-    return()
-  }
-  
-  df_gwas <- clean_track(make_track_df(gwas_hits,  31,120,180, type = "gwas"))
-  df_gtex <- clean_track(make_track_df(gtex_hits, 227, 26, 28, type = "gtex"))
-  
-  session$userData$track_gwas_data <- df_gwas
-  session$userData$track_gtex_data <- df_gtex
-}, ignoreInit = TRUE)
-
-make_ucsc_track_text_gwas <- function(name, df) {
-  header <- sprintf(
-    'track name="%s" description="%s" visibility=pack itemRgb=On url="https://www.ncbi.nlm.nih.gov/snp/$$"',
-    name, name
-  )
-  if (is.null(df) || !nrow(df)) return(header)
-  
-  cols_bed12 <- c("chrom","start","end","name","score","strand",
-                  "thickStart","thickEnd","itemRgb",
-                  "blockCount","blockSizes","blockStarts")
-  body <- apply(df[, cols_bed12], 1, paste, collapse = "\t")
-  paste(c(header, body), collapse = "\n")
-}
-
-make_ucsc_track_text_gtex <- function(name, df) {
-  header <- sprintf(
-    'track name="%s" description="%s" visibility=pack itemRgb=On url="https://www.gtexportal.org/home/snp/$$"',
-    name, name
-  )
-  if (is.null(df) || !nrow(df)) return(header)
-  
-  cols_bed12 <- c("chrom","start","end","name","score","strand",
-                  "thickStart","thickEnd","itemRgb",
-                  "blockCount","blockSizes","blockStarts")
-  body <- apply(df[, cols_bed12], 1, paste, collapse = "\t")
-  paste(c(header, body), collapse = "\n")
-}
-
-make_ucsc_url <- function(region, track_text) {
-  base <- "https://genome-euro.ucsc.edu/cgi-bin/hgTracks?db=hg38"
-  reg  <- paste0("&position=", utils::URLencode(region,  reserved = TRUE))
-  trk  <- paste0("&hgt.customText=", utils::URLencode(track_text, reserved = TRUE))
-  paste0(base, reg, trk)
-}
-
-output$ucsc_link_gwas <- renderUI({
-  region <- ucsc_region()
-  df     <- session$userData$track_gwas_data
-  req(!is.null(region), !is.null(df), nrow(df) > 0)
-  
-  txt <- make_ucsc_track_text_gwas("GWAS_hits", df)
-  url <- make_ucsc_url(region, txt)
-  
-  tags$a(href = url, target = "_blank", "Open UCSC – GWAS hits (dbSNP links)")
-})
-
-output$ucsc_link_gtex <- renderUI({
-  region <- ucsc_region()
-  df     <- session$userData$track_gtex_data
-  req(!is.null(region), !is.null(df), nrow(df) > 0)
-  
-  txt <- make_ucsc_track_text_gtex("GTEx_hits", df)
-  url <- make_ucsc_url(region, txt)
-  
-  tags$a(href = url, target = "_blank", "Open UCSC – GTEx hits (clickable)")
-})
-
-output$debug_ucsc_state <- renderUI({
-  region <- ucsc_region() %||% "NULL"
-  gwas_n <- nrow(session$userData$track_gwas_data %||% tibble::tibble())
-  gtex_n <- nrow(session$userData$track_gtex_data %||% tibble::tibble())
-  tags$pre(
-    style="background-color:#f6f6f6; border:1px solid #ddd; padding:10px; font-family: 'Courier New', monospace;",
-    paste0(
-      "region = ", region,
-      "\nGWAS hits in track = ", gwas_n,
-      "\nGTEx hits in track = ", gtex_n
-    )
-  )
-})
-
-
-
-# ===========================
-# Modal info input
-# ===========================
-observeEvent(input$info_00, {
-  showModal(modalDialog(
-    title = "Info: Hits to plot",
-    HTML('
+  # ===========================
+  # Modal info input
+  # ===========================
+  observeEvent(input$info_00, {
+    showModal(modalDialog(
+      title = "Info: Hits to plot",
+      HTML('
 <p style="text-align: justify;">
   Input file format [(*) mandatory columns]
 </p>
@@ -2413,1011 +2781,2102 @@ observeEvent(input$info_00, {
   </tbody>
 </table>
 '),
-    easyClose = TRUE,
-    footer = NULL
-  ))
-})
-
-observeEvent(input$info_12, {
-  txt <- HTML(
-    "<b>GSSize (Gene Set Size) — quick guide</b><br><br>",
-    "<p>GSSize is the number of genes in a GO/KEGG term gene set (depends on the background).</p>",
-    "<ul>",
-    "<li><b>minGSSize</b>: removes very small sets.</li><br>",
-    "<li><b>maxGSSize</b>: removes very large generic sets.</li><br>",
-    "<li>Only sets with <b>minGSSize ≤ GSSize ≤ maxGSSize</b> are tested.</li>",
-    "</ul>"
-  )
+      easyClose = TRUE,
+      footer = NULL
+    ))
+  })
   
-  showModal(modalDialog(
-    title = "GSSize (Gene Set Size)",
-    txt,
-    easyClose = TRUE,
-    footer = modalButton("Close")
-  ))
-})
-
-# ===========================
-# Downloads (GTEx hits by cluster) amb nom mode+threshold
-# ===========================
-
-output$dl_gtex_hits_csv <- downloadHandler(
-  filename = function() {
-    tag <- .make_mode_thr_tag(input)
-    paste0(
-      "gtex_hits_by_cluster_",
-      format(Sys.Date(), "%Y%m%d"),
-      "_", tag$mode_tag,
-      "_thr", tag$thr_tag,
-      ".csv"
+  observeEvent(input$info_12, {
+    txt <- HTML(
+      "<b>GSSize (Gene Set Size) — quick guide</b><br><br>",
+      "<p>GSSize is the number of genes in a GO/KEGG term gene set (depends on the background).</p>",
+      "<ul>",
+      "<li><b>minGSSize</b>: removes very small sets.</li><br>",
+      "<li><b>maxGSSize</b>: removes very large generic sets.</li><br>",
+      "<li>Only sets with <b>minGSSize ≤ GSSize ≤ maxGSSize</b> are tested.</li>",
+      "</ul>"
     )
-  },
-  content = function(file) {
-    dt <- gtex_data()
-    if (is.null(dt) || !nrow(dt)) {
-      writeLines("No GTEx hits extracted.", con = file)
-    } else {
-      readr::write_csv(dt, file)
-    }
-  }
-)
-
-output$dl_gtex_hits_rds <- downloadHandler(
-  filename = function() {
-    tag <- .make_mode_thr_tag(input)
-    paste0(
-      "gtex_hits_by_cluster_",
-      format(Sys.Date(), "%Y%m%d"),
-      "_", tag$mode_tag,
-      "_thr", tag$thr_tag,
-      ".rds"
-    )
-  },
-  content = function(file) {
-    dt <- gtex_data()
-    if (is.null(dt) || !nrow(dt)) {
-      saveRDS(list(message = "No GTEx hits extracted."), file = file)
-    } else {
-      saveRDS(dt, file = file)
-    }
-  }
-)
-
-observeEvent(input$info_01, {
-  txt <- HTML(
-    "<b>Clustering methods — quick guide</b><br><br>",
     
-    "<p>This app can generate GWAS <b>clusters</b> using two alternative strategies. ",
-    "Both end up producing a table of clusters with <b>cluster_id</b>, <b>start</b>, and <b>end</b> (plus summary stats such as top SNP, top −log10(P), and EWAS bins when available).</p>",
-    
-    "<hr style='margin:10px 0;'>",
-    
-    "<b>1) By intervals (hits → flank → merge)</b><br>",
-    "<p style='margin-top:6px;'>",
-    "Starts from GWAS hits above the chosen threshold (or only the selected hits in the table). ",
-    "For each hit, an interval is built as <b>[BP − flank, BP + flank]</b>. ",
-    "Overlapping intervals are merged into continuous regions, which become the final clusters.",
-    "</p>",
-    
-    "<ul>",
-    "<li><b>Input used</b>: hits above threshold (optionally only selected rows).</li>",
-    "<li><b>Main parameter</b>: <b>flank</b> (bp) controls how far each hit expands.</li>",
-    "<li><b>Result</b>: merged genomic regions, each assigned a <b>cluster_id</b>.</li>",
-    "</ul>",
-    
-    "<hr style='margin:10px 0;'>",
-    
-    "<b>2) By hit count (windows → merge)</b><br>",
-    "<p style='margin-top:6px;'>",
-    "First filters GWAS to SNPs with <b>−log10(P) ≥ min_logp</b>. ",
-    "Then it looks for regions where significant hits are <b>dense</b>, by counting how many hits fall inside genomic windows. ",
-    "Windows that pass <b>min_hits</b> are considered significant, and overlapping/adjacent significant windows are merged into final clusters. ",
-    "Each final cluster is then summarised (start/end, number of hits, top SNP by −log10(P)).",
-    "</p>",
-    
-    "<ul>",
-    "<li><b>Input used</b>: all SNPs passing <b>min_logp</b>.</li>",
-    "<li><b>Main parameters</b>: <b>min_logp</b> and <b>min_hits</b> (plus window settings below).</li>",
-    "<li><b>Result</b>: clusters representing genomic regions enriched in significant hits.</li>",
-    "</ul>",
-    
-    "<div style='margin-top:8px;'><b>Hit-count window modes</b></div>",
-    "<p style='margin-top:6px;'>Choose how windows are defined before merging them into clusters:</p>",
-    
-    "<ul>",
-    "<li><b>1 Mb hit-span</b>: within each chromosome, hits are ordered by position and grouped so that all hits in a group lie within a maximum span of <b>1,000,000 bp</b> from the <i>first</i> hit of that group. ",
-    "These are <b>non-overlapping groups</b> (a hit belongs to only one group). ",
-    "<br><i>Why clusters can be small:</i> the cluster boundaries are <b>min(BP)</b> to <b>max(BP)</b> of the hits in the group, so if hits are close together the cluster can be only a few kb even though the rule allows up to 1 Mb.</li>",
-    
-    "<li><b>Tiled windows</b>: the chromosome is split into <b>non-overlapping tiles</b> of size <b>win_bp</b> (step = win_bp). ",
-    "Counts hits per tile; tiles passing <b>min_hits</b> are merged if they touch/overlap.</li>",
-    
-    "<li><b>Sliding windows</b>: windows of size <b>win_bp</b> move along the chromosome with step <b>step_bp</b> (so windows <b>overlap</b> when step_bp &lt; win_bp). ",
-    "Counts hits per window; overlapping significant windows are merged into clusters. ",
-    "<br><i>Typical behavior:</i> sliding is more sensitive to local density peaks and often finds narrower clusters than tiled.</li>",
-    "</ul>",
-    
-    "<br><p style='margin:0;'><i>Tip:</i> Use <b>By intervals</b> for “hit-centered regions”. Use <b>By hit count</b> (especially <b>sliding</b>) when you want “hit-dense regions”.</p>"
-  )
+    showModal(modalDialog(
+      title = "GSSize (Gene Set Size)",
+      txt,
+      easyClose = TRUE,
+      footer = modalButton("Close")
+    ))
+  })
   
-  showModal(modalDialog(
-    title = NULL,
-    easyClose = TRUE,
-    footer = modalButton("Close"),
-    size = "m",
-    tags$div(style = "line-height:1.35;", txt)
-  ))
-})
-# ============================================================
-# SERVER — GTEx Enrichment (Catalog/NonSyn-style)  [ADAPTAT]
-# Manté denominacions GTEx: gene_id (ENSEMBL), gtex_table_filtered(), clusters_cur()
-# ============================================================
-
-
-pick_col <- function(df, candidates) {
-  nm <- names(df)
-  hit <- candidates[candidates %in% nm]
-  if (length(hit)) hit[1] else NULL
-}
-
-strip_ens_version <- function(x) {
-  x <- as.character(x)
-  sub("\\..*$", "", x)
-}
-
-# ------------------------------------------------------------
-# UI cluster picker (com Catalog), però amb clusters_cur() i cluster_chr_n (GTEx)
-# ------------------------------------------------------------
-output$func_cluster_ui <- renderUI({
-  cl <- clusters_cur()
-  validate(need(is.data.frame(cl) && nrow(cl) > 0, "No clusters available."))
+  # ===========================
+  # Downloads (GTEx hits by cluster) amb nom mode+threshold
+  # ===========================
   
-  validate(need("chr" %in% names(cl), "clusters_cur() must contain column 'chr'."))
-  validate(need("cluster_chr_n" %in% names(cl), "clusters_cur() must contain column 'cluster_chr_n'."))
-  
-  chr_choices <- sort(unique(as.integer(cl$chr)))
-  chr_labels  <- chr_label_plink(chr_choices)
-  names(chr_choices) <- paste0("chr", chr_labels)
-  
-  tagList(
-    selectInput("func_chr", "Chromosome", choices = chr_choices, selected = chr_choices[1]),
-    uiOutput("func_cluster_id_ui")
-  )
-})
-
-output$func_cluster_id_ui <- renderUI({
-  cl <- clusters_cur()
-  req(is.data.frame(cl), nrow(cl) > 0, input$func_chr)
-  
-  x <- cl %>%
-    dplyr::filter(as.integer(chr) == as.integer(input$func_chr)) %>%
-    dplyr::arrange(start, end)
-  
-  validate(need(nrow(x) > 0, "No clusters on this chromosome."))
-  
-  lab <- paste0(x$cluster_chr_n, " (", x$start, "-", x$end, ")")
-  choices <- stats::setNames(x$cluster_chr_n, lab)
-  
-  selectInput("func_cluster_id", "Cluster", choices = choices, selected = x$cluster_chr_n[1])
-})
-
-# ------------------------------------------------------------
-# Dades GTEx per enrichment
-#   - IMPORTANT: assumim que gtex_table_filtered() retorna GTEx hits (global o no)
-#   - Per CLUSTER mode filtrarem nosaltres per cluster_chr_n / cluster id column
-# ------------------------------------------------------------
-gtex_hits_all <- reactive({
-  dt <- gtex_table_all()
-  if (!is.data.frame(dt) || !nrow(dt)) return(NULL)
-  dt
-})
-
-cluster_col_gtex <- reactive({
-  dt <- gtex_hits_all()
-  if (is.null(dt)) return(NULL)
-  pick_col(dt, c("cluster_chr_n", "cluster_id", "cluster", "cluster_chr"))
-})
-
-genes_all_ensembl <- reactive({
-  dt <- gtex_hits_all()
-  if (is.null(dt) || !nrow(dt)) return(character(0))
-  validate(need("gene_id" %in% names(dt), "GTEx hits missing 'gene_id' column."))
-  g <- unique(strip_ens_version(dt$gene_id))
-  g <- g[!is.na(g) & nzchar(g)]
-  g
-})
-
-genes_scope_ensembl <- reactive({
-  dt <- gtex_hits_all()
-  validate(need(is.data.frame(dt) && nrow(dt) > 0, "No GTEx hits loaded."))
-  
-  validate(need("gene_id" %in% names(dt), "GTEx hits missing 'gene_id' column."))
-  
-  if (identical(input$func_scope, "cluster")) {
-    cc <- cluster_col_gtex()
-    validate(need(!is.null(cc), "GTEx hits table has no cluster column (cluster_chr_n/cluster_id/cluster/cluster_chr)."))
-    req(input$func_cluster_id)
-    dt <- dt %>% dplyr::filter(.data[[cc]] == input$func_cluster_id)
-  }
-  
-  g <- unique(strip_ens_version(dt$gene_id))
-  g <- g[!is.na(g) & nzchar(g)]
-  g
-})
-
-# ------------------------------------------------------------
-# Mapatge ENSEMBL -> ENTREZ una sola vegada (cache)
-# ------------------------------------------------------------
-gene_map_cache_ens <- reactiveVal(NULL)
-gene_map_cache_map <- reactiveVal(NULL)
-
-gene_map_all <- reactive({
-  validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler package is required."))
-  validate(need(requireNamespace("org.Hs.eg.db", quietly = TRUE), "org.Hs.eg.db package is required."))
-  
-  ens <- genes_all_ensembl()
-  validate(need(length(ens) > 0, "No valid ENSEMBL gene_ids found in GTEx hits."))
-  
-  prev_ens <- gene_map_cache_ens()
-  prev_map <- gene_map_cache_map()
-  
-  if (!is.null(prev_ens) && !is.null(prev_map) && identical(sort(prev_ens), sort(ens))) {
-    return(prev_map)
-  }
-  
-  m <- tryCatch({
-    suppressMessages(
-      clusterProfiler::bitr(
-        ens,
-        fromType = "ENSEMBL",
-        toType   = "ENTREZID",
-        OrgDb    = org.Hs.eg.db
+  output$dl_gtex_hits_csv <- downloadHandler(
+    filename = function() {
+      tag <- .make_mode_thr_tag(input)
+      paste0(
+        "gtex_hits_by_cluster_",
+        format(Sys.Date(), "%Y%m%d"),
+        "_", tag$mode_tag,
+        "_thr", tag$thr_tag,
+        ".csv"
       )
+    },
+    content = function(file) {
+      dt <- gtex_data()
+      if (is.null(dt) || !nrow(dt)) {
+        writeLines("No GTEx hits extracted.", con = file)
+      } else {
+        readr::write_csv(dt, file)
+      }
+    }
+  )
+  
+  output$dl_gtex_hits_rds <- downloadHandler(
+    filename = function() {
+      tag <- .make_mode_thr_tag(input)
+      paste0(
+        "gtex_hits_by_cluster_",
+        format(Sys.Date(), "%Y%m%d"),
+        "_", tag$mode_tag,
+        "_thr", tag$thr_tag,
+        ".rds"
+      )
+    },
+    content = function(file) {
+      dt <- gtex_data()
+      if (is.null(dt) || !nrow(dt)) {
+        saveRDS(list(message = "No GTEx hits extracted."), file = file)
+      } else {
+        saveRDS(dt, file = file)
+      }
+    }
+  )
+  
+  observeEvent(input$info_01, {
+    txt <- HTML(
+      "<b>Clustering methods — quick guide</b><br><br>",
+      
+      "<p>This app can generate GWAS <b>clusters</b> using two alternative strategies. ",
+      "Both end up producing a table of clusters with <b>cluster_id</b>, <b>start</b>, and <b>end</b> (plus summary stats such as top SNP, top −log10(P), and EWAS bins when available).</p>",
+      
+      "<hr style='margin:10px 0;'>",
+      
+      "<b>1) By intervals (hits → flank → merge)</b><br>",
+      "<p style='margin-top:6px;'>",
+      "Starts from GWAS hits above the chosen threshold (or only the selected hits in the table). ",
+      "For each hit, an interval is built as <b>[BP − flank, BP + flank]</b>. ",
+      "Overlapping intervals are merged into continuous regions, which become the final clusters.",
+      "</p>",
+      
+      "<ul>",
+      "<li><b>Input used</b>: hits above threshold (optionally only selected rows).</li>",
+      "<li><b>Main parameter</b>: <b>flank</b> (bp) controls how far each hit expands.</li>",
+      "<li><b>Result</b>: merged genomic regions, each assigned a <b>cluster_id</b>.</li>",
+      "</ul>",
+      
+      "<hr style='margin:10px 0;'>",
+      
+      "<b>2) By hit count (windows → merge)</b><br>",
+      "<p style='margin-top:6px;'>",
+      "First filters GWAS to SNPs with <b>−log10(P) ≥ min_logp</b>. ",
+      "Then it looks for regions where significant hits are <b>dense</b>, by counting how many hits fall inside genomic windows. ",
+      "Windows that pass <b>min_hits</b> are considered significant, and overlapping/adjacent significant windows are merged into final clusters. ",
+      "Each final cluster is then summarised (start/end, number of hits, top SNP by −log10(P)).",
+      "</p>",
+      
+      "<ul>",
+      "<li><b>Input used</b>: all SNPs passing <b>min_logp</b>.</li>",
+      "<li><b>Main parameters</b>: <b>min_logp</b> and <b>min_hits</b> (plus window settings below).</li>",
+      "<li><b>Result</b>: clusters representing genomic regions enriched in significant hits.</li>",
+      "</ul>",
+      
+      "<div style='margin-top:8px;'><b>Hit-count window modes</b></div>",
+      "<p style='margin-top:6px;'>Choose how windows are defined before merging them into clusters:</p>",
+      
+      "<ul>",
+      "<li><b>1 Mb hit-span</b>: within each chromosome, hits are ordered by position and grouped so that all hits in a group lie within a maximum span of <b>1,000,000 bp</b> from the <i>first</i> hit of that group. ",
+      "These are <b>non-overlapping groups</b> (a hit belongs to only one group). ",
+      "<br><i>Why clusters can be small:</i> the cluster boundaries are <b>min(BP)</b> to <b>max(BP)</b> of the hits in the group, so if hits are close together the cluster can be only a few kb even though the rule allows up to 1 Mb.</li>",
+      
+      "<li><b>Tiled windows</b>: the chromosome is split into <b>non-overlapping tiles</b> of size <b>win_bp</b> (step = win_bp). ",
+      "Counts hits per tile; tiles passing <b>min_hits</b> are merged if they touch/overlap.</li>",
+      
+      "<li><b>Sliding windows</b>: windows of size <b>win_bp</b> move along the chromosome with step <b>step_bp</b> (so windows <b>overlap</b> when step_bp &lt; win_bp). ",
+      "Counts hits per window; overlapping significant windows are merged into clusters. ",
+      "<br><i>Typical behavior:</i> sliding is more sensitive to local density peaks and often finds narrower clusters than tiled.</li>",
+      "</ul>",
+      
+      "<br><p style='margin:0;'><i>Tip:</i> Use <b>By intervals</b> for “hit-centered regions”. Use <b>By hit count</b> (especially <b>sliding</b>) when you want “hit-dense regions”.</p>"
     )
-  }, error = function(e) NULL)
+    
+    showModal(modalDialog(
+      title = NULL,
+      easyClose = TRUE,
+      footer = modalButton("Close"),
+      size = "m",
+      tags$div(style = "line-height:1.35;", txt)
+    ))
+  })
   
-  validate(need(is.data.frame(m) && nrow(m) > 0, "ENSEMBL → ENTREZ mapping failed (empty)."))
-  
-  gene_map_cache_ens(sort(ens))
-  gene_map_cache_map(m)
-  m
-})
+  # ============================================================
+  # SERVER — GTEx Enrichment (Catalog/NonSyn-style)  [ADAPTAT]
+  # Manté denominacions GTEx: gene_id (ENSEMBL), gtex_table_filtered(), clusters_cur()
+  # ============================================================
 
-entrez_scope <- reactive({
-  m <- gene_map_all()
-  ens <- genes_scope_ensembl()
-  validate(need(length(ens) > 0, "No valid genes for the selected scope."))
+  pick_col <- function(df, candidates) {
+    nm <- names(df)
+    hit <- candidates[candidates %in% nm]
+    if (length(hit)) hit[1] else NULL
+  }
   
-  ids <- unique(m$ENTREZID[m$ENSEMBL %in% ens])
-  ids <- ids[!is.na(ids) & nzchar(ids)]
-  validate(need(length(ids) > 0, "No ENTREZIDs for the selected scope (mapping empty)."))
-  ids
-})
-
-universe_entrez_dataset <- reactive({
-  m <- gene_map_all()
-  u <- unique(m$ENTREZID)
-  u <- u[!is.na(u) & nzchar(u)]
-  validate(need(length(u) > 0, "Universe (dataset) is empty after mapping."))
-  u
-})
-
-universe_entrez_for_scope <- reactive({
-  scope <- input$func_scope %||% "global"
-  bg    <- input$enrich_background %||% "dataset"
+  strip_ens_version <- function(x) {
+    x <- as.character(x)
+    sub("\\..*$", "", x)
+  }
   
-  # GLOBAL: background per defecte (OrgDb/KEGG)
-  if (identical(scope, "global")) return(NULL)
+  # ------------------------------------------------------------
+  # UI cluster picker (com Catalog), però amb clusters_cur() i cluster_chr_n (GTEx)
+  # ------------------------------------------------------------
+  output$func_cluster_ui <- renderUI({
+   # cl <- clusters_cur()
+    cl <- clusters_stable()
+    validate(need(is.data.frame(cl) && nrow(cl) > 0, "No clusters available."))
+    
+    validate(need("chr" %in% names(cl), "clusters_cur() must contain column 'chr'."))
+    validate(need("cluster_chr_n" %in% names(cl), "clusters_cur() must contain column 'cluster_chr_n'."))
+    
+    chr_choices <- sort(unique(as.integer(cl$chr)))
+    chr_labels  <- chr_label_plink(chr_choices)
+    names(chr_choices) <- paste0("chr", chr_labels)
+    
+    tagList(
+      selectInput("func_chr", "Chromosome", choices = chr_choices, selected = chr_choices[1]),
+      uiOutput("func_cluster_id_ui")
+    )
+  })
   
-  # CLUSTER: usuari decideix
-  if (identical(bg, "dataset")) return(universe_entrez_dataset())
+  output$func_cluster_id_ui <- renderUI({
+   # cl <- clusters_cur()
+    cl <- clusters_stable()
+    req(is.data.frame(cl), nrow(cl) > 0, input$func_chr)
+    
+    x <- cl %>%
+      dplyr::filter(as.integer(chr) == as.integer(input$func_chr)) %>%
+      dplyr::arrange(start, end)
+    
+    validate(need(nrow(x) > 0, "No clusters on this chromosome."))
+    
+    lab <- paste0(x$cluster_chr_n, " (", x$start, "-", x$end, ")")
+    choices <- stats::setNames(x$cluster_chr_n, lab)
+    
+    selectInput("func_cluster_id", "Cluster", choices = choices, selected = x$cluster_chr_n[1])
+  })
   
-  NULL
-})
-
-output$enrich_bg_note <- renderUI({
-  bg  <- input$enrich_background %||% "dataset"
-  tab <- input$enrich_tabs %||% "tab_enrich_go"
+  # ------------------------------------------------------------
+  # Dades GTEx per enrichment
+  #   - IMPORTANT: assumim que gtex_table_filtered() retorna GTEx hits (global o no)
+  #   - Per CLUSTER mode filtrarem nosaltres per cluster_chr_n / cluster id column
+  # ------------------------------------------------------------
+  gtex_hits_all <- reactive({
+    dt <- gtex_table_all()
+    if (!is.data.frame(dt) || !nrow(dt)) return(NULL)
+    dt
+  })
   
-  bg_lbl <- if (identical(bg, "dataset")) "Dataset genes" else "Default background"
+  cluster_col_gtex <- reactive({
+    dt <- gtex_hits_all()
+    if (is.null(dt)) return(NULL)
+    pick_col(dt, c("cluster_chr_n", "cluster_id", "cluster", "cluster_chr"))
+  })
   
-  msg <- if (identical(tab, "tab_enrich_go")) {
-    if (identical(bg, "orgdb")) {
-      paste0("<b>Background:</b> ", bg_lbl, "<br>",
-             "GO enrichment uses the default <i>OrgDb</i>-based background (org.Hs.eg.db).")
-    } else {
-      paste0("<b>Background:</b> ", bg_lbl, "<br>",
-             "GO enrichment uses only genes present in the GTEx hits dataset as background (cluster mode).")
+  genes_all_ensembl <- reactive({
+    dt <- gtex_hits_all()
+    if (is.null(dt) || !nrow(dt)) return(character(0))
+    validate(need("gene_id" %in% names(dt), "GTEx hits missing 'gene_id' column."))
+    g <- unique(strip_ens_version(dt$gene_id))
+    g <- g[!is.na(g) & nzchar(g)]
+    g
+  })
+  
+  genes_scope_ensembl <- reactive({
+    dt <- gtex_hits_all()
+    validate(need(is.data.frame(dt) && nrow(dt) > 0, "No GTEx hits loaded."))
+    
+    validate(need("gene_id" %in% names(dt), "GTEx hits missing 'gene_id' column."))
+    
+    if (identical(input$func_scope, "cluster")) {
+      cc <- cluster_col_gtex()
+      validate(need(!is.null(cc), "GTEx hits table has no cluster column (cluster_chr_n/cluster_id/cluster/cluster_chr)."))
+      req(input$func_cluster_id)
+      dt <- dt %>% dplyr::filter(.data[[cc]] == input$func_cluster_id)
     }
-  } else {
-    if (identical(bg, "orgdb")) {
-      paste0("<b>Background:</b> ", bg_lbl, "<br>",
-             "KEGG enrichment uses the default KEGG background (organism-specific).")
+    
+    g <- unique(strip_ens_version(dt$gene_id))
+    g <- g[!is.na(g) & nzchar(g)]
+    g
+  })
+  
+  # ------------------------------------------------------------
+  # Mapatge ENSEMBL -> ENTREZ una sola vegada (cache)
+  # ------------------------------------------------------------
+  gene_map_cache_ens <- reactiveVal(NULL)
+  gene_map_cache_map <- reactiveVal(NULL)
+  
+  gene_map_all <- reactive({
+    validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler package is required."))
+    validate(need(requireNamespace("org.Hs.eg.db", quietly = TRUE), "org.Hs.eg.db package is required."))
+    
+    ens <- genes_all_ensembl()
+    validate(need(length(ens) > 0, "No valid ENSEMBL gene_ids found in GTEx hits."))
+    
+    prev_ens <- gene_map_cache_ens()
+    prev_map <- gene_map_cache_map()
+    
+    if (!is.null(prev_ens) && !is.null(prev_map) && identical(sort(prev_ens), sort(ens))) {
+      return(prev_map)
+    }
+    
+    m <- tryCatch({
+      suppressMessages(
+        clusterProfiler::bitr(
+          ens,
+          fromType = "ENSEMBL",
+          toType   = "ENTREZID",
+          OrgDb    = org.Hs.eg.db
+        )
+      )
+    }, error = function(e) NULL)
+    
+    validate(need(is.data.frame(m) && nrow(m) > 0, "ENSEMBL → ENTREZ mapping failed (empty)."))
+    
+    gene_map_cache_ens(sort(ens))
+    gene_map_cache_map(m)
+    m
+  })
+  
+  entrez_scope <- reactive({
+    m <- gene_map_all()
+    ens <- genes_scope_ensembl()
+    validate(need(length(ens) > 0, "No valid genes for the selected scope."))
+    
+    ids <- unique(m$ENTREZID[m$ENSEMBL %in% ens])
+    ids <- ids[!is.na(ids) & nzchar(ids)]
+    validate(need(length(ids) > 0, "No ENTREZIDs for the selected scope (mapping empty)."))
+    ids
+  })
+  
+  universe_entrez_dataset <- reactive({
+    m <- gene_map_all()
+    u <- unique(m$ENTREZID)
+    u <- u[!is.na(u) & nzchar(u)]
+    validate(need(length(u) > 0, "Universe (dataset) is empty after mapping."))
+    u
+  })
+  
+  universe_entrez_for_scope <- reactive({
+    scope <- input$func_scope %||% "global"
+    bg    <- input$enrich_background %||% "dataset"
+    
+    # GLOBAL: background per defecte (OrgDb/KEGG)
+    if (identical(scope, "global")) return(NULL)
+    
+    # CLUSTER: usuari decideix
+    if (identical(bg, "dataset")) return(universe_entrez_dataset())
+    
+    NULL
+  })
+  
+  output$enrich_bg_note <- renderUI({
+    bg  <- input$enrich_background %||% "dataset"
+    tab <- input$enrich_tabs %||% "tab_enrich_go"
+    
+    # -----------------------------
+    # Helpers (local)
+    # -----------------------------
+    bg_lbl <- if (identical(bg, "dataset")) "Dataset genes" else "Default background"
+    
+    sc <- input$func_scope %||% "global"
+    sc_txt <- if (identical(sc, "cluster")) {
+      paste0("Foreground: genes in <b>", htmltools::htmlEscape(input$func_cluster_id %||% ""), "</b>.")
     } else {
-      paste0("<b>Background:</b> ", bg_lbl, "<br>",
-             "KEGG enrichment uses dataset genes as background (cluster mode).")
+      "Foreground: genes in <b>global</b> (all extracted hits)."
+    }
+    
+    safe_n <- function(expr) {
+      tryCatch({
+        v <- eval(expr)
+        if (is.null(v)) return(NA_integer_)
+        if (is.atomic(v) && length(v) == 1) return(as.integer(v))
+        if (is.vector(v)) return(as.integer(length(v)))
+        if (is.data.frame(v)) return(as.integer(nrow(v)))
+        NA_integer_
+      }, error = function(e) NA_integer_)
+    }
+    
+    # foreground gene counts (ENTREZIDs used by GO/KEGG/GoSlim)
+    n_fg <- safe_n(quote(length(entrez_scope())))
+    
+    # universe gene counts for "dataset" bg (mapped dataset universe)
+    n_uni_dataset <- safe_n(quote(length(universe_entrez_dataset())))
+    
+    # universe gene counts for default backgrounds (OrgDb / KEGG)
+    n_uni_orgdb <- safe_n(quote(length(AnnotationDbi::keys(org.Hs.eg.db::org.Hs.eg.db, keytype = "ENTREZID"))))
+    
+    # choose N text
+    uni_txt <- function(default_name) {
+      if (identical(bg, "dataset")) {
+        if (is.finite(n_uni_dataset)) {
+          paste0("<b>Background (universe):</b> dataset-mapped genes (N=", n_uni_dataset, ").")
+        } else {
+          "<b>Background (universe):</b> dataset-mapped genes."
+        }
+      } else {
+        # default background
+        if (is.finite(n_uni_orgdb)) {
+          paste0("<b>Background (universe):</b> ", default_name, " (N≈", n_uni_orgdb, ").")
+        } else {
+          paste0("<b>Background (universe):</b> ", default_name, ".")
+        }
+      }
+    }
+    
+    fg_cnt_txt <- if (is.finite(n_fg)) paste0("<br><b>Foreground size:</b> n=", n_fg, " genes.") else ""
+    
+    # GSSize note (common)
+    gs_txt <- "<b>GSSize:</b> number of genes per term in the selected universe (filtered by minGSSize / maxGSSize)."
+    
+    # -----------------------------
+    # Build message per tab
+    # -----------------------------
+    msg <- if (identical(tab, "tab_enrich_go")) {
+      
+      # GO
+      base_uni <- if (identical(bg, "orgdb")) "OrgDb annotated genes (org.Hs.eg.db)" else "dataset-mapped genes"
+      tip <- "<br><b>Test unit:</b> genes (ENTREZID)."
+      
+      paste0(
+        "<b>GO enrichment</b><br>",
+        sc_txt,
+        fg_cnt_txt, "<br>",
+        uni_txt("OrgDb annotated genes (org.Hs.eg.db)"), "<br>",
+        tip, "<br>",
+        gs_txt, "<br>",
+        "<b>Method:</b> clusterProfiler::enrichGO (pAdjustMethod=BH; filtered by FDR cutoff)."
+      )
+      
+    } else if (identical(tab, "tab_enrich_kegg")) {
+      
+      paste0(
+        "<b>KEGG enrichment</b><br>",
+        sc_txt,
+        fg_cnt_txt, "<br>",
+        uni_txt("KEGG default background (organism-specific, hsa)"), "<br>",
+        "<b>Test unit:</b> genes (ENTREZID).<br>",
+        gs_txt, "<br>",
+        "<b>Method:</b> clusterProfiler::enrichKEGG (organism=hsa; pAdjustMethod=BH; filtered by FDR cutoff)."
+      )
+      
+    } else if (identical(tab, "tab_enrich_goslim")) {
+      
+      tip <- "<br><br><b>Tip:</b> If you get no GoSlim terms, try setting <code>minGSSize</code> to <b>1–3</b> (GoSlim categories often have fewer hits)."
+      
+      paste0(
+        "<b>GoSlim enrichment</b><br>",
+        sc_txt,
+        fg_cnt_txt, "<br>",
+        if (identical(bg, "dataset")) {
+          paste0("<b>Background (universe):</b> dataset-mapped genes (recommended in cluster mode).")
+        } else {
+          "GoSlim uses an OrgDb-derived GO→GoSlim TERM2GENE; universe is default unless a dataset universe is provided."
+        },
+        if (identical(bg, "dataset") && is.finite(n_uni_dataset)) paste0(" (N=", n_uni_dataset, ").") else "",
+        "<br>",
+        "<b>Test unit:</b> genes (ENTREZID).<br>",
+        gs_txt, "<br>",
+        "<b>Method:</b> clusterProfiler::enricher with GoSlim TERM2GENE (GO ancestors mapped to <i>goslim_generic</i>).",
+        tip
+      )
+      
+    } else if (identical(tab, "tab_enrich_gtex_terms")) {
+      
+      # (Keep your existing GTEx gene/tissue note unchanged)
+      sc2 <- input$func_scope %||% "global"
+      sc_txt2 <- if (identical(sc2, "cluster")) {
+        paste0("Foreground: GTEx eQTL rows inside cluster <b>",
+               htmltools::htmlEscape(input$func_cluster_id %||% ""),
+               "</b>.")
+      } else {
+        "Foreground: GTEx eQTL rows inside <b>all clusters</b>."
+      }
+      
+      n_uni <- tryCatch(nrow(gtex_all()), error = function(e) NA_integer_)
+      n_fg2 <- tryCatch({ xx <- dt_enrich_res_gtex(); nrow(xx$dt2) }, error = function(e) NA_integer_)
+      
+      cnt_txt <- if (is.finite(n_uni) && is.finite(n_fg2)) {
+        paste0("<br><b>Rows:</b> foreground n=", n_fg2, " · universe N=", n_uni, ".")
+      } else {
+        ""
+      }
+      
+      paste0(
+        "<b>GTEx Gene/Tissue enrichment</b><br>",
+        sc_txt2, "<br>",
+        "<b>Background (universe):</b> all GTEx eQTL rows from <code>www/gtex_eqtl_light.rds</code>.",
+        cnt_txt, "<br>",
+        "<b>Test unit:</b> eQTL rows (not unique genes/tissues).<br>",
+        "<b>GSSize:</b> number of eQTL rows per term in the universe."
+      )
+      
+    } else {
+      paste0("<b>Background:</b> ", bg_lbl)
+    }
+    
+    htmltools::HTML(paste0(
+      "<div style='background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>",
+      msg, "</div>"
+    ))
+  })
+  
+  
+  # ------------------------------------------------------------
+  # Triggers (eviten execució en entrar al panell), com al Catalog
+  # ------------------------------------------------------------
+  go_trigger   <- reactiveVal(NULL)
+  kegg_trigger <- reactiveVal(NULL)
+  
+  observeEvent(input$run_enrich, {
+    tab <- input$enrich_tabs %||% "tab_enrich_go"
+    
+    if (identical(tab, "tab_enrich_go")) {
+      go_trigger((go_trigger() %||% 0L) + 1L)
+    } else if (identical(tab, "tab_enrich_kegg")) {
+      kegg_trigger((kegg_trigger() %||% 0L) + 1L)
+    } else if (identical(tab, "tab_enrich_goslim")) {
+      goslim_trigger((goslim_trigger() %||% 0L) + 1L)
+    }
+  }, ignoreInit = TRUE)
+  
+  # ------------------------------------------------------------
+  # GO enrichment (multi-ontology) — pvalueCutoff=1 i filtrem després per FDR cutoff
+  # ------------------------------------------------------------
+  go_enrich_raw <- eventReactive(go_trigger(), {
+    validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler package is required."))
+    validate(need(requireNamespace("org.Hs.eg.db", quietly = TRUE), "org.Hs.eg.db package is required."))
+    
+    withProgress(message = "Running GO enrichment…", value = 0, {
+      
+      gene <- entrez_scope()
+      incProgress(0.2, detail = paste("Genes:", length(gene)))
+      
+      uni  <- universe_entrez_for_scope()
+      incProgress(0.1, detail = if (is.null(uni)) "Universe: default (OrgDb)" else paste("Universe:", length(uni)))
+      
+      ontos <- input$go_ontos %||% c("BP", "CC", "MF")
+      ontos <- intersect(c("BP","CC","MF"), ontos)
+      validate(need(length(ontos) > 0, "Select at least one GO ontology (BP/CC/MF)."))
+      
+      minGS <- input$enrich_min_gs %||% 10
+      maxGS <- input$enrich_max_gs %||% 500
+      
+      simplify_flag <- isTRUE(input$go_simplify)
+      
+      res <- purrr::map_dfr(ontos, function(ont) {
+        
+        incProgress(0.6 / length(ontos), detail = paste("Ontology:", ont))
+        
+        eg <- suppressMessages(
+          clusterProfiler::enrichGO(
+            gene          = gene,
+            universe      = uni,
+            OrgDb         = org.Hs.eg.db,
+            keyType       = "ENTREZID",
+            ont           = ont,
+            pAdjustMethod = "BH",
+            pvalueCutoff  = 1,
+            qvalueCutoff  = 1,
+            minGSSize     = minGS,
+            maxGSSize     = maxGS,
+            readable      = TRUE
+          )
+        )
+        
+        if (is.null(eg) || is.null(eg@result) || !nrow(eg@result)) return(NULL)
+        
+        if (simplify_flag && requireNamespace("clusterProfiler", quietly = TRUE)) {
+          eg <- tryCatch(
+            suppressMessages(clusterProfiler::simplify(eg, cutoff = 0.7, by = "p.adjust", select_fun = min)),
+            error = function(e) eg
+          )
+        }
+        
+        df <- as.data.frame(eg@result, stringsAsFactors = FALSE)
+        if (!nrow(df)) return(NULL)
+        df$Ontology <- ont
+        df
+      })
+      
+      if (is.null(res) || !nrow(res)) return(tibble::tibble())
+      res
+    })
+  }, ignoreInit = TRUE)
+  
+  go_enrich_tbl <- reactive({
+    df <- go_enrich_raw()
+    if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+    
+    pcut <- input$enrich_pcut %||% 0.05
+    topn <- input$go_topn %||% 10
+    
+    df2 <- df %>%
+      dplyr::mutate(
+        Ontology = as.character(Ontology),
+        pvalue   = suppressWarnings(as.numeric(pvalue)),
+        p.adjust = suppressWarnings(as.numeric(p.adjust))
+      ) %>%
+      dplyr::filter(is.finite(p.adjust), is.finite(pvalue)) %>%
+      dplyr::filter(p.adjust <= pcut) %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+      dplyr::slice_head(n = topn) %>%
+      dplyr::ungroup()
+    
+    if (!nrow(df2)) return(tibble::tibble())
+    df2
+  })
+  
+  output$go_table <- DT::renderDT({
+    df <- go_enrich_tbl()
+    if (!nrow(df)) {
+      return(DT::datatable(
+        data.frame(Message = "No GO terms passed the cutoff."),
+        options = list(dom = "t"),
+        rownames = FALSE
+      ))
+    }
+    
+    out <- df %>%
+      dplyr::select(Ontology, ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+      dplyr::mutate(
+        pvalue   = sprintf("%.3g", as.numeric(pvalue)),
+        p.adjust = sprintf("%.3g", as.numeric(p.adjust))
+      )
+    
+    DT::datatable(out, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
+  })
+  
+  scope_label <- function() {
+    sc <- input$func_scope %||% "global"
+    if (identical(sc, "cluster")) {
+      cid <- input$func_cluster_id %||% ""
+      if (nzchar(cid)) paste0("cluster ", cid) else "cluster"
+    } else {
+      "global"
     }
   }
   
-  htmltools::HTML(paste0(
-    "<div style='background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>",
-    msg, "</div>"
-  ))
-})
-
-# ------------------------------------------------------------
-# Triggers (eviten execució en entrar al panell), com al Catalog
-# ------------------------------------------------------------
-go_trigger   <- reactiveVal(NULL)
-kegg_trigger <- reactiveVal(NULL)
-
-observeEvent(input$run_enrich, {
-  tab <- input$enrich_tabs %||% "tab_enrich_go"
+  go_top_df <- reactive({
+    df <- go_enrich_raw()
+    if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+    
+    pcut <- input$enrich_pcut %||% 0.05
+    topn <- input$go_topn %||% 10
+    
+    df0 <- df %>%
+      dplyr::mutate(
+        Ontology   = as.character(Ontology),
+        pvalue     = suppressWarnings(as.numeric(pvalue)),
+        p.adjust   = suppressWarnings(as.numeric(p.adjust)),
+        term_short = ifelse(nchar(Description) > 50, paste0(substr(Description, 1, 47), "."), Description),
+        score      = -log10(pvalue)
+      ) %>%
+      dplyr::filter(
+        Ontology %in% c("BP","CC","MF"),
+        is.finite(pvalue), is.finite(p.adjust),
+        nzchar(term_short)
+      )
+    
+    if (!nrow(df0)) return(tibble::tibble())
+    
+    sig <- df0 %>%
+      dplyr::filter(p.adjust <= pcut) %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+      dplyr::slice_head(n = topn) %>%
+      dplyr::ungroup()
+    
+    if (nrow(sig) > 0) {
+      attr(sig, "fallback") <- FALSE
+      return(sig)
+    }
+    
+    fb <- df0 %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+      dplyr::slice_head(n = topn) %>%
+      dplyr::ungroup()
+    
+    attr(fb, "fallback") <- TRUE
+    fb
+  })
   
-  if (identical(tab, "tab_enrich_go")) {
-    go_trigger((go_trigger() %||% 0L) + 1L)
-  } else if (identical(tab, "tab_enrich_kegg")) {
-    kegg_trigger((kegg_trigger() %||% 0L) + 1L)
-  }
-}, ignoreInit = TRUE)
-
-# ------------------------------------------------------------
-# GO enrichment (multi-ontology) — pvalueCutoff=1 i filtrem després per FDR cutoff
-# ------------------------------------------------------------
-go_enrich_raw <- eventReactive(go_trigger(), {
-  validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler package is required."))
-  validate(need(requireNamespace("org.Hs.eg.db", quietly = TRUE), "org.Hs.eg.db package is required."))
+  output$go_bar <- renderPlot({
+    dat <- go_top_df()
+    req(is.data.frame(dat), nrow(dat) > 0)
+    
+    fb   <- isTRUE(attr(dat, "fallback"))
+    pcut <- input$enrich_pcut %||% 0.05
+    
+    ttl <- paste0("GO enrichment (", scope_label(), ")")
+    subttl <- if (fb) {
+      paste0("No terms at FDR ≤ ", pcut, " — showing top terms ranked by FDR; bar height = -log10(pvalue)")
+    } else {
+      paste0("FDR ≤ ", pcut, " (bar height = -log10(pvalue))")
+    }
+    
+    dat <- dat %>% dplyr::mutate(Ontology = factor(as.character(Ontology), levels = c("BP","CC","MF")))
+    cols_go <- c(BP = "darkgreen", CC = "orange", MF = "darkblue")
+    
+    mk <- function(onto) {
+      d <- dat %>% dplyr::filter(Ontology == onto)
+      if (!nrow(d)) return(ggplot2::ggplot() + ggplot2::theme_void() + ggplot2::labs(title = paste0(onto, " (none)")))
+      
+      ggplot2::ggplot(
+        d,
+        ggplot2::aes(
+          x    = stats::reorder(term_short, score),
+          y    = score,
+          fill = Ontology
+        )
+      ) +
+        ggplot2::geom_col() +
+        ggplot2::coord_flip() +
+        ggplot2::labs(title = onto, x = NULL, y = "-log10(pvalue)") +
+        ggplot2::scale_fill_manual(values = cols_go, guide = "none", drop = FALSE) +
+        ggplot2::theme_minimal(base_size = 12) +
+        ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
+    }
+    
+    if (requireNamespace("patchwork", quietly = TRUE)) {
+      (mk("BP") | mk("CC") | mk("MF")) +
+        patchwork::plot_annotation(title = ttl, subtitle = subttl)
+    } else {
+      ggplot2::ggplot(
+        dat,
+        ggplot2::aes(
+          x    = stats::reorder(term_short, score),
+          y    = score,
+          fill = Ontology
+        )
+      ) +
+        ggplot2::geom_col() +
+        ggplot2::coord_flip() +
+        ggplot2::facet_wrap(~Ontology, scales = "free_y") +
+        ggplot2::scale_fill_manual(values = cols_go, guide = "none", drop = FALSE) +
+        ggplot2::labs(title = ttl, subtitle = subttl, x = NULL, y = "-log10(pvalue)") +
+        ggplot2::theme_minimal(base_size = 12)
+    }
+  }, height = 450)
   
-  withProgress(message = "Running GO enrichment…", value = 0, {
+  # ------------------------------------------------------------
+  # KEGG enrichment
+  # ------------------------------------------------------------
+  kegg_enrich_raw <- eventReactive(kegg_trigger(), {
+    validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler package is required."))
     
-    gene <- entrez_scope()
-    incProgress(0.2, detail = paste("Genes:", length(gene)))
-    
-    uni  <- universe_entrez_for_scope()
-    incProgress(0.1, detail = if (is.null(uni)) "Universe: default (OrgDb)" else paste("Universe:", length(uni)))
-    
-    ontos <- input$go_ontos %||% c("BP", "CC", "MF")
-    ontos <- intersect(c("BP","CC","MF"), ontos)
-    validate(need(length(ontos) > 0, "Select at least one GO ontology (BP/CC/MF)."))
-    
-    minGS <- input$enrich_min_gs %||% 10
-    maxGS <- input$enrich_max_gs %||% 500
-    
-    simplify_flag <- isTRUE(input$go_simplify)
-    
-    res <- purrr::map_dfr(ontos, function(ont) {
+    withProgress(message = "Running KEGG enrichment…", value = 0, {
       
-      incProgress(0.6 / length(ontos), detail = paste("Ontology:", ont))
+      gene <- entrez_scope()
+      incProgress(0.2, detail = paste("Genes:", length(gene)))
       
-      eg <- suppressMessages(
-        clusterProfiler::enrichGO(
+      uni  <- universe_entrez_for_scope()
+      incProgress(0.1, detail = if (is.null(uni)) "Universe: default (KEGG)" else paste("Universe:", length(uni)))
+      
+      minGS <- input$enrich_min_gs %||% 10
+      maxGS <- input$enrich_max_gs %||% 500
+      
+      ek <- suppressMessages(
+        clusterProfiler::enrichKEGG(
           gene          = gene,
           universe      = uni,
-          OrgDb         = org.Hs.eg.db,
-          keyType       = "ENTREZID",
-          ont           = ont,
+          organism      = "hsa",
           pAdjustMethod = "BH",
           pvalueCutoff  = 1,
           qvalueCutoff  = 1,
           minGSSize     = minGS,
-          maxGSSize     = maxGS,
-          readable      = TRUE
+          maxGSSize     = maxGS
         )
       )
       
-      if (is.null(eg) || is.null(eg@result) || !nrow(eg@result)) return(NULL)
-      
-      if (simplify_flag && requireNamespace("clusterProfiler", quietly = TRUE)) {
-        eg <- tryCatch(
-          suppressMessages(clusterProfiler::simplify(eg, cutoff = 0.7, by = "p.adjust", select_fun = min)),
-          error = function(e) eg
-        )
-      }
-      
-      df <- as.data.frame(eg@result, stringsAsFactors = FALSE)
-      if (!nrow(df)) return(NULL)
-      df$Ontology <- ont
-      df
+      if (is.null(ek) || is.null(ek@result) || !nrow(ek@result)) return(tibble::tibble())
+      as.data.frame(ek@result, stringsAsFactors = FALSE)
     })
+  }, ignoreInit = TRUE)
+  
+  kegg_enrich_tbl <- reactive({
+    df <- kegg_enrich_raw()
+    if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
     
-    if (is.null(res) || !nrow(res)) return(tibble::tibble())
-    res
+    pcut <- input$enrich_pcut %||% 0.05
+    topn <- input$enrich_kegg_top %||% 15
+    
+    df2 <- df %>%
+      dplyr::mutate(
+        pvalue   = suppressWarnings(as.numeric(pvalue)),
+        p.adjust = suppressWarnings(as.numeric(p.adjust))
+      ) %>%
+      dplyr::filter(is.finite(p.adjust), is.finite(pvalue)) %>%
+      dplyr::filter(p.adjust <= pcut) %>%
+      dplyr::arrange(p.adjust) %>%
+      dplyr::slice_head(n = topn)
+    
+    if (!nrow(df2)) return(tibble::tibble())
+    df2
   })
-}, ignoreInit = TRUE)
-
-go_enrich_tbl <- reactive({
-  df <- go_enrich_raw()
-  if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
   
-  pcut <- input$enrich_pcut %||% 0.05
-  topn <- input$go_topn %||% 10
+  output$kegg_table <- DT::renderDT({
+    df <- kegg_enrich_tbl()
+    if (!nrow(df)) {
+      return(DT::datatable(
+        data.frame(Message = "No KEGG pathways passed the cutoff."),
+        options = list(dom = "t"),
+        rownames = FALSE
+      ))
+    }
+    
+    out <- df %>%
+      dplyr::select(ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+      dplyr::mutate(
+        pvalue   = sprintf("%.3g", as.numeric(pvalue)),
+        p.adjust = sprintf("%.3g", as.numeric(p.adjust))
+      )
+    
+    DT::datatable(out, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
+  })
   
-  df2 <- df %>%
-    dplyr::mutate(
-      Ontology = as.character(Ontology),
-      pvalue   = suppressWarnings(as.numeric(pvalue)),
-      p.adjust = suppressWarnings(as.numeric(p.adjust))
-    ) %>%
-    dplyr::filter(is.finite(p.adjust), is.finite(pvalue)) %>%
-    dplyr::filter(p.adjust <= pcut) %>%
-    dplyr::group_by(Ontology) %>%
-    dplyr::arrange(p.adjust, .by_group = TRUE) %>%
-    dplyr::slice_head(n = topn) %>%
-    dplyr::ungroup()
+  kegg_top_df <- reactive({
+    df <- kegg_enrich_raw()
+    if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+    
+    pcut <- input$enrich_pcut %||% 0.05
+    topn <- input$enrich_kegg_top %||% 15
+    
+    df0 <- df %>%
+      dplyr::mutate(
+        pvalue     = suppressWarnings(as.numeric(pvalue)),
+        p.adjust   = suppressWarnings(as.numeric(p.adjust)),
+        term_short = ifelse(nchar(Description) > 50, paste0(substr(Description, 1, 47), "."), Description),
+        score      = -log10(pvalue)
+      ) %>%
+      dplyr::filter(is.finite(pvalue), is.finite(p.adjust), nzchar(term_short))
+    
+    if (!nrow(df0)) return(tibble::tibble())
+    
+    sig <- df0 %>%
+      dplyr::filter(p.adjust <= pcut) %>%
+      dplyr::arrange(p.adjust) %>%
+      dplyr::slice_head(n = topn)
+    
+    if (nrow(sig) > 0) {
+      attr(sig, "fallback") <- FALSE
+      return(sig)
+    }
+    
+    fb <- df0 %>%
+      dplyr::arrange(p.adjust) %>%
+      dplyr::slice_head(n = topn)
+    
+    attr(fb, "fallback") <- TRUE
+    fb
+  })
   
-  if (!nrow(df2)) return(tibble::tibble())
-  df2
-})
-
-output$go_table <- DT::renderDT({
-  df <- go_enrich_tbl()
-  if (!nrow(df)) {
-    return(DT::datatable(
-      data.frame(Message = "No GO terms passed the cutoff."),
-      options = list(dom = "t"),
-      rownames = FALSE
-    ))
-  }
-  
-  out <- df %>%
-    dplyr::select(Ontology, ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
-    dplyr::mutate(
-      pvalue   = sprintf("%.3g", as.numeric(pvalue)),
-      p.adjust = sprintf("%.3g", as.numeric(p.adjust))
+  output$kegg_bar <- renderPlot({
+    df <- kegg_top_df()
+    req(is.data.frame(df), nrow(df) > 0)
+    
+    fb   <- isTRUE(attr(df, "fallback"))
+    pcut <- input$enrich_pcut %||% 0.05
+    
+    ttl <- paste0(
+      "KEGG enrichment (", scope_label(), ")",
+      if (fb) paste0(" — no pathways at FDR ≤ ", pcut, " (showing top by FDR)") else paste0(" — FDR ≤ ", pcut)
     )
-  
-  DT::datatable(out, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
-})
-
-scope_label <- function() {
-  sc <- input$func_scope %||% "global"
-  if (identical(sc, "cluster")) {
-    cid <- input$func_cluster_id %||% ""
-    if (nzchar(cid)) paste0("cluster ", cid) else "cluster"
-  } else {
-    "global"
-  }
-}
-
-go_top_df <- reactive({
-  df <- go_enrich_raw()
-  if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
-  
-  pcut <- input$enrich_pcut %||% 0.05
-  topn <- input$go_topn %||% 10
-  
-  df0 <- df %>%
-    dplyr::mutate(
-      Ontology   = as.character(Ontology),
-      pvalue     = suppressWarnings(as.numeric(pvalue)),
-      p.adjust   = suppressWarnings(as.numeric(p.adjust)),
-      term_short = ifelse(nchar(Description) > 50, paste0(substr(Description, 1, 47), "."), Description),
-      score      = -log10(pvalue)
-    ) %>%
-    dplyr::filter(
-      Ontology %in% c("BP","CC","MF"),
-      is.finite(pvalue), is.finite(p.adjust),
-      nzchar(term_short)
-    )
-  
-  if (!nrow(df0)) return(tibble::tibble())
-  
-  sig <- df0 %>%
-    dplyr::filter(p.adjust <= pcut) %>%
-    dplyr::group_by(Ontology) %>%
-    dplyr::arrange(p.adjust, .by_group = TRUE) %>%
-    dplyr::slice_head(n = topn) %>%
-    dplyr::ungroup()
-  
-  if (nrow(sig) > 0) {
-    attr(sig, "fallback") <- FALSE
-    return(sig)
-  }
-  
-  fb <- df0 %>%
-    dplyr::group_by(Ontology) %>%
-    dplyr::arrange(p.adjust, .by_group = TRUE) %>%
-    dplyr::slice_head(n = topn) %>%
-    dplyr::ungroup()
-  
-  attr(fb, "fallback") <- TRUE
-  fb
-})
-
-output$go_bar <- renderPlot({
-  dat <- go_top_df()
-  req(is.data.frame(dat), nrow(dat) > 0)
-  
-  fb   <- isTRUE(attr(dat, "fallback"))
-  pcut <- input$enrich_pcut %||% 0.05
-  
-  ttl <- paste0("GO enrichment (", scope_label(), ")")
-  subttl <- if (fb) {
-    paste0("No terms at FDR ≤ ", pcut, " — showing top terms ranked by FDR; bar height = -log10(pvalue)")
-  } else {
-    paste0("FDR ≤ ", pcut, " (bar height = -log10(pvalue))")
-  }
-  
-  dat <- dat %>% dplyr::mutate(Ontology = factor(as.character(Ontology), levels = c("BP","CC","MF")))
-  cols_go <- c(BP = "darkgreen", CC = "orange", MF = "darkblue")
-  
-  mk <- function(onto) {
-    d <- dat %>% dplyr::filter(Ontology == onto)
-    if (!nrow(d)) return(ggplot2::ggplot() + ggplot2::theme_void() + ggplot2::labs(title = paste0(onto, " (none)")))
+    
+    df <- df %>%
+      dplyr::mutate(
+        score = -log10(pvalue),
+        padj  = suppressWarnings(as.numeric(p.adjust))
+      )
     
     ggplot2::ggplot(
-      d,
+      df,
       ggplot2::aes(
         x    = stats::reorder(term_short, score),
         y    = score,
-        fill = Ontology
+        fill = padj
       )
     ) +
       ggplot2::geom_col() +
       ggplot2::coord_flip() +
-      ggplot2::labs(title = onto, x = NULL, y = "-log10(pvalue)") +
-      ggplot2::scale_fill_manual(values = cols_go, guide = "none", drop = FALSE) +
+      ggplot2::labs(title = ttl, x = NULL, y = "-log10(pvalue)", fill = "FDR") +
+      ggplot2::scale_fill_gradient(
+        low  = "red",   # més significatiu (FDR petit)
+        high = "orange",   # menys significatiu
+        na.value = "yellow",
+        trans = "reverse"   # perquè low (color fort) correspongui a FDR petit
+      ) +
       ggplot2::theme_minimal(base_size = 12) +
       ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
+  }, height = function() {
+    n <- tryCatch(nrow(kegg_top_df()), error = function(e) 0)
+    max(420, 28 * n)
+  })
+  ############################################################################
+  ############################################################################
+  ############################## GENE / TISSUE ENRICHMENT ######################
+  # Universe: gtex_all()  (www/gtex_eqtl_light.rds)
+  # Foreground: gtex_table_all() == gtex_data() (hits inside clusters)
+  # Scope: global / cluster (input$func_scope + input$func_cluster_id)
+  # Triggered by: input$run_enrich when enrich_tabs == tab_enrich_gtex_terms
+  ############################################################################
+  
+  # ------------------------------------------------------------
+  # Helpers (Catalog-style)
+  # ------------------------------------------------------------
+  `%||%` <- function(a, b) if (!is.null(a)) a else b
+  
+  pick_col <- function(df, candidates) {
+    nm <- names(df)
+    hit <- candidates[candidates %in% nm]
+    if (length(hit)) hit[1] else NULL
   }
   
-  if (requireNamespace("patchwork", quietly = TRUE)) {
-    (mk("BP") | mk("CC") | mk("MF")) +
-      patchwork::plot_annotation(title = ttl, subtitle = subttl)
-  } else {
-    ggplot2::ggplot(
+  short_label <- function(x, max_chars = 35, wrap_width = 14) {
+    x <- as.character(x)
+    x <- stringr::str_squish(x)
+    x <- ifelse(nchar(x) > max_chars, paste0(substr(x, 1, max_chars - 1), "…"), x)
+    stringr::str_wrap(x, width = wrap_width)
+  }
+  # ------------------------------------------------------------
+  
+  norm_tissue_id <- function(x) {
+    x <- trimws(as.character(x))
+    x <- toupper(x)
+    # converteix qualsevol separador (espais, '-', '/', etc.) a '_'
+    x <- gsub("[^A-Z0-9]+", "_", x)
+    x <- gsub("^_+|_+$", "", x)
+    x <- gsub("_+", "_", x)
+    x
+  }
+  
+  # ------------------------------------------------------------
+  # Fisher enrichment for terms (subset vs universe) on ROWS
+  # (NO unique() used for the test)
+  # Fast version: hypergeometric tail (equivalent to Fisher 1-sided "greater")
+  # ------------------------------------------------------------
+  fisher_enrich_terms_fast <- function(subset_terms, uni_terms,
+                                       alternative = "greater",
+                                       min_a = 1, min_Tt = 1, max_Tt = Inf,
+                                       max_terms = 3000) {
+    
+    sub <- na.omit(as.character(subset_terms))
+    uni <- na.omit(as.character(uni_terms))
+    if (!length(sub) || !length(uni)) return(data.table::data.table())
+    
+    tabU <- table(uni)
+    tabS <- table(sub)
+    
+    terms <- intersect(names(tabU), names(tabS))
+    if (!length(terms)) return(data.table::data.table())
+    
+    Tt <- as.integer(tabU[terms])   # universe count per term (rows)
+    a  <- as.integer(tabS[terms])   # subset count per term (rows)
+    
+    keep <- which(a >= min_a & Tt >= min_Tt & Tt <= max_Tt)
+    if (!length(keep)) return(data.table::data.table())
+    
+    terms <- terms[keep]; a <- a[keep]; Tt <- Tt[keep]
+    
+    # limit max_terms by most frequent in universe
+    if (length(terms) > max_terms) {
+      ord <- order(Tt, decreasing = TRUE)[1:max_terms]
+      terms <- terms[ord]; a <- a[ord]; Tt <- Tt[ord]
+    }
+    
+    n <- length(sub)  # subset rows
+    N <- length(uni)  # universe rows
+    
+    # one-sided "greater": P(X >= a) where X ~ Hypergeom(N, Tt, n)
+    p <- stats::phyper(a - 1L, Tt, N - Tt, n, lower.tail = FALSE)
+    
+    # odds ratio (safe)
+    b <- n - a
+    c <- Tt - a
+    d <- (N - Tt) - b
+    or <- rep(NA_real_, length(a))
+    ok <- (b > 0 & c > 0 & d > 0)
+    or[ok] <- (a[ok] * d[ok]) / (b[ok] * c[ok])
+    
+    out <- data.table::data.table(term = terms, a = a, Tt = Tt, or = or, p = p)
+    out[, p_adj := p.adjust(p, method = "BH")]
+    data.table::setorder(out, p_adj, p)
+    out
+  }
+  
+  # ------------------------------------------------------------
+  # Bundle (Catalog-style): dt_uni, dt (all hits), dt2 (scope)
+  # ------------------------------------------------------------
+  dt_enrich_res_gtex <- reactive({
+    dt_uni <- gtex_all()
+    dt     <- gtex_table_all()   # == gtex_data()
+    
+    validate(need(is.data.frame(dt_uni) && nrow(dt_uni) > 0,
+                  "GTEx universe not loaded (www/gtex_eqtl_light.rds)."))
+    validate(need(is.data.frame(dt) && nrow(dt) > 0,
+                  "No GTEx hits yet. Run Step 3/4 (Extract GTEx)."))
+    
+    dt_uni <- as.data.frame(dt_uni)
+    dt     <- as.data.frame(dt)
+    
+    # validate columns exist
+    validate(need("tissue" %in% names(dt),      "GTEx hits missing 'tissue' column."))
+    validate(need("tissue" %in% names(dt_uni),  "GTEx universe missing 'tissue' column."))
+    validate(need("gene_id" %in% names(dt),     "GTEx hits missing 'gene_id' column."))
+    validate(need("gene_id" %in% names(dt_uni), "GTEx universe missing 'gene_id' column."))
+    
+    # normalize types
+    dt$tissue      <- trimws(as.character(dt$tissue))
+    dt_uni$tissue  <- trimws(as.character(dt_uni$tissue))
+    dt$gene_id     <- as.character(dt$gene_id)
+    dt_uni$gene_id <- as.character(dt_uni$gene_id)
+    
+    # Normalize cluster id strings (Hub sometimes prepends cluster_)
+    if ("cluster_chr_n" %in% names(dt)) {
+      dt$cluster_chr_n <- sub("^cluster_", "", as.character(dt$cluster_chr_n))
+    }
+    cid_in <- sub("^cluster_", "", as.character(input$func_cluster_id %||% ""))
+    
+    # ---- scope ----
+    dt2 <- dt
+    
+    if (identical(input$func_scope, "cluster")) {
+      req(nzchar(cid_in))
+      
+      if ("cluster_chr_n" %in% names(dt2) && any(nzchar(dt2$cluster_chr_n))) {
+        dt2 <- dt2 %>% dplyr::filter(as.character(cluster_chr_n) == cid_in)
+      } else if ("cluster_id" %in% names(dt2)) {
+        dt2 <- dt2 %>% dplyr::filter(sub("^cluster_", "", as.character(cluster_id)) == cid_in)
+      } else if ("cluster" %in% names(dt2)) {
+        dt2 <- dt2 %>% dplyr::filter(as.integer(cluster) == suppressWarnings(as.integer(cid_in)))
+      }
+    }
+    
+    validate(need(is.data.frame(dt2) && nrow(dt2) > 0,
+                  "No GTEx hits in this scope (cluster empty)."))
+    
+    list(dt = dt, dt2 = dt2, dt_uni = dt_uni)
+  })
+  
+  # ------------------------------------------------------------
+  # Trigger (same pattern as GO/KEGG/GoSlim)
+  # ------------------------------------------------------------
+  gtex_terms_trigger <- reactiveVal(NULL)
+  
+  observeEvent(input$run_enrich, {
+    tab <- input$enrich_tabs %||% "tab_enrich_go"
+    if (identical(tab, "tab_enrich_gtex_terms")) {
+      gtex_terms_trigger((gtex_terms_trigger() %||% 0L) + 1L)
+    }
+  }, ignoreInit = TRUE)
+  
+  # ------------------------------------------------------------
+  # Compute ONCE per click (so DT doesn't "spin forever")
+  # ------------------------------------------------------------
+  norm_tissue_id <- function(x) {
+    x <- trimws(as.character(x))
+    x <- tolower(x)
+    x <- gsub("[^a-z0-9]+", "_", x)  # espais/guions/etc -> "_"
+    x <- gsub("^_+|_+$", "", x)
+    x <- gsub("_+", "_", x)
+    x
+  }
+  
+  gtex_terms_res <- eventReactive(gtex_terms_trigger(), {
+    x <- dt_enrich_res_gtex()
+    
+    dt2    <- x$dt2
+    dt_uni <- x$dt_uni
+    
+    tissue_col     <- pick_col(dt2,    c("tissue"))
+    tissue_col_uni <- pick_col(dt_uni, c("tissue"))
+    gene_col       <- pick_col(dt2,    c("gene_id"))
+    gene_col_uni   <- pick_col(dt_uni, c("gene_id"))
+    
+    validate(need(!is.null(tissue_col) && !is.null(tissue_col_uni),
+                  "Tissue column not found (expected: tissue)."))
+    validate(need(!is.null(gene_col) && !is.null(gene_col_uni),
+                  "Gene column not found (expected: gene_id)."))
+    
+    minGS <- input$enrich_min_gs %||% 1
+    maxGS <- input$enrich_max_gs %||% 500000
+    
+    withProgress(message = "Running GTEx gene/tissue enrichment…", value = 0, {
+      
+      # ----------------------------
+      # TISSUE (normalize + fallback to tissue_family if overlap==0)
+      # ----------------------------
+      incProgress(0.2, detail = "Counting tissues…")
+      
+      fg_tis_raw <- dt2[[tissue_col]]
+      un_tis_raw <- dt_uni[[tissue_col_uni]]
+      
+      fg_id <- norm_tissue_id(fg_tis_raw)
+      un_id <- norm_tissue_id(un_tis_raw)
+      
+      fg_ok <- fg_id[!is.na(fg_id) & nzchar(fg_id)]
+      un_ok <- un_id[!is.na(un_id) & nzchar(un_id)]
+      
+      cat("[TISSUE] overlap_norm=",
+          length(intersect(unique(fg_ok), unique(un_ok))),
+          " example_fg=", paste(head(unique(fg_ok), 5), collapse = ","),
+          " example_uni=", paste(head(unique(un_ok), 5), collapse = ","),
+          "\n"
+      )
+      
+      tab_tissue <- data.table::data.table()
+      tissue_msg <- NULL
+      
+      if (!length(fg_ok)) {
+        tissue_msg <- "Foreground has 0 valid tissue values (all NA/empty)."
+      } else if (!length(un_ok)) {
+        tissue_msg <- "Universe has 0 valid tissue values."
+      } else {
+        
+        # check overlap after normalization
+        ov <- intersect(unique(fg_ok), unique(un_ok))
+        
+        if (!length(ov)) {
+          # ---- FALLBACK: use tissue families (Brain/Immune/...) on BOTH sides ----
+          if (exists("map_tissue_family", mode = "function")) {
+            
+            fg_fam <- vapply(trimws(as.character(fg_tis_raw)), map_tissue_family, FUN.VALUE = character(1))
+            un_fam <- vapply(trimws(as.character(un_tis_raw)), map_tissue_family, FUN.VALUE = character(1))
+            
+            fg_fam <- fg_fam[!is.na(fg_fam) & nzchar(fg_fam)]
+            un_fam <- un_fam[!is.na(un_fam) & nzchar(un_fam)]
+            
+            tab_tissue <- fisher_enrich_terms_fast(
+              fg_fam, un_fam,
+              alternative = "greater",
+              min_a  = 1,
+              min_Tt = minGS,
+              max_Tt = Inf,
+              max_terms = 200
+            )
+            
+            if (!nrow(tab_tissue)) {
+              tissue_msg <- "No overlap for tissues; fallback to tissue families also returned 0 terms."
+            } else {
+              tab_tissue$label <- tab_tissue$term
+              tissue_msg <- "No overlap for tissues; showing enrichment on tissue families instead."
+            }
+            
+          } else {
+            tissue_msg <- "Tissue overlap is 0 even after normalization. (No map_tissue_family() found for fallback.)"
+          }
+          
+        } else {
+          # ---- NORMAL PATH: enrich on normalized tissue IDs ----
+          tab_tissue <- fisher_enrich_terms_fast(
+            fg_ok, un_ok,
+            alternative = "greater",
+            min_a  = 1,
+            min_Tt = minGS,
+            max_Tt = Inf,
+            max_terms = 5000
+          )
+          
+          if (!nrow(tab_tissue)) {
+            tissue_msg <- "Tissue enrichment returned 0 terms after normalization (unexpected)."
+          } else {
+            # label map: normalized id -> original universe label (first)
+            u_lab <- data.frame(
+              term  = un_id,
+              label = trimws(as.character(un_tis_raw)),
+              stringsAsFactors = FALSE
+            )
+            u_lab <- u_lab[!is.na(u_lab$term) & nzchar(u_lab$term), , drop = FALSE]
+            u_lab <- u_lab[!duplicated(u_lab$term), , drop = FALSE]
+            
+            tab_tissue <- dplyr::left_join(tab_tissue, u_lab, by = "term")
+            miss <- is.na(tab_tissue$label) | !nzchar(tab_tissue$label)
+            tab_tissue$label[miss] <- tab_tissue$term[miss]
+          }
+        }
+      }
+      
+      # ----------------------------
+      # GENES
+      # ----------------------------
+      incProgress(0.5, detail = "Counting genes…")
+      tab_gene <- fisher_enrich_terms_fast(
+        dt2[[gene_col]], dt_uni[[gene_col_uni]],
+        alternative = "greater",
+        min_a  = 1,
+        min_Tt = minGS,
+        max_Tt = maxGS,
+        max_terms = 8000
+      )
+      
+      incProgress(0.2, detail = "Preparing gene labels…")
+      mp <- dt_uni %>%
+        dplyr::select(gene_id, gene_name) %>%
+        dplyr::filter(!is.na(gene_id), nzchar(gene_id)) %>%
+        dplyr::group_by(gene_id) %>%
+        dplyr::summarise(gene_name = dplyr::first(gene_name), .groups = "drop")
+      
+      list(
+        tab_tissue = tab_tissue,
+        tissue_msg = tissue_msg,
+        tab_gene   = tab_gene,
+        mp         = mp
+      )
+    })
+  }, ignoreInit = TRUE)
+  
+  # ------------------------------------------------------------
+  # Tissue table + plot (render from computed result)
+  # ------------------------------------------------------------
+  output$enrich_tissue_table <- DT::renderDT({
+    res <- gtex_terms_res(); req(res)
+    tab <- res$tab_tissue
+    msg <- res$tissue_msg %||% "No tissues pass filters."
+    
+    if (!is.data.frame(tab) || !nrow(tab)) {
+      return(DT::datatable(data.frame(Message = msg), options = list(dom="t"), rownames = FALSE))
+    }
+    
+    # FIX: ensure label exists
+    if (!"label" %in% names(tab)) tab$label <- tab$term
+    
+    out <- tab %>%
+      dplyr::transmute(
+        tissue    = dplyr::coalesce(.data$label, .data$term),
+        in_subset = a,
+        OR  = sprintf("%.3f", as.numeric(or)),
+        p   = formatC(as.numeric(p),     format="e", digits=2),
+        FDR = formatC(as.numeric(p_adj), format="e", digits=2)
+      )
+    
+    DT::datatable(out, rownames=FALSE,
+                  extensions="Buttons",
+                  options=list(dom="Bfrtip", buttons=c("copy","csv","excel","pdf","print"),
+                               pageLength=10, scrollX=TRUE))
+  })
+  
+  output$enrich_tissue_plot <- renderPlot({
+    res <- gtex_terms_res(); req(res)
+    
+    tab <- res$tab_tissue
+    msg <- res$tissue_msg %||% "No tissues to plot."
+    
+    if (!is.data.frame(tab) || !nrow(tab)) {
+      return(
+        ggplot2::ggplot() +
+          ggplot2::theme_void() +
+          ggplot2::annotate("text", x = 0, y = 0, label = msg, size = 4) +
+          ggplot2::xlim(-1, 1) + ggplot2::ylim(-1, 1)
+      )
+    }
+    
+    if (!"label" %in% names(tab)) tab$label <- tab$term
+    
+    top <- tab %>%
+      dplyr::slice_head(n = 20) %>%
+      dplyr::mutate(score = -log10(p_adj)) %>%
+      dplyr::arrange(score) %>%
+      dplyr::mutate(
+        term_short = short_label(dplyr::coalesce(label, term), max_chars = 35, wrap_width = 14),
+        term_short = factor(term_short, levels = term_short),
+        zebra = factor(seq_len(dplyr::n()) %% 2)
+      )
+    
+    ggplot2::ggplot(top, ggplot2::aes(x = term_short, y = score, fill = zebra)) +
+      ggplot2::geom_col() +
+      ggplot2::scale_fill_manual(values = c("0"="orange","1"="darkgreen"), guide = "none") +
+      ggplot2::labs(title = "Top enriched tissues (GTEx)", x = NULL, y = "-log10(FDR)") +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::theme(axis.text.x = ggplot2::element_text(angle=90, vjust=0.5, hjust=1))
+  })
+  
+  # ------------------------------------------------------------
+  # Gene table + plot (render from computed result)
+  # ------------------------------------------------------------
+  output$enrich_gene_table <- DT::renderDT({
+    res <- gtex_terms_res(); req(res)
+    tab <- res$tab_gene
+    mp  <- res$mp
+    
+    if (!nrow(tab)) {
+      return(DT::datatable(data.frame(Message="No genes pass filters."), options=list(dom="t"), rownames=FALSE))
+    }
+    
+    out <- tab %>%
+      dplyr::left_join(mp, by = c("term" = "gene_id")) %>%
+      dplyr::mutate(
+        gene = dplyr::if_else(!is.na(gene_name) & nzchar(gene_name),
+                              paste0(gene_name, " (", term, ")"),
+                              term)
+      ) %>%
+      dplyr::transmute(
+        gene = gene,
+        in_subset = a,
+        OR  = sprintf("%.3f", as.numeric(or)),
+        p   = formatC(as.numeric(p),     format="e", digits=2),
+        FDR = formatC(as.numeric(p_adj), format="e", digits=2)
+      )
+    
+    DT::datatable(out, rownames=FALSE,
+                  extensions="Buttons",
+                  options=list(dom="Bfrtip", buttons=c("copy","csv","excel","pdf","print"),
+                               pageLength=10, scrollX=TRUE))
+  })
+  
+  output$enrich_gene_plot <- renderPlot({
+    res <- gtex_terms_res(); req(res)
+    tab <- res$tab_gene
+    mp  <- res$mp
+    if (!nrow(tab)) return(NULL)
+    
+    top <- tab %>%
+      dplyr::left_join(mp, by = c("term" = "gene_id")) %>%
+      dplyr::mutate(
+        label = dplyr::if_else(!is.na(gene_name) & nzchar(gene_name),
+                               paste0(gene_name, " (", term, ")"),
+                               term)
+      ) %>%
+      dplyr::slice_head(n = 20) %>%
+      dplyr::mutate(score = -log10(p_adj)) %>%
+      dplyr::arrange(score) %>%
+      dplyr::mutate(
+        term_short = short_label(label, max_chars = 35, wrap_width = 14),
+        term_short = factor(term_short, levels = term_short),
+        zebra = factor(seq_len(dplyr::n()) %% 2)
+      )
+    
+    ggplot2::ggplot(top, ggplot2::aes(x = term_short, y = score, fill = zebra)) +
+      ggplot2::geom_col() +
+      ggplot2::scale_fill_manual(values = c("0"="orange","1"="darkgreen"), guide = "none") +
+      ggplot2::labs(title = "Top enriched genes (GTEx)", x = NULL, y = "-log10(FDR)") +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::theme(axis.text.x = ggplot2::element_text(angle=90, vjust=0.5, hjust=1))
+  })
+  
+  # ------------------------------------------------------------
+  # Optional debug (runs only after click because depends on gtex_terms_res)
+  # ------------------------------------------------------------
+  output$enrich_gtex_debug <- renderPrint({
+    res <- gtex_terms_res(); req(res)
+    list(
+      n_tissue_terms = nrow(res$tab_tissue),
+      n_gene_terms   = nrow(res$tab_gene),
+      top_tissues    = head(res$tab_tissue$term, 10),
+      top_genes      = head(res$tab_gene$term, 10)
+    )
+  })
+  
+  ############################################################################
+  ######## save candidates and hits
+  ############################################################################
+  
+  norm_chr_int <- function(x) {
+    x <- as.character(x)
+    x <- trimws(x)
+    x <- gsub("^chr", "", x, ignore.case = TRUE)
+    x[x %in% c("X","x")] <- "23"
+    x[x %in% c("Y","y")] <- "24"
+    x[x %in% c("MT","Mt","mt","M","m")] <- "25"
+    suppressWarnings(as.integer(x))
+  }
+  
+  pick_first_col <- function(df, candidates) {
+    hit <- intersect(candidates, names(df))
+    if (length(hit) == 0) return(NULL)
+    hit[1]
+  }
+  
+  ################################################################################
+  # ============================================================
+  # GTEx → canonical CLUSTERS + CANDIDATES (shared by LD + ZIP)
+  # ============================================================
+  
+  # ---- helpers (only if you don't already have them) ----
+  
+  norm_chr_int <- function(x) {
+    x <- as.character(x)
+    x <- trimws(x)
+    x <- gsub("^chr", "", x, ignore.case = TRUE)
+    x[x %in% c("X","x")] <- "23"
+    x[x %in% c("Y","y")] <- "24"
+    x[x %in% c("MT","Mt","mt","M","m")] <- "25"
+    suppressWarnings(as.integer(x))
+  }
+  
+  pick_first_col <- function(df, candidates) {
+    hit <- intersect(candidates, names(df))
+    if (length(hit) == 0) return(NULL)
+    hit[1]
+  }
+  
+  # ------------------------------------------------------------
+  # A) CLUSTERS (canonical for LD module + export)
+  #    returns: cluster_id, chr, cluster_start, cluster_end
+  # ------------------------------------------------------------
+  build_ld_clusters_from_gtex_app <- function() {
+    
+   # cl <- clusters_cur()
+    cl <- clusters_stable()
+    shiny::validate(shiny::need(is.data.frame(cl) && nrow(cl) > 0,
+                                "No clusters available (run Step 2: build intervals + clusters)."))
+    
+    cl <- as.data.frame(cl)
+    
+    # tolerate variants
+    if (!"chr"   %in% names(cl) && "CHR"      %in% names(cl)) cl$chr   <- cl$CHR
+    if (!"start" %in% names(cl) && "start_bp" %in% names(cl)) cl$start <- cl$start_bp
+    if (!"end"   %in% names(cl) && "end_bp"   %in% names(cl)) cl$end   <- cl$end_bp
+    
+    shiny::validate(shiny::need(all(c("chr","start","end") %in% names(cl)),
+                                "clusters_cur() must contain chr/start/end (or compatible names)."))
+    
+    # stable export id (DO NOT change GTEx internal naming)
+    if ("cluster_chr_n" %in% names(cl) && any(nzchar(as.character(cl$cluster_chr_n)))) {
+      cl$cluster_id <- as.character(cl$cluster_chr_n)     # e.g. chr1_3
+    } else if ("cluster" %in% names(cl)) {
+      cl$cluster_id <- paste0("cluster_", as.integer(cl$cluster))
+    } else {
+      cl$cluster_id <- paste0("cluster_", seq_len(nrow(cl)))
+    }
+    
+    cl$chr   <- norm_chr_int(cl$chr)
+    cl$start <- suppressWarnings(as.integer(cl$start))
+    cl$end   <- suppressWarnings(as.integer(cl$end))
+    
+    cl <- cl[is.finite(cl$chr) & is.finite(cl$start) & is.finite(cl$end) & cl$end >= cl$start, , drop = FALSE]
+    shiny::validate(shiny::need(nrow(cl) > 0, "All clusters became invalid after coercion (chr/start/end)."))
+    
+    out <- cl[, c("cluster_id","chr","start","end")]
+    names(out) <- c("cluster_id","chr","cluster_start","cluster_end")
+    out
+  }
+  
+  # ------------------------------------------------------------
+  # B) CANDIDATES (canonical for LD module + export)
+  #    returns: chr, pos_ini, pos_end, id_hit, classe
+  # ------------------------------------------------------------
+  build_ld_candidates_from_gtex_app <- function() {
+    
+    # ---------- GWAS candidates (hits_df) ----------
+    h <- tryCatch(hits_df(), error = function(e) NULL)
+    
+    if (is.null(h) || !is.data.frame(h) || nrow(h) == 0) {
+      gwas_cand <- data.frame(
+        chr = integer(), pos_ini = integer(), pos_end = integer(),
+        id_hit = character(), classe = character(),
+        stringsAsFactors = FALSE
+      )
+    } else {
+      shiny::validate(shiny::need(all(c("CHR","BP") %in% names(h)),
+                                  "hits_df() must contain CHR and BP columns."))
+      
+      rsid <- if ("snp" %in% names(h)) as.character(h$snp) else NA_character_
+      rsid[is.na(rsid) | !nzchar(rsid)] <- paste0("chr", h$CHR, ":", h$BP)
+      
+      gwas_cand <- data.frame(
+        chr     = norm_chr_int(h$CHR),
+        pos_ini = suppressWarnings(as.integer(h$BP)),
+        pos_end = suppressWarnings(as.integer(h$BP)),
+        id_hit  = rsid,
+        classe  = "GWAS",
+        stringsAsFactors = FALSE
+      )
+    }
+    
+    # ---------- GTEx candidates (gtex_data) ----------
+    cd <- gtex_data()
+    shiny::validate(shiny::need(is.data.frame(cd) && nrow(cd) > 0,
+                                "No GTEx hits available (run Step 4: extract GTEx eQTLs)."))
+    
+    cd <- as.data.frame(cd)
+    
+    chr_col <- pick_first_col(cd, c("chr","CHR","chrom","chromosome"))
+    shiny::validate(shiny::need(!is.null(chr_col), "gtex_data() has no chromosome column (chr/CHR/...)."))
+    
+    start_col <- pick_first_col(cd, c("start","pos","POS","BP","bp","position","variant_pos","pos_ini"))
+    end_col   <- pick_first_col(cd, c("end","pos_end","bp_end"))
+    shiny::validate(shiny::need(!is.null(start_col) || !is.null(end_col),
+                                "gtex_data() has no position column (start/BP/POS/...)."))
+    
+    if (is.null(start_col)) start_col <- end_col
+    if (is.null(end_col))   end_col   <- start_col
+    
+    id_col <- pick_first_col(cd, c("variant_id","variant","snp","rsid","RSID","ID","id_hit"))
+    if (is.null(id_col)) {
+      id_col <- ".id_tmp"
+      cd[[id_col]] <- paste0("GTEx_chr", cd[[chr_col]], ":", cd[[start_col]], "-", cd[[end_col]])
+    }
+    
+    gtex_cand <- data.frame(
+      chr     = norm_chr_int(cd[[chr_col]]),
+      pos_ini = suppressWarnings(as.integer(cd[[start_col]])),
+      pos_end = suppressWarnings(as.integer(cd[[end_col]])),
+      id_hit  = as.character(cd[[id_col]]),
+      classe  = "GTEx_hit",
+      stringsAsFactors = FALSE
+    )
+    
+    # ---------- clean + combine ----------
+    candidate_csv <- rbind(gwas_cand, gtex_cand)
+    candidate_csv <- candidate_csv[
+      is.finite(candidate_csv$chr) &
+        is.finite(candidate_csv$pos_ini) &
+        is.finite(candidate_csv$pos_end) &
+        candidate_csv$pos_end >= candidate_csv$pos_ini &
+        !is.na(candidate_csv$id_hit) & nzchar(candidate_csv$id_hit),
+      , drop = FALSE
+    ]
+    
+    shiny::validate(shiny::need(nrow(candidate_csv) > 0, "No candidates available for LD."))
+    candidate_csv
+  }
+  
+  # ============================================================
+  # GTEx ZIP download (USES THE SAME BUILDERS)
+  # ============================================================
+  output$dl_candidates_zip <- downloadHandler(
+    filename = function() {
+      stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+      
+      tag_txt <- tryCatch({
+        tg <- make_mode_thr_tag(input$cluster_method %||% "window", input$pthr, input$min_logp)
+        paste0(tg$mode_tag, "_thr", tg$thr_txt)
+      }, error = function(e) "run")
+      
+      paste0("gtex_candidates_", tag_txt, "_", stamp, ".zip")
+    },
+    
+    content = function(file) {
+      
+      # Build canonical objects (single source of truth)
+      cluster_csv   <- build_ld_clusters_from_gtex_app()
+      candidate_csv <- build_ld_candidates_from_gtex_app()
+      
+      # Write to temp folder and zip
+      tmpdir <- tempfile("gtex_export_")
+      dir.create(tmpdir, recursive = TRUE, showWarnings = FALSE)
+      
+      f1 <- file.path(tmpdir, "cluster_gtex.csv")
+      f2 <- file.path(tmpdir, "candidate_gtex.csv")
+      
+      utils::write.csv(cluster_csv,   f1, row.names = FALSE, quote = FALSE)
+      utils::write.csv(candidate_csv, f2, row.names = FALSE, quote = FALSE)
+      
+      old <- getwd()
+      on.exit(setwd(old), add = TRUE)
+      setwd(tmpdir)
+      
+      utils::zip(zipfile = file, files = c("cluster_gtex.csv", "candidate_gtex.csv"))
+    }
+  )
+  
+  ##############################################################################
+  ############################ LD Module  GTEX #################################
+  ##############################################################################
+  # -----------------------------
+  # LD PANEL
+  # -----------------------------
+  clusters_r <- reactive({
+    build_ld_clusters_from_gtex_app()
+  })
+  
+  candidates_r <- reactive({
+    build_ld_candidates_from_gtex_app()
+  })
+  
+  ld_module_server(
+    "ld",
+    clusters_r   = clusters_r,
+    candidates_r = candidates_r
+  )
+  
+  # -----------------------------
+  # Reset session (GTEx Inspector)
+  # -----------------------------
+  observeEvent(input$reset_case, {
+    # (A) Tanca modals si n'hi ha
+    removeModal()
+    
+    # (B) Neteja seleccions de DT (si existeixen)
+    for (id in c("hits_tbl", "cluster_dt", "gtex_table", "go_table", "kegg_table")) {
+      try(DT::selectRows(DT::dataTableProxy(id), NULL), silent = TRUE)
+    }
+    
+    # (C) Esborra fitxer temporal principal (selected_intervals.range)
+    # workdir existeix al teu codi (per-session)
+    if (exists("workdir", inherits = TRUE) && is.character(workdir) && dir.exists(workdir)) {
+      f_rng <- file.path(workdir, "selected_intervals.range")
+      if (file.exists(f_rng)) {
+        try(unlink(f_rng, force = TRUE), silent = TRUE)
+      }
+    }
+    
+    # (D) Reset del "core state" real (reactiveVal del teu GTEx)
+    intervals_raw(NULL)
+    clusters_cur(NULL)
+    ucsc_region(NULL)
+    window_selected(NULL)
+    
+    # GTEx hits + caches
+    gtex_hits_val(NULL)
+    gene_map_cache_ens(NULL)
+    gene_map_cache_map(NULL)
+    
+    # triggers d'enrichment
+    go_trigger(0L)
+    kegg_trigger(0L)
+    
+    # (E) Reset dels tracks UCSC (session$userData)
+    # (els fas servir per construir els links/track hubs)
+    session$userData$track_gwas_data <- tibble::tibble()
+    session$userData$track_gtex_data <- tibble::tibble()
+    
+    # (F) Reset inputs a valors per defecte (segurs: si algun ID no existeix, no peta)
+    safe <- function(expr) try(expr, silent = TRUE)
+    
+    safe(updateRadioButtons(session, "use_preloaded_catalog", selected = "new"))
+    safe(updateRadioButtons(session, "cluster_method", selected = "window"))
+    safe(updateSliderInput(session, "pthr", value = 5))
+    safe(updateSliderInput(session, "min_logp", value = 5))
+    safe(updateNumericInput(session, "flank", value = 10000))
+    safe(updateNumericInput(session, "min_hits", value = 3))
+    safe(updateNumericInput(session, "win_bp", value = 1000000))
+    safe(updateNumericInput(session, "step_bp", value = 250000))
+    
+    # (G) Feedback
+    showNotification("Reset done. Ready for a new case.", type = "message", duration = 2)
+  }, ignoreInit = TRUE)
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # GO SLIM (generic) enrichment — GTEx
+  #  - gene set: ENTREZIDs (entrez_scope())
+  #  - background: NULL (default) o dataset universe (universe_entrez_dataset())
+  #  - GO annotations: org.Hs.eg.db (GOALL / ONTOLOGYALL)
+  #  - Slim terms: goslim_generic.obo (GO slim generic)
+  # ============================================================
+  
+  # --- 1) Sources required (put these files in your app under /R) ---
+  #   R/goslim_utils.R        (load_goslim_generic_ids, map_go_to_goslim, shorten_go_label, etc.)
+  #   R/go_slim_generic.R     (optional; loads GO_SLIM_GENERIC w/ TERM + ONTOLOGY from GO.db)
+  #   R/goslim_generic.obo    (GO slim generic obo)
+  #
+  # If you already have them in a shared GItools folder, point source() there.
+  
+  observe({
+    cl <- tryCatch(clusters_stable(), error = function(e) NULL)
+    
+    ids <- character(0)
+    if (is.data.frame(cl) && nrow(cl)) {
+      idcol <- if ("cluster_chr_n" %in% names(cl)) "cluster_chr_n" else
+        if ("cluster_id" %in% names(cl)) "cluster_id" else names(cl)[1]
+      ids <- unique(as.character(cl[[idcol]]))
+    } else if (is.vector(cl) && length(cl)) {
+      ids <- unique(as.character(cl))
+    }
+    
+    ids <- sort(ids[!is.na(ids) & nzchar(ids)])
+    updateSelectInput(session, "func_cluster_id", choices = ids, selected = ids[1] %||% "")
+  })
+  
+  
+  local({
+    f1 <- file.path("R", "goslim_utils.R")
+    f2 <- file.path("R", "go_slim_generic.R")
+    f3 <- file.path("R", "goslim_generic.obo")
+    
+    if (file.exists(f1)) source(f1, local = TRUE)
+    if (file.exists(f2)) source(f2, local = TRUE)
+    
+    # If GO_SLIM_GENERIC is not defined by go_slim_generic.R, define it minimally here:
+    if (!exists("GO_SLIM_GENERIC", inherits = TRUE) && file.exists(f3) &&
+        exists("load_goslim_generic_ids", inherits = TRUE)) {
+      
+      # Build a simple GOID->ONTOLOGY table from the IDs in the OBO
+      ids <- load_goslim_generic_ids(f3)
+      GO_SLIM_GENERIC <- AnnotationDbi::select(
+        GO.db::GO.db,
+        keys    = ids,
+        keytype = "GOID",
+        columns = c("GOID", "TERM", "ONTOLOGY")
+      ) %>%
+        dplyr::filter(!is.na(GOID), !is.na(TERM), !is.na(ONTOLOGY)) %>%
+        dplyr::transmute(GOID, ONTOLOGY, slim_term = TERM) %>%
+        dplyr::distinct(GOID, ONTOLOGY, slim_term)
+      
+      assign("GO_SLIM_GENERIC", GO_SLIM_GENERIC, envir = .GlobalEnv)
+    }
+  })
+  
+  # ------------------------------------------------------------
+  # Trigger (com GO/KEGG)
+  # ------------------------------------------------------------
+  goslim_trigger <- reactiveVal(NULL)
+  
+  observeEvent(input$run_enrich, {
+    tab <- input$enrich_tabs %||% "tab_enrich_go"
+    if (identical(tab, "tab_enrich_goslim")) {
+      goslim_trigger((goslim_trigger() %||% 0L) + 1L)
+    }
+  }, ignoreInit = TRUE)
+  
+  # ------------------------------------------------------------
+  # Helpers: build GO slim TERM2GENE from org.Hs.eg.db annotations
+  # ------------------------------------------------------------
+  
+  # Slim IDs per ontologia
+  goslim_ids_by_onto <- reactive({
+    validate(need(exists("GO_SLIM_GENERIC", inherits = TRUE), "GO_SLIM_GENERIC not loaded."))
+    df <- get("GO_SLIM_GENERIC", inherits = TRUE)
+    validate(need(is.data.frame(df) && nrow(df) > 0, "GO_SLIM_GENERIC is empty."))
+    split(unique(df$GOID), as.character(df$ONTOLOGY))
+  })
+  
+  # TERM2NAME (slim GOID -> term)
+  goslim_term2name <- reactive({
+    df <- get("GO_SLIM_GENERIC", inherits = TRUE)
+    df %>%
+      dplyr::transmute(term = GOID, name = slim_term, Ontology = ONTOLOGY) %>%
+      dplyr::distinct(term, name, Ontology)
+  })
+  
+  # Build TERM2GENE for a given ontology, restricted to the chosen "universe" if provided
+  goslim_term2gene_for_onto <- function(onto, universe_entrez) {
+    validate(need(requireNamespace("org.Hs.eg.db", quietly = TRUE), "org.Hs.eg.db package is required."))
+    validate(need(requireNamespace("GO.db", quietly = TRUE), "GO.db package is required."))
+    validate(need(exists("map_go_to_goslim", inherits = TRUE), "map_go_to_goslim() not loaded (goslim_utils.R)."))
+    
+    onto <- match.arg(onto, c("BP","CC","MF"))
+    
+    # Universe genes used to fetch GO annotations:
+    # - If universe_entrez is NULL, use the dataset universe (mapped) to keep it fast & consistent.
+    #   (You can change this to all OrgDb genes if you really want global background.)
+    if (is.null(universe_entrez) || !length(universe_entrez)) {
+      universe_entrez <- universe_entrez_dataset()
+    }
+    universe_entrez <- unique(as.character(universe_entrez))
+    universe_entrez <- universe_entrez[!is.na(universe_entrez) & nzchar(universe_entrez)]
+    validate(need(length(universe_entrez) > 0, "Universe genes empty."))
+    
+    slim_ids <- goslim_ids_by_onto()[[onto]]
+    validate(need(length(slim_ids) > 0, paste0("No GO slim IDs found for ontology ", onto)))
+    
+    # 1) gene -> GOALL/ONTOLOGYALL
+    ann <- suppressMessages(
+      AnnotationDbi::select(
+        org.Hs.eg.db::org.Hs.eg.db,
+        keys    = universe_entrez,
+        keytype = "ENTREZID",
+        columns = c("ENTREZID", "GOALL", "ONTOLOGYALL")
+      )
+    )
+    
+    ann <- ann %>%
+      dplyr::filter(!is.na(ENTREZID), !is.na(GOALL), !is.na(ONTOLOGYALL)) %>%
+      dplyr::filter(ONTOLOGYALL == onto) %>%
+      dplyr::transmute(ENTREZID = as.character(ENTREZID), GOID = as.character(GOALL)) %>%
+      dplyr::filter(nzchar(ENTREZID), nzchar(GOID)) %>%
+      dplyr::distinct()
+    
+    if (!nrow(ann)) return(data.frame(term = character(0), gene = character(0)))
+    
+    # 2) GOID -> slim GOIDs (via ancestor mapping)
+    go_ids <- unique(ann$GOID)
+    go2sl <- map_go_to_goslim(go_ids, ontology = onto, goslim_ids = slim_ids)
+    
+    # explode list
+    lens <- lengths(go2sl)
+    if (!any(lens > 0)) return(data.frame(term = character(0), gene = character(0)))
+    
+    map_df <- data.frame(
+      GOID  = rep(go_ids, times = pmax(lens, 1L)),
+      slim  = unlist(lapply(go2sl, function(z) if (length(z)) z else NA_character_), use.names = FALSE),
+      stringsAsFactors = FALSE
+    ) %>% dplyr::filter(!is.na(slim), nzchar(slim)) %>% dplyr::distinct()
+    
+    # 3) gene -> slim
+    t2g <- ann %>%
+      dplyr::inner_join(map_df, by = "GOID") %>%
+      dplyr::transmute(term = slim, gene = ENTREZID) %>%
+      dplyr::distinct()
+    
+    t2g
+  }
+  
+  # ------------------------------------------------------------
+  # GO SLIM enrichment (multi-ontology) — enricher() + filtrem després per FDR
+  # ------------------------------------------------------------
+  goslim_enrich_raw <- eventReactive(goslim_trigger(), {
+    validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler package is required."))
+    validate(need(requireNamespace("dplyr", quietly = TRUE), "dplyr package is required."))
+    
+    withProgress(message = "Running GO slim enrichment…", value = 0, {
+      
+      gene <- entrez_scope()
+      incProgress(0.2, detail = paste("Genes:", length(gene)))
+      
+      uni  <- universe_entrez_for_scope()
+      incProgress(0.1, detail = if (is.null(uni)) "Universe: default (slim TERM2GENE-derived)" else paste("Universe:", length(uni)))
+      
+      ontos <- input$go_ontos %||% c("BP","CC","MF")
+      ontos <- intersect(c("BP","CC","MF"), ontos)
+      validate(need(length(ontos) > 0, "Select at least one ontology (BP/CC/MF)."))
+      
+      tab <- input$enrich_tabs %||% "tab_enrich_go"
+      
+      minGS <- input$enrich_min_gs %||% 10
+      maxGS <- input$enrich_max_gs %||% 500
+      
+      # GoSlim: categories més “ample” però sovint amb pocs hits → baixa minGS
+      if (identical(tab, "tab_enrich_goslim")) {
+        minGS <- min(minGS, 1L)  # força com a mínim 1
+      }
+      
+      
+      res <- purrr::map_dfr(ontos, function(ont) {
+        
+        incProgress(0.7 / length(ontos), detail = paste("Ontology:", ont))
+        
+        t2g <- goslim_term2gene_for_onto(ont, universe_entrez = uni)
+        if (!is.data.frame(t2g) || !nrow(t2g)) return(NULL)
+        
+        # TERM2NAME for this ontology (optional but nicer)
+        t2n <- goslim_term2name() %>%
+          dplyr::filter(Ontology == ont) %>%
+          dplyr::select(term, name) %>%
+          dplyr::distinct()
+        
+        eg <- tryCatch({
+          suppressMessages(
+            clusterProfiler::enricher(
+              gene          = gene,
+              universe      = uni,                 # NULL => background inferred from TERM2GENE
+              TERM2GENE     = t2g,
+              TERM2NAME     = t2n,
+              pAdjustMethod = "BH",
+              pvalueCutoff  = 1,
+              qvalueCutoff  = 1,
+              minGSSize     = minGS,
+              maxGSSize     = maxGS
+            )
+          )
+        }, error = function(e) NULL)
+        
+        if (is.null(eg) || is.null(eg@result) || !nrow(eg@result)) return(NULL)
+        
+        df <- as.data.frame(eg@result, stringsAsFactors = FALSE)
+        if (!nrow(df)) return(NULL)
+        
+        df$Ontology <- ont
+        df
+      })
+      
+      if (is.null(res) || !nrow(res)) return(tibble::tibble())
+      res
+    })
+  }, ignoreInit = TRUE)
+  
+  goslim_enrich_tbl <- reactive({
+    df <- goslim_enrich_raw()
+    if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+    
+    pcut <- input$enrich_pcut %||% 0.05
+    topn <- input$go_topn %||% 10
+    
+    df2 <- df %>%
+      dplyr::mutate(
+        Ontology = as.character(Ontology),
+        pvalue   = suppressWarnings(as.numeric(pvalue)),
+        p.adjust = suppressWarnings(as.numeric(p.adjust)),
+        term_short = ifelse(nchar(Description) > 50, paste0(substr(Description, 1, 47), "."), Description)
+      ) %>%
+      dplyr::filter(is.finite(p.adjust), is.finite(pvalue)) %>%
+      dplyr::filter(p.adjust <= pcut) %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+      dplyr::slice_head(n = topn) %>%
+      dplyr::ungroup()
+    
+    if (!nrow(df2)) return(tibble::tibble())
+    df2
+  })
+  
+  # ------------------------------------------------------------
+  # Outputs: table + barplot (copiat del GO, canviant labels)
+  # ------------------------------------------------------------
+  output$goslim_table <- DT::renderDT({
+    df <- goslim_enrich_tbl()
+    if (!nrow(df)) {
+      return(DT::datatable(
+        data.frame(Message = "No GO slim terms passed the cutoff."),
+        options = list(dom = "t"),
+        rownames = FALSE
+      ))
+    }
+    
+    out <- df %>%
+      dplyr::select(Ontology, ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+      dplyr::mutate(
+        pvalue   = sprintf("%.3g", as.numeric(pvalue)),
+        p.adjust = sprintf("%.3g", as.numeric(p.adjust))
+      )
+    
+    DT::datatable(out, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
+  })
+  
+  goslim_top_df <- reactive({
+    df <- goslim_enrich_raw()
+    if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+    
+    pcut <- input$enrich_pcut %||% 0.05
+    topn <- input$go_topn %||% 10
+    
+    df0 <- df %>%
+      dplyr::mutate(
+        Ontology   = as.character(Ontology),
+        pvalue     = suppressWarnings(as.numeric(pvalue)),
+        p.adjust   = suppressWarnings(as.numeric(p.adjust)),
+        term_short = ifelse(nchar(Description) > 50, paste0(substr(Description, 1, 47), "."), Description),
+        score      = -log10(pvalue)
+      ) %>%
+      dplyr::filter(
+        Ontology %in% c("BP","CC","MF"),
+        is.finite(pvalue), is.finite(p.adjust),
+        nzchar(term_short)
+      )
+    
+    if (!nrow(df0)) return(tibble::tibble())
+    
+    sig <- df0 %>%
+      dplyr::filter(p.adjust <= pcut) %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+      dplyr::slice_head(n = topn) %>%
+      dplyr::ungroup()
+    
+    if (nrow(sig) > 0) {
+      attr(sig, "fallback") <- FALSE
+      return(sig)
+    }
+    
+    fb <- df0 %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+      dplyr::slice_head(n = topn) %>%
+      dplyr::ungroup()
+    
+    attr(fb, "fallback") <- TRUE
+    fb
+  })
+  
+  output$goslim_bar <- plotly::renderPlotly({
+    
+    df <- goslim_enrich_raw()
+    validate(need(is.data.frame(df) && nrow(df) > 0, "GoSlim: no data to plot yet. Run enrichment first."))
+    
+    # Controls
+    top_n <- input$go_topn %||% 15
+    gap   <- 2
+    
+    pcut <- input$enrich_pcut %||% 0.05
+    
+    # Ensure columns exist (enricher() result)
+    validate(need(all(c("Description","Ontology","p.adjust","geneID") %in% names(df)),
+                  "goslim_enrich_raw() must return: Description, Ontology, p.adjust, geneID"))
+    
+    # Helpers: shorten/wrap
+    if (!exists("shorten_go_label", mode = "function")) {
+      shorten_go_label <- function(x, max = 55) {
+        x <- as.character(x)
+        x <- stringr::str_squish(x)
+        ifelse(nchar(x) > max, paste0(substr(x, 1, max - 1), "…"), x)
+      }
+    }
+    
+    # Parse geneID (ENTREZIDs separated by "/") -> n_genes
+    dat <- df %>%
+      dplyr::mutate(
+        Ontology   = as.character(Ontology),
+        slim_term  = as.character(Description),
+        p.adjust   = suppressWarnings(as.numeric(p.adjust)),
+        geneID     = as.character(geneID),
+        n_genes    = ifelse(
+          is.na(geneID) | !nzchar(geneID),
+          0L,
+          lengths(strsplit(geneID, "/", fixed = TRUE))
+        ),
+        term_short = stringr::str_wrap(shorten_go_label(slim_term, 55), width = 28)
+      ) %>%
+      dplyr::filter(Ontology %in% c("BP","CC","MF")) %>%
+      dplyr::filter(is.finite(p.adjust))
+    
+    validate(need(nrow(dat) > 0, "GoSlim: no BP/CC/MF terms to plot."))
+    
+    # Prefer significant terms; fallback to top by p.adjust if none pass
+    sig <- dat %>% dplyr::filter(p.adjust <= pcut)
+    fb  <- nrow(sig) == 0
+    if (!fb) dat <- sig
+    
+    # Enforce BP/CC/MF order
+    ont_order <- c("BP","CC","MF")
+    present   <- intersect(ont_order, unique(dat$Ontology))
+    validate(need(length(present) > 0, "GoSlim: no BP/CC/MF data to plot."))
+    
+    dat <- dat %>%
+      dplyr::filter(Ontology %in% present) %>%
+      dplyr::mutate(Ontology = factor(Ontology, levels = ont_order))
+    
+    # Top-N per ontology by n_genes (classification-style)
+    dat <- dat %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::slice_max(order_by = n_genes, n = top_n, with_ties = FALSE) %>%
+      dplyr::arrange(Ontology, dplyr::desc(n_genes), p.adjust) %>%
+      dplyr::mutate(rank = dplyr::row_number()) %>%
+      dplyr::ungroup()
+    
+    # Offsets per block (BP | gap | CC | gap | MF)
+    n_bp <- if ("BP" %in% present) max(dat$rank[dat$Ontology == "BP"], 0) else 0
+    n_cc <- if ("CC" %in% present) max(dat$rank[dat$Ontology == "CC"], 0) else 0
+    
+    offsets <- c(
+      BP = 0,
+      CC = n_bp + gap,
+      MF = n_bp + gap + n_cc + gap
+    )
+    
+    dat$x <- dat$rank + offsets[as.character(dat$Ontology)]
+    
+    # Separator lines between blocks
+    vlines <- c()
+    if (all(c("BP","CC") %in% present)) vlines <- c(vlines, offsets["CC"] - gap/2)
+    if (all(c("CC","MF") %in% present)) vlines <- c(vlines, offsets["MF"] - gap/2)
+    
+    # Centers for top labels
+    centers <- dat %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::summarise(
+        xmin = min(x), xmax = max(x),
+        xmid = (xmin + xmax) / 2,
+        .groups = "drop"
+      )
+    
+    ymax  <- max(dat$n_genes, na.rm = TRUE)
+    ylab  <- -0.12 * ymax
+    y_top <- ymax * 1.08
+    
+    # Title label (reuse your scope_label())
+    ttl <- paste0("Gene Function Classification (GO slim generic) — ", scope_label())
+    if (fb) {
+      ttl <- paste0(ttl, "  (no terms at FDR ≤ ", pcut, "; showing top by gene count)")
+    } else {
+      ttl <- paste0(ttl, "  (FDR ≤ ", pcut, ")")
+    }
+    
+    # Tooltip
+    dat$tooltip <- paste0(
+      "<b>", dat$Ontology, "</b>",
+      "<br><b>GO slim:</b> ", htmltools::htmlEscape(dat$slim_term),
+      "<br><b>Genes:</b> ", dat$n_genes,
+      "<br><b>FDR:</b> ", sprintf("%.3g", dat$p.adjust)
+    )
+    
+    # Build ggplot
+    p <- ggplot2::ggplot(
       dat,
       ggplot2::aes(
-        x    = stats::reorder(term_short, score),
-        y    = score,
-        fill = Ontology
+        x = x, y = n_genes,
+        fill = Ontology,
+        text = tooltip
       )
     ) +
-      ggplot2::geom_col() +
-      ggplot2::coord_flip() +
-      ggplot2::facet_wrap(~Ontology, scales = "free_y") +
-      ggplot2::scale_fill_manual(values = cols_go, guide = "none", drop = FALSE) +
-      ggplot2::labs(title = ttl, subtitle = subttl, x = NULL, y = "-log10(pvalue)") +
-      ggplot2::theme_minimal(base_size = 12)
-  }
-}, height = 450)
-
-# ------------------------------------------------------------
-# KEGG enrichment
-# ------------------------------------------------------------
-kegg_enrich_raw <- eventReactive(kegg_trigger(), {
-  validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler package is required."))
-  
-  withProgress(message = "Running KEGG enrichment…", value = 0, {
-    
-    gene <- entrez_scope()
-    incProgress(0.2, detail = paste("Genes:", length(gene)))
-    
-    uni  <- universe_entrez_for_scope()
-    incProgress(0.1, detail = if (is.null(uni)) "Universe: default (KEGG)" else paste("Universe:", length(uni)))
-    
-    minGS <- input$enrich_min_gs %||% 10
-    maxGS <- input$enrich_max_gs %||% 500
-    
-    ek <- suppressMessages(
-      clusterProfiler::enrichKEGG(
-        gene          = gene,
-        universe      = uni,
-        organism      = "hsa",
-        pAdjustMethod = "BH",
-        pvalueCutoff  = 1,
-        qvalueCutoff  = 1,
-        minGSSize     = minGS,
-        maxGSSize     = maxGS
+      ggplot2::geom_col(width = 0.85, color = "black", linewidth = 0.25) +
+      { if (length(vlines)) ggplot2::geom_vline(xintercept = vlines, linewidth = 0.4) } +
+      ggplot2::scale_x_continuous(
+        breaks = dat$x,
+        labels = dat$term_short,
+        expand = c(0, 0)
+      ) +
+      ggplot2::coord_cartesian(ylim = c(ylab, ymax * 1.20), clip = "off") +
+      
+      # Top class labels
+      { if ("BP" %in% present)
+        ggplot2::annotate("text",
+                          x = centers$xmid[centers$Ontology == "BP"], y = y_top,
+                          label = "Biological Process", fontface = "bold", size = 3.6) } +
+      { if ("CC" %in% present)
+        ggplot2::annotate("text",
+                          x = centers$xmid[centers$Ontology == "CC"], y = y_top,
+                          label = "Cellular Component", fontface = "bold", size = 3.6) } +
+      { if ("MF" %in% present)
+        ggplot2::annotate("text",
+                          x = centers$xmid[centers$Ontology == "MF"], y = y_top,
+                          label = "Molecular Function", fontface = "bold", size = 3.6) } +
+      
+      ggplot2::labs(
+        x = NULL,
+        y = "Number of genes",
+        title = ttl
+      ) +
+      ggplot2::theme_minimal(base_size = 10) +
+      ggplot2::theme(
+        plot.title   = ggplot2::element_text(size = 11, face = "bold"),
+        axis.title.y = ggplot2::element_text(size = 9),
+        axis.text.x  = ggplot2::element_text(angle = 90, size = 7, vjust = 0.5, hjust = 1),
+        axis.text.y  = ggplot2::element_text(size = 8),
+        legend.position = "none",
+        plot.margin = grid::unit(c(28, 10, 35, 10), "pt")
+      ) +
+      ggplot2::scale_fill_manual(
+        values = c(BP = "darkgreen", CC = "orange", MF = "darkblue"),
+        guide = "none"
       )
-    )
     
-    if (is.null(ek) || is.null(ek@result) || !nrow(ek@result)) return(tibble::tibble())
-    as.data.frame(ek@result, stringsAsFactors = FALSE)
+    plotly::ggplotly(p, tooltip = "text")
   })
-}, ignoreInit = TRUE)
-
-kegg_enrich_tbl <- reactive({
-  df <- kegg_enrich_raw()
-  if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
   
-  pcut <- input$enrich_pcut %||% 0.05
-  topn <- input$enrich_kegg_top %||% 15
   
-  df2 <- df %>%
-    dplyr::mutate(
-      pvalue   = suppressWarnings(as.numeric(pvalue)),
-      p.adjust = suppressWarnings(as.numeric(p.adjust))
-    ) %>%
-    dplyr::filter(is.finite(p.adjust), is.finite(pvalue)) %>%
-    dplyr::filter(p.adjust <= pcut) %>%
-    dplyr::arrange(p.adjust) %>%
-    dplyr::slice_head(n = topn)
-  
-  if (!nrow(df2)) return(tibble::tibble())
-  df2
-})
-
-output$kegg_table <- DT::renderDT({
-  df <- kegg_enrich_tbl()
-  if (!nrow(df)) {
-    return(DT::datatable(
-      data.frame(Message = "No KEGG pathways passed the cutoff."),
-      options = list(dom = "t"),
-      rownames = FALSE
-    ))
-  }
-  
-  out <- df %>%
-    dplyr::select(ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
-    dplyr::mutate(
-      pvalue   = sprintf("%.3g", as.numeric(pvalue)),
-      p.adjust = sprintf("%.3g", as.numeric(p.adjust))
+  output$goslim_debug <- renderPrint({
+    tab <- input$enrich_tabs %||% NA_character_
+    onto <- (input$go_ontos %||% c("BP","CC","MF"))[1]
+    
+    gene <- tryCatch(entrez_scope(), error = function(e) character(0))
+    uni  <- tryCatch(universe_entrez_for_scope(), error = function(e) NULL)
+    
+    # TERM2GENE per una ontologia (BP per defecte)
+    t2g <- tryCatch(goslim_term2gene_for_onto(onto, universe_entrez = uni), error = function(e) NULL)
+    
+    list(
+      tab = tab,
+      scope = input$func_scope %||% NA_character_,
+      cluster = input$func_cluster_id %||% NA_character_,
+      n_entrez_scope = length(gene),
+      universe_is_null = is.null(uni),
+      n_universe = if (is.null(uni)) NA_integer_ else length(uni),
+      onto_tested = onto,
+      t2g_is_null = is.null(t2g),
+      n_term2gene = if (is.data.frame(t2g)) nrow(t2g) else NA_integer_,
+      n_terms = if (is.data.frame(t2g)) length(unique(t2g$term)) else NA_integer_
     )
-  
-  DT::datatable(out, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
-})
+  })
 
-kegg_top_df <- reactive({
-  df <- kegg_enrich_raw()
-  if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
   
-  pcut <- input$enrich_pcut %||% 0.05
-  topn <- input$enrich_kegg_top %||% 15
-  
-  df0 <- df %>%
-    dplyr::mutate(
-      pvalue     = suppressWarnings(as.numeric(pvalue)),
-      p.adjust   = suppressWarnings(as.numeric(p.adjust)),
-      term_short = ifelse(nchar(Description) > 50, paste0(substr(Description, 1, 47), "."), Description),
-      score      = -log10(pvalue)
-    ) %>%
-    dplyr::filter(is.finite(pvalue), is.finite(p.adjust), nzchar(term_short))
-  
-  if (!nrow(df0)) return(tibble::tibble())
-  
-  sig <- df0 %>%
-    dplyr::filter(p.adjust <= pcut) %>%
-    dplyr::arrange(p.adjust) %>%
-    dplyr::slice_head(n = topn)
-  
-  if (nrow(sig) > 0) {
-    attr(sig, "fallback") <- FALSE
-    return(sig)
-  }
-  
-  fb <- df0 %>%
-    dplyr::arrange(p.adjust) %>%
-    dplyr::slice_head(n = topn)
-  
-  attr(fb, "fallback") <- TRUE
-  fb
-})
-
-output$kegg_bar <- renderPlot({
-  df <- kegg_top_df()
-  req(is.data.frame(df), nrow(df) > 0)
-  
-  fb   <- isTRUE(attr(df, "fallback"))
-  pcut <- input$enrich_pcut %||% 0.05
-  
-  ttl <- paste0(
-    "KEGG enrichment (", scope_label(), ")",
-    if (fb) paste0(" — no pathways at FDR ≤ ", pcut, " (showing top by FDR)") else paste0(" — FDR ≤ ", pcut)
-  )
-  
-  df <- df %>%
-    dplyr::mutate(
-      score = -log10(pvalue),
-      padj  = suppressWarnings(as.numeric(p.adjust))
-    )
-  
-  ggplot2::ggplot(
-    df,
-    ggplot2::aes(
-      x    = stats::reorder(term_short, score),
-      y    = score,
-      fill = padj
-    )
-  ) +
-    ggplot2::geom_col() +
-    ggplot2::coord_flip() +
-    ggplot2::labs(title = ttl, x = NULL, y = "-log10(pvalue)", fill = "FDR") +
-    ggplot2::scale_fill_gradient(
-      low  = "red",   # més significatiu (FDR petit)
-      high = "orange",   # menys significatiu
-      na.value = "yellow",
-      trans = "reverse"   # perquè low (color fort) correspongui a FDR petit
-    ) +
-    ggplot2::theme_minimal(base_size = 12) +
-    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-}, height = function() {
-  n <- tryCatch(nrow(kegg_top_df()), error = function(e) 0)
-  max(420, 28 * n)
-})
-
-############################################################################
-######## save candidates and hits
-############################################################################
-
-norm_chr_int <- function(x) {
-  x <- as.character(x)
-  x <- trimws(x)
-  x <- gsub("^chr", "", x, ignore.case = TRUE)
-  x[x %in% c("X","x")] <- "23"
-  x[x %in% c("Y","y")] <- "24"
-  x[x %in% c("MT","Mt","mt","M","m")] <- "25"
-  suppressWarnings(as.integer(x))
-}
-
-pick_first_col <- function(df, candidates) {
-  hit <- intersect(candidates, names(df))
-  if (length(hit) == 0) return(NULL)
-  hit[1]
-}
-
-################################################################################
-# ============================================================
-# GTEx → canonical CLUSTERS + CANDIDATES (shared by LD + ZIP)
-# ============================================================
-
-# ---- helpers (only if you don't already have them) ----
-
-norm_chr_int <- function(x) {
-  x <- as.character(x)
-  x <- trimws(x)
-  x <- gsub("^chr", "", x, ignore.case = TRUE)
-  x[x %in% c("X","x")] <- "23"
-  x[x %in% c("Y","y")] <- "24"
-  x[x %in% c("MT","Mt","mt","M","m")] <- "25"
-  suppressWarnings(as.integer(x))
-}
-
-pick_first_col <- function(df, candidates) {
-  hit <- intersect(candidates, names(df))
-  if (length(hit) == 0) return(NULL)
-  hit[1]
-}
-
-# ------------------------------------------------------------
-# A) CLUSTERS (canonical for LD module + export)
-#    returns: cluster_id, chr, cluster_start, cluster_end
-# ------------------------------------------------------------
-build_ld_clusters_from_gtex_app <- function() {
-  
-  cl <- clusters_cur()
-  shiny::validate(shiny::need(is.data.frame(cl) && nrow(cl) > 0,
-                              "No clusters available (run Step 2: build intervals + clusters)."))
-  
-  cl <- as.data.frame(cl)
-  
-  # tolerate variants
-  if (!"chr"   %in% names(cl) && "CHR"      %in% names(cl)) cl$chr   <- cl$CHR
-  if (!"start" %in% names(cl) && "start_bp" %in% names(cl)) cl$start <- cl$start_bp
-  if (!"end"   %in% names(cl) && "end_bp"   %in% names(cl)) cl$end   <- cl$end_bp
-  
-  shiny::validate(shiny::need(all(c("chr","start","end") %in% names(cl)),
-                              "clusters_cur() must contain chr/start/end (or compatible names)."))
-  
-  # stable export id (DO NOT change GTEx internal naming)
-  if ("cluster_chr_n" %in% names(cl) && any(nzchar(as.character(cl$cluster_chr_n)))) {
-    cl$cluster_id <- as.character(cl$cluster_chr_n)     # e.g. chr1_3
-  } else if ("cluster" %in% names(cl)) {
-    cl$cluster_id <- paste0("cluster_", as.integer(cl$cluster))
-  } else {
-    cl$cluster_id <- paste0("cluster_", seq_len(nrow(cl)))
-  }
-  
-  cl$chr   <- norm_chr_int(cl$chr)
-  cl$start <- suppressWarnings(as.integer(cl$start))
-  cl$end   <- suppressWarnings(as.integer(cl$end))
-  
-  cl <- cl[is.finite(cl$chr) & is.finite(cl$start) & is.finite(cl$end) & cl$end >= cl$start, , drop = FALSE]
-  shiny::validate(shiny::need(nrow(cl) > 0, "All clusters became invalid after coercion (chr/start/end)."))
-  
-  out <- cl[, c("cluster_id","chr","start","end")]
-  names(out) <- c("cluster_id","chr","cluster_start","cluster_end")
-  out
-}
-
-# ------------------------------------------------------------
-# B) CANDIDATES (canonical for LD module + export)
-#    returns: chr, pos_ini, pos_end, id_hit, classe
-# ------------------------------------------------------------
-build_ld_candidates_from_gtex_app <- function() {
-  
-  # ---------- GWAS candidates (hits_df) ----------
-  h <- tryCatch(hits_df(), error = function(e) NULL)
-  
-  if (is.null(h) || !is.data.frame(h) || nrow(h) == 0) {
-    gwas_cand <- data.frame(
-      chr = integer(), pos_ini = integer(), pos_end = integer(),
-      id_hit = character(), classe = character(),
-      stringsAsFactors = FALSE
-    )
-  } else {
-    shiny::validate(shiny::need(all(c("CHR","BP") %in% names(h)),
-                                "hits_df() must contain CHR and BP columns."))
-    
-    rsid <- if ("snp" %in% names(h)) as.character(h$snp) else NA_character_
-    rsid[is.na(rsid) | !nzchar(rsid)] <- paste0("chr", h$CHR, ":", h$BP)
-    
-    gwas_cand <- data.frame(
-      chr     = norm_chr_int(h$CHR),
-      pos_ini = suppressWarnings(as.integer(h$BP)),
-      pos_end = suppressWarnings(as.integer(h$BP)),
-      id_hit  = rsid,
-      classe  = "GWAS",
-      stringsAsFactors = FALSE
-    )
-  }
-  
-  # ---------- GTEx candidates (gtex_data) ----------
-  cd <- gtex_data()
-  shiny::validate(shiny::need(is.data.frame(cd) && nrow(cd) > 0,
-                              "No GTEx hits available (run Step 4: extract GTEx eQTLs)."))
-  
-  cd <- as.data.frame(cd)
-  
-  chr_col <- pick_first_col(cd, c("chr","CHR","chrom","chromosome"))
-  shiny::validate(shiny::need(!is.null(chr_col), "gtex_data() has no chromosome column (chr/CHR/...)."))
-  
-  start_col <- pick_first_col(cd, c("start","pos","POS","BP","bp","position","variant_pos","pos_ini"))
-  end_col   <- pick_first_col(cd, c("end","pos_end","bp_end"))
-  shiny::validate(shiny::need(!is.null(start_col) || !is.null(end_col),
-                              "gtex_data() has no position column (start/BP/POS/...)."))
-  
-  if (is.null(start_col)) start_col <- end_col
-  if (is.null(end_col))   end_col   <- start_col
-  
-  id_col <- pick_first_col(cd, c("variant_id","variant","snp","rsid","RSID","ID","id_hit"))
-  if (is.null(id_col)) {
-    id_col <- ".id_tmp"
-    cd[[id_col]] <- paste0("GTEx_chr", cd[[chr_col]], ":", cd[[start_col]], "-", cd[[end_col]])
-  }
-  
-  gtex_cand <- data.frame(
-    chr     = norm_chr_int(cd[[chr_col]]),
-    pos_ini = suppressWarnings(as.integer(cd[[start_col]])),
-    pos_end = suppressWarnings(as.integer(cd[[end_col]])),
-    id_hit  = as.character(cd[[id_col]]),
-    classe  = "GTEx_hit",
-    stringsAsFactors = FALSE
-  )
-  
-  # ---------- clean + combine ----------
-  candidate_csv <- rbind(gwas_cand, gtex_cand)
-  candidate_csv <- candidate_csv[
-    is.finite(candidate_csv$chr) &
-      is.finite(candidate_csv$pos_ini) &
-      is.finite(candidate_csv$pos_end) &
-      candidate_csv$pos_end >= candidate_csv$pos_ini &
-      !is.na(candidate_csv$id_hit) & nzchar(candidate_csv$id_hit),
-    , drop = FALSE
-  ]
-  
-  shiny::validate(shiny::need(nrow(candidate_csv) > 0, "No candidates available for LD."))
-  candidate_csv
-}
-
-# ============================================================
-# GTEx ZIP download (USES THE SAME BUILDERS)
-# ============================================================
-output$dl_candidates_zip <- downloadHandler(
-  filename = function() {
-    stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
-    
-    tag_txt <- tryCatch({
-      tg <- make_mode_thr_tag(input$cluster_method %||% "window", input$pthr, input$min_logp)
-      paste0(tg$mode_tag, "_thr", tg$thr_txt)
-    }, error = function(e) "run")
-    
-    paste0("gtex_candidates_", tag_txt, "_", stamp, ".zip")
-  },
-  
-  content = function(file) {
-    
-    # Build canonical objects (single source of truth)
-    cluster_csv   <- build_ld_clusters_from_gtex_app()
-    candidate_csv <- build_ld_candidates_from_gtex_app()
-    
-    # Write to temp folder and zip
-    tmpdir <- tempfile("gtex_export_")
-    dir.create(tmpdir, recursive = TRUE, showWarnings = FALSE)
-    
-    f1 <- file.path(tmpdir, "cluster_gtex.csv")
-    f2 <- file.path(tmpdir, "candidate_gtex.csv")
-    
-    utils::write.csv(cluster_csv,   f1, row.names = FALSE, quote = FALSE)
-    utils::write.csv(candidate_csv, f2, row.names = FALSE, quote = FALSE)
-    
-    old <- getwd()
-    on.exit(setwd(old), add = TRUE)
-    setwd(tmpdir)
-    
-    utils::zip(zipfile = file, files = c("cluster_gtex.csv", "candidate_gtex.csv"))
-  }
-)
-
-##############################################################################
-############################ LD Module  GTEX #################################
-##############################################################################
-# -----------------------------
-# LD PANEL
-# -----------------------------
-clusters_r <- reactive({
-  build_ld_clusters_from_gtex_app()
-})
-
-candidates_r <- reactive({
-  build_ld_candidates_from_gtex_app()
-})
-
-ld_module_server(
-  "ld",
-  clusters_r   = clusters_r,
-  candidates_r = candidates_r
-)
-
-# -----------------------------
-# Reset session (GTEx Inspector)
-# -----------------------------
-observeEvent(input$reset_case, {
-  # (A) Tanca modals si n'hi ha
-  removeModal()
-  
-  # (B) Neteja seleccions de DT (si existeixen)
-  for (id in c("hits_tbl", "cluster_dt", "gtex_table", "go_table", "kegg_table")) {
-    try(DT::selectRows(DT::dataTableProxy(id), NULL), silent = TRUE)
-  }
-  
-  # (C) Esborra fitxer temporal principal (selected_intervals.range)
-  # workdir existeix al teu codi (per-session)
-  if (exists("workdir", inherits = TRUE) && is.character(workdir) && dir.exists(workdir)) {
-    f_rng <- file.path(workdir, "selected_intervals.range")
-    if (file.exists(f_rng)) {
-      try(unlink(f_rng, force = TRUE), silent = TRUE)
-    }
-  }
-  
-  # (D) Reset del "core state" real (reactiveVal del teu GTEx)
-  intervals_raw(NULL)
-  clusters_cur(NULL)
-  ucsc_region(NULL)
-  window_selected(NULL)
-  
-  # GTEx hits + caches
-  gtex_hits_val(NULL)
-  gene_map_cache_ens(NULL)
-  gene_map_cache_map(NULL)
-  
-  # triggers d'enrichment
-  go_trigger(0L)
-  kegg_trigger(0L)
-  
-  # (E) Reset dels tracks UCSC (session$userData)
-  # (els fas servir per construir els links/track hubs)
-  session$userData$track_gwas_data <- tibble::tibble()
-  session$userData$track_gtex_data <- tibble::tibble()
-  
-  # (F) Reset inputs a valors per defecte (segurs: si algun ID no existeix, no peta)
-  safe <- function(expr) try(expr, silent = TRUE)
-  
-  safe(updateRadioButtons(session, "use_preloaded_catalog", selected = "new"))
-  safe(updateRadioButtons(session, "cluster_method", selected = "window"))
-  safe(updateSliderInput(session, "pthr", value = 5))
-  safe(updateSliderInput(session, "min_logp", value = 5))
-  safe(updateNumericInput(session, "flank", value = 10000))
-  safe(updateNumericInput(session, "min_hits", value = 3))
-  safe(updateNumericInput(session, "win_bp", value = 1000000))
-  safe(updateNumericInput(session, "step_bp", value = 250000))
-  
-  # (G) Feedback
-  showNotification("Reset done. Ready for a new case.", type = "message", duration = 2)
-}, ignoreInit = TRUE)
-
-
-
 }
 
 shinyApp(ui, server)

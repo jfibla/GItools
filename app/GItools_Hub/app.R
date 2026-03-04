@@ -1,4 +1,4 @@
-# /Volumes/DISK1TB/Inspector_app_slaves/GItools_Hub/app.R
+# /Volumes/DISK1TB/Inspector_app_slaves_ngroc/GItools/app/GItools_Hub/app.R
 #
 # to kill all processes and remove logs:
 #  pkill -f "shiny::runApp"
@@ -8,6 +8,12 @@
 # to run hub:
 # shiny::runApp("/Volumes/DISK1TB/Inspector_app_slaves_github/GItools/app/GItools_Hub",
 #              port=7101, host="127.0.0.1", launch.browser=TRUE)
+
+# sequencia d'arrancada:'
+# pkill -f "shiny::runApp"; pkill caddy; pkill ngrok
+# Rscript --vanilla /Volumes/DISK1TB/Inspector_app_slaves_ngroc/start_ALL_local.R
+# caddy run --config /Volumes/DISK1TB/Inspector_app_slaves_ngroc/Caddyfile
+# ngrok http 8080
 
 library(shiny)
 library(DT)
@@ -40,6 +46,7 @@ message("[hub] APPS_DIR contents: ", paste(list.files(APPS_DIR), collapse=", "))
 APP_PORT_BASE <- 7200 
 
 apps <- list(
+  hub     = list(name="🧭 GItools Hub",       dir=HUB_DIR,                           port=7101),
   catalog = list(name="📚 Catalog Inspector", dir=file.path(APPS_DIR, "Catalog_inspector"), port=APP_PORT_BASE + 1),
   gtex    = list(name="🧠 GTEx Inspector",    dir=file.path(APPS_DIR, "GTEX_inspector"),    port=APP_PORT_BASE + 2),
   nonsyn  = list(name="🧬 NonSyn Inspector",  dir=file.path(APPS_DIR, "NonSyn_Inspector"),  port=APP_PORT_BASE + 3),
@@ -52,6 +59,9 @@ apps <- list(
 # Logs (en temp por defecto, siempre escribible)
 LOG_DIR <- file.path(APPS_DIR, "_logs")   # -> GItools/app/_logs
 dir.create(LOG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+HUB_LOG <- file.path(LOG_DIR, "hub_actions.log")
+if (!file.exists(HUB_LOG)) file.create(HUB_LOG)
 
 hub_log <- function(...) {
   f <- file.path(LOG_DIR, "hub.log")
@@ -110,22 +120,6 @@ find_listen_pid <- function(port) {
 is_port_listening <- function(port) is.finite(find_listen_pid(port))
 
 # --- fast local curl status (quiet + short timeouts) ---
-http_statusXXXX <- function(url) {
-  if (!has_cmd("curl")) return(NA_integer_)
-  
-  args <- c(
-    "-s", "-o", "/dev/null",
-    "-w", "%{http_code}",
-    "--connect-timeout", "3",
-    "--max-time", "5",
-    url
-  )
-  out <- suppressWarnings(tryCatch(system2("curl", args, stdout = TRUE, stderr = TRUE),
-                                   error = function(e) ""))
-  
-  code <- suppressWarnings(as.integer(as.character(out[1] %||% "")))
-  if (!is.finite(code)) NA_integer_ else code
-}
 
 http_status_fast <- function(url) {
   if (!has_cmd("curl")) return(NA_integer_)
@@ -133,8 +127,8 @@ http_status_fast <- function(url) {
   args <- c(
     "-s", "-o", "/dev/null",
     "-w", "%{http_code}",
-    "--connect-timeout", "0.25",
-    "--max-time", "0.8",
+    "--connect-timeout", "1.5",
+    "--max-time", "3",
     url
   )
   out <- suppressWarnings(tryCatch(system2("curl", args, stdout = TRUE, stderr = TRUE),
@@ -142,6 +136,7 @@ http_status_fast <- function(url) {
   code <- suppressWarnings(as.integer(out[1] %||% ""))
   if (!is.finite(code)) NA_integer_ else code
 }
+
 
 read_pids <- function() {
   if (file.exists(PID_FILE)) {
@@ -181,9 +176,10 @@ start_app_bg <- function(key, app_dir, port, log_dir = NULL) {
   runner_txt <- c(
     "options(shiny.port = NULL)",
     "options(shiny.host = NULL)",
-    sprintf('Sys.setenv(GITOOLS_LOG_DIR = "%s")', gsub("\\\\", "/", log_dir)),  # opcional
+    sprintf('Sys.setenv(GITOOLS_LOG_DIR = "%s")', gsub("\\\\", "/", log_dir)),
+    sprintf('Sys.setenv(TMPDIR = "%s")', gsub("\\\\","/", file.path(log_dir, "tmp"))),
+    'dir.create(Sys.getenv("TMPDIR"), showWarnings=FALSE, recursive=TRUE)',
     sprintf("setwd(%s)", app_dir_q),
-    sprintf('cat("[runner] starting %s on port %d\\n")', key, port),
     sprintf('shiny::runApp(%s, port=%d, host="127.0.0.1", launch.browser=FALSE)', app_dir_q, port)
   )
   writeLines(runner_txt, runner)
@@ -224,6 +220,8 @@ open_many_js <- function(url_vec) {
               collapse = "")
   sprintf("<script>%s</script>", js)
 }
+
+
 
 ui <- fluidPage(
   tags$head(
@@ -269,6 +267,8 @@ ui <- fluidPage(
       actionButton("info_00", "ℹ️ GItools Hub help"),
      tags$hr(),
       uiOutput("open_buttons_ui"),
+    tags$hr(),
+    downloadButton("dl_example_zip", "⬇️ Download example files (zip)", style="width:50%; font-size:14px; padding:12px 14px;"),
 
       tags$hr(),
       tags$div(style="margin:6px 0; font-size:14px; color:#555;",
@@ -291,7 +291,9 @@ ui <- fluidPage(
       tags$hr(),
       tags$h4("Kill / Restart (one app)"),
       fluidRow(
-        column(4, selectInput("manage_app", "App", choices = names(apps), selected = "catalog")),
+        column(4, selectInput("manage_app", "App",
+                              choices  = setdiff(names(apps), "hub"),
+                              selected = "catalog")),
         column(
           8,
           actionButton("start_one", "Start", class="btn btn-success"),
@@ -328,28 +330,61 @@ server <- function(input, output, session) {
     sid(sid0)
   }, once = TRUE)
   
-#  urls_ui <- reactive({
-#    s <- sid()
-#    list(
-#      catalog = paste0("/catalog/?sid=", s),
-#      gtex    = paste0("/gtex/?sid=", s),
-#      nonsyn  = paste0("/nonsyn/?sid=", s),
-#      ewastum = paste0("/ewastum/?sid=", s),
-#      ewasdis = paste0("/ewasdis/?sid=", s),
-#      ld      = paste0("/ld/?sid=", s)
-#    )
-#  })
+
+  # ------------------------------------------------------------
+  # NGROK-aware URL builder (falls back to localhost)
+  # Expects a JSON file written by start_ALL_local.R --ngrok:
+  #   { "7101":"https://....", "7201":"https://....", ... }
+  # Env vars:
+  #   GITOOLS_URL_MODE="ngrok" (optional)
+  #   GITOOLS_NGROK_URLS_FILE="/path/to/ngrok_urls.json"
+  # ------------------------------------------------------------
   
+  read_ngrok_urls <- function() {
+    f <- Sys.getenv("GITOOLS_NGROK_URLS_FILE", unset = "")
+    if (!nzchar(f) || !file.exists(f)) return(list())
+    txt <- tryCatch(paste(readLines(f, warn = FALSE), collapse = "\n"), error = function(e) "")
+    if (!nzchar(txt)) return(list())
+    
+    # Minimal JSON parser (no jsonlite dependency)
+    # Extract "port":"url" pairs
+    m <- gregexpr('"[0-9]+"\\s*:\\s*"[^"]+"', txt, perl = TRUE)
+    hits <- regmatches(txt, m)[[1]]
+    if (!length(hits)) return(list())
+    
+    out <- list()
+    for (h in hits) {
+      # h like: "7201": "https://xxxx.ngrok-free.app"
+      port <- sub('^"([0-9]+)".*$', "\\1", h)
+      url  <- sub('^"[0-9]+"\\s*:\\s*"([^"]+)".*$', "\\1", h)
+      if (nzchar(port) && nzchar(url)) out[[port]] <- url
+    }
+    out
+  }
+  
+  base_url_for_port <- function(port) {
+    port <- as.integer(port)
+    mode <- Sys.getenv("GITOOLS_URL_MODE", unset = "")
+    ng   <- read_ngrok_urls()
+    
+    # Use ngrok if mode says so OR if mapping exists
+    if ((identical(tolower(mode), "ngrok") || length(ng)) && length(ng)) {
+      u <- ng[[as.character(port)]] %||% ""
+      if (nzchar(u)) return(u)
+    }
+    sprintf("http://127.0.0.1:%d", port)
+  }
+ 
   urls_ui <- reactive({
     s <- sid()
     
     list(
-      catalog = sprintf("http://127.0.0.1:%d/?sid=%s", apps$catalog$port, s),
-      gtex    = sprintf("http://127.0.0.1:%d/?sid=%s", apps$gtex$port,    s),
-      nonsyn  = sprintf("http://127.0.0.1:%d/?sid=%s", apps$nonsyn$port,  s),
-      ewastum = sprintf("http://127.0.0.1:%d/?sid=%s", apps$ewastum$port, s),
-      ewasdis = sprintf("http://127.0.0.1:%d/?sid=%s", apps$ewasdis$port, s),
-      ld      = sprintf("http://127.0.0.1:%d/?sid=%s", apps$ld$port,      s)
+      catalog = paste0(base_url_for_port(apps$catalog$port), "/?sid=", s),
+      gtex    = paste0(base_url_for_port(apps$gtex$port),    "/?sid=", s),
+      nonsyn  = paste0(base_url_for_port(apps$nonsyn$port),  "/?sid=", s),
+      ewastum = paste0(base_url_for_port(apps$ewastum$port), "/?sid=", s),
+      ewasdis = paste0(base_url_for_port(apps$ewasdis$port), "/?sid=", s),
+      ld      = paste0(base_url_for_port(apps$ld$port),      "/?sid=", s)
     )
   })
   
@@ -367,9 +402,13 @@ server <- function(input, output, session) {
       "Rscript used: ", RSCRIPT, " (exists=", file.exists(RSCRIPT), ")\n",
       "curl: ", Sys.which("curl"), "\n",
       "lsof: ", Sys.which("lsof"), "\n",
-      "kill: ", Sys.which("kill"), "\n"
+      "kill: ", Sys.which("kill"), "\n",
+      "URL_MODE: ", Sys.getenv("GITOOLS_URL_MODE"), "\n",
+      "NGROK_URLS_FILE: ", Sys.getenv("GITOOLS_NGROK_URLS_FILE"), " (exists=",
+      file.exists(Sys.getenv("GITOOLS_NGROK_URLS_FILE", "")), ")\n"
     )
   })
+  
   
   # ✅ This controls the banner closing exactly when open_buttons_ui is rendered
   banner_hidden <- reactiveVal(FALSE)
@@ -382,13 +421,14 @@ server <- function(input, output, session) {
     
     tagList(
       tags$a("📚 Catalog (MASTER)", href=u$catalog, target="_blank", class="btn btn-primary", style=btn_style),
-      tags$a("🧠 GTEx (SLAVE)",     href=u$gtex,    target="_blank", class="btn btn-primary", style=btn_style),
-      tags$a("🧬 NonSyn (SLAVE)",   href=u$nonsyn,  target="_blank", class="btn btn-primary", style=btn_style),
+      tags$a("🧠 GTEx (SLAVE)",     href=u$gtex,    target="_blank", class="btn btn-success", style=btn_style),
+      tags$a("🧬 NonSyn (SLAVE)",   href=u$nonsyn,  target="_blank", class="btn btn-success", style=btn_style),
       tags$a("🧪 EWASDis (SLAVE)",  href=u$ewasdis, target="_blank", class="btn btn-success", style=btn_style),
       tags$a("🧫 EWAStum (SLAVE)",  href=u$ewastum, target="_blank", class="btn btn-success", style=btn_style),
       tags$a("🔗 LD",              href=u$ld,      target="_blank", class="btn btn-warning", style=btn_style)
     )
   })
+  
   # --- Status computation (light + stable) ---
   compute_status <- function() {
     rows <- lapply(names(apps), function(key) {
@@ -435,11 +475,12 @@ server <- function(input, output, session) {
   
   output$status_table <- renderDT({
     df <- rv$last_status
+    
     if (is.null(df)) {
       df <- tryCatch(compute_status(), error = function(e) {
         data.frame(
           app = names(apps),
-          url = vapply(apps, function(x) sprintf("http://127.0.0.1:%d/", x$port), ""),
+          url = vapply(apps, function(x) paste0(base_url_for_port(x$port), "/"), ""),
           port = vapply(apps, `[[`, 0L, "port"),
           http_code = 0L,
           status = paste0("ERR: ", conditionMessage(e)),
@@ -450,17 +491,30 @@ server <- function(input, output, session) {
       })
     }
     
+    # Make URL clickable (absolute, works for localhost + ngrok)
+    df$url_link <- vapply(df$url, function(u) {
+      as.character(htmltools::tags$a(href = u, target = "_blank", u))
+    }, character(1))
     
-    datatable(df, rownames = FALSE, selection = "none",
-              options = list(pageLength = 10, scrollX = TRUE)) %>%
+    # Show url_link instead of raw url
+    df$url <- NULL
+    
+    datatable(
+      df,
+      rownames = FALSE,
+      selection = "none",
+      escape = FALSE,  # IMPORTANT: render <a href=...>
+      options = list(pageLength = 10, scrollX = TRUE)
+    ) %>%
       formatStyle(
-        "status", target="row",
+        "status", target = "row",
         backgroundColor = styleEqual(
-          c("UP","STARTING","DOWN"),
-          c("#e7f7ee","#fff7e6","#fdecea")
+          c("UP", "STARTING", "DOWN"),
+          c("#e7f7ee", "#fff7e6", "#fdecea")
         )
       )
   })
+  
   
   # light polling (avoid heavy loops over ngrok)
   observe({
@@ -599,7 +653,7 @@ server <- function(input, output, session) {
     msgs <- character(0)
     
     withProgress(message = "Starting apps…", value = 0, {
-      keys <- names(apps)
+      keys <- setdiff(names(apps), "hub")
       n <- length(keys)
       
       for (i in seq_along(keys)) {
@@ -641,13 +695,19 @@ server <- function(input, output, session) {
   }, ignoreInit = TRUE)
   
   observeEvent(input$kill_all, {
-    for (key in names(apps)) {
+    
+    keys <- setdiff(names(apps), "hub")  # <-- IMPORTANT: no matar el hub
+    
+    for (key in keys) {
       info <- apps[[key]]
       kill_by_port(info$port)
       rv$starting[[key]] <- NULL
     }
-    rv$manage_msg <- "[ALL] kill_all executed."
+    
+    rv$manage_msg  <- "[ALL] kill_all executed (hub preserved)."
     rv$last_status <- compute_status()
+    
+    showNotification("Killed all slave apps (Hub stays running).", type="message", duration=3)
   }, ignoreInit = TRUE)
   
   output$manage_out <- renderText(rv$manage_msg)
@@ -670,7 +730,15 @@ server <- function(input, output, session) {
         " (master) and reuse them across the other GItools apps (slaves)."
       ),
       
+      tags$div(
+        style = "text-align:center; margin:10px 0 14px 0;",
+        tags$img(
+          src = "gi_tools_ideogram.png",   # fitxer dins www/
+          style = "max-width:100%; width:900px; height:auto; border:1px solid #e5e5e5; border-radius:10px;"
+        )
+      ),
       tags$hr(),
+      
       
       tags$h4("1) Start with Catalog Inspector (Master)"),
       tags$ol(
@@ -823,7 +891,16 @@ server <- function(input, output, session) {
     
   }, ignoreInit = TRUE)
   
-  
+  output$dl_example_zip <- downloadHandler(
+    filename = function() {
+      paste0("gitools_example_files_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".zip")
+    },
+    content = function(file) {
+      src <- file.path(APPS_DIR, "GItools_Hub", "www", "example_files.zip")
+      if (!file.exists(src)) stop("Example file not found: ", src)
+      file.copy(src, file, overwrite = TRUE)
+    }
+  )
   
 }
 
