@@ -31,14 +31,14 @@ Across all GItools applications, the workflow is intentionally consistent.
 ### 1. Input hits
 - GWAS hits (SNPs with p-values, −log10(p), rsID, genomic position)
 - EWAS results (CpGs or bins with statistics and metadata)
-- Prioritized variants (e.g. NonSyn / dbNSFP-derived annotations)
+- Prioritized variants (e.g., NonSyn / dbNSFP-derived annotations)
 
 ### 2. Threshold / selection
 - Filter by p-value, FDR, −log10(FDR), or module-specific criteria  
 - The selected threshold defines the **active hit set**
 
 ### 3. Build intervals
-- Create genomic intervals per hit (e.g. hit ± flank)  
+- Create genomic intervals per hit (e.g., hit ± flank)  
 - Or window-based intervals
 
 ### 4. Merge intervals into clusters
@@ -71,12 +71,21 @@ Intersect and map items falling inside each cluster:
 
 ## Included tools
 
+### GItools Hub
+The Hub is the entry point to orchestrate and synchronize all inspectors.
+
+**Features**
+- Launch and monitor inspectors
+- Deep links between apps (cluster → app → region)
+- Shared canonical state and cluster propagation
+
+---
+
 ### Catalog Inspector
 Connects GWAS hits with evidence from the GWAS Catalog.
 
-**Pipeline**
+**Pipeline**  
 threshold → intervals → clusters → map GWAS Catalog entries
-
 
 **Outputs**
 - Cluster summary (`n_catalog`)
@@ -88,9 +97,8 @@ threshold → intervals → clusters → map GWAS Catalog entries
 ### GTEx eQTL Inspector
 Links GWAS hits to GTEx eQTLs for tissue-aware functional interpretation.
 
-**Pipeline**
+**Pipeline**  
 threshold → intervals → clusters → map eQTLs per cluster
-
 
 **Outputs**
 - Cluster summary (`n_gtex`)
@@ -102,9 +110,8 @@ threshold → intervals → clusters → map eQTLs per cluster
 ### EWAS Tumor Inspector
 Tumor vs control (or adjacent normal) methylation analysis.
 
-**Pipeline**
+**Pipeline**  
 group definition → statistical testing → FDR → regional exploration
-
 
 **Outputs**
 - Genome-wide and regional summaries
@@ -116,9 +123,8 @@ group definition → statistical testing → FDR → regional exploration
 ### EWAS Disease Inspector
 Disease-focused EWAS exploration using the same region-centric logic.
 
-**Pipeline**
+**Pipeline**  
 filter by disease → threshold → map hits to regions/windows
-
 
 **Outputs**
 - Disease-specific tables and plots
@@ -129,9 +135,8 @@ filter by disease → threshold → map hits to regions/windows
 ### NonSyn Inspector
 Prioritization of nonsynonymous and functionally relevant variants.
 
-**Pipeline**
+**Pipeline**  
 threshold → intervals → clusters → map NonSyn variants + annotations
-
 
 **Outputs**
 - Cluster summary (`n_nonsyn`)
@@ -141,39 +146,65 @@ threshold → intervals → clusters → map NonSyn variants + annotations
 ---
 
 ### LD Inspector
-Exploration of linkage disequilibrium and haplotype structure.
+Exploration of linkage disequilibrium and haplotype structure aligned to clusters.
 
 **Outputs**
 - LD matrices and blocks
 - Regional LD visualization aligned to clusters
+- Cluster-aware regional LD context for follow-up interpretation
+
+---
+
+## Enrichment (GO / KEGG / GO Slim)
+
+GItools includes enrichment modules to summarize biological meaning from genes mapped to hits, intervals, or clusters.  
+Depending on the inspector and the selected scope, enrichment can be computed on:
+
+- **Per-cluster gene sets** (cluster-centric interpretation)
+- **Union of active clusters** (global interpretation for a chosen threshold)
+- **Module-specific subsets** (e.g., filtered by tissue/disease/variant class)
+
+Supported enrichment types (where applicable):
+- **GO enrichment**: BP / CC / MF
+- **KEGG pathway enrichment**
+- **GO Slim (generic)**: reduced GO terms for high-level interpretation
+
+Typical outputs:
+- Ranked enrichment tables (p-value / FDR)
+- Barplots / dotplots (interactive when available)
+- Exportable results (CSV/TSV) and reproducible parameters
+
+> Notes  
+> - If no terms pass the selected FDR cutoff, inspectors may show a **fallback view** (e.g., top terms ranked by FDR/p-value) to avoid empty plots/tables.  
+> - Enrichment depends on the organism/background configured in the inspector resources.
 
 ---
 
 ## Shared UI / UX patterns
 
-- **Interactive tables (DT)**  
-  Column filters, row selection, plot cross-highlighting
-
-- **Interactive plots (Plotly)**  
-  Manhattan-style views, interval/cluster tracks, regional zoom
-
-- **Traceability**  
-  On-screen logs for data loading and heavy operations
-
-- **Large data handling**  
-  Per-chromosome storage, `.rda` preloading, configurable resource paths
+- **Interactive tables (DT)**: filtering, selection, cross-highlighting  
+- **Interactive plots (Plotly)**: Manhattan-style views, regional zoom, cluster tracks  
+- **Cross-app continuity**: the same cluster coordinates drive multiple inspectors  
+- **Traceability**: on-screen logs for loading and heavy operations  
+- **Performance-aware**: per-chromosome resources, caching/preloading, configurable paths  
+- **Export-first mindset**: consistent file naming and ZIP bundles for sharing results  
 
 ---
 
 ## Repository layout (typical)
 
-app.R
-R/
-modules/
-helpers/
-www/
-icons/
-css/
+config.R
+app/
+ GItools_Hub/
+ Catalog_inspector/
+ GTEX_inspector/
+ NonSyn_Inspector/
+ EWAS_cancer/
+ EWAS_disease/
+ LD_Inspector/
+ _logs/
+docs/
+scripts/
 example_files/
 
 
@@ -181,23 +212,228 @@ example_files/
 
 ---
 
-## Run locally
+## Requirements
 
-1. Clone the repository
-2. Download **Inspector resources** folder from dropbox (see Inspector resources/readme.md)
-3. Open the project in RStudio
-4. Install required CRAN / Bioconductor dependencies
-5. Run:
+- **R ≥ 4.2**
+- Recommended: **RStudio**
+- System tools used by helper scripts:
+  - `lsof` (port detection / stop by port)
+  - `curl` (fast HTTP checks)
+  - Optional: `ngrok` (public tunneling)
 
-```r
-shiny::runApp()
-Some inspectors rely on GB-scale external resources.
-For these, running GItools on a local VM or Shiny Server is recommended.
+Some inspectors rely on **GB-scale external resources**.  
+For these, running GItools on a local workstation, VM, or Shiny Server is recommended.
 
-Data sources and licensing
+---
+
+## Quick start (recommended): Hub + all inspectors
+
+From the **repository root**:
+
+### Start everything
+```bash
+Rscript --vanilla scripts/start_ALL_local.R
+
+This starts all inspectors in the background and then the GItools Hub.
+
+Default ports:
+
+Hub: 7101
+
+Inspectors: 7201–7206
+
+Open:
+
+Hub: http://127.0.0.1:7101/
+
+Stop everything
+Rscript --vanilla scripts/STOP_ALL_local.R
+
+Optional flags:
+
+Rscript --vanilla scripts/STOP_ALL_local.R --kill-ngrok
+Rscript --vanilla scripts/STOP_ALL_local.R --clean-logs
+Rscript --vanilla scripts/STOP_ALL_local.R --ports=7101,7201,7202,7203,7204,7205,7206
+Optional: start with ngrok tunnels
+Rscript --vanilla scripts/start_ALL_local.R --ngrok
+
+This writes:
+
+app/_logs/ngrok_urls.json
+
+app/_logs/ngrok.log
+
+If your Hub is configured to read ngrok URLs, it can render remote-ready links.
+
+Run a single inspector (developer mode)
+
+Example:
+
+shiny::runApp("app/Catalog_inspector", launch.browser = TRUE)
+
+Or run the Hub alone:
+
+shiny::runApp("app/GItools_Hub", launch.browser = TRUE)
+External resources
+
 GItools provides the analysis framework only.
-External datasets (GWAS Catalog, GTEx, dbNSFP, EWAS cohorts, etc.) have their own licenses and citation requirements.
-Users are responsible for compliance with the relevant terms.
+External datasets (GWAS Catalog, GTEx, dbNSFP, EWAS cohorts, LD references, etc.) have their own licenses and citation requirements.
+
+If your deployment requires downloading large resources (e.g., Inspector_resources/), see the corresponding documentation under:
+
+docs/ or app/Inspector_resources/ (depending on your setup)
 
 Project goal
-GItools accelerates genomic interpretation by converting lists of hits into candidate genomic regions and attaching multiple layers of biological evidence in a consistent, reproducible, and exportable way — supporting prioritization and downstream functional follow-up.
+
+GItools accelerates genomic interpretation by converting lists of hits into candidate genomic regions and attaching multiple layers of biological evidence in a consistent, reproducible, and exportable way—supporting prioritization and downstream functional follow-up.
+
+## Troubleshooting
+
+### 1) “Port already in use” / apps won’t start
+Symptoms:
+- `Listening on http://127.0.0.1:720X` never appears
+- `address already in use`
+- Hub starts but one inspector is missing
+
+Fix:
+1. Stop everything:
+```bash
+Rscript --vanilla scripts/STOP_ALL_local.R
+
+If a port is still busy, manually check who owns it:
+
+lsof -nP -iTCP:7201 -sTCP:LISTEN
+
+Kill the PID if needed:
+
+kill -TERM <PID>
+kill -KILL <PID>
+
+Tip: you can explicitly stop the default set of ports:
+
+Rscript --vanilla scripts/STOP_ALL_local.R --ports=7101,7201,7202,7203,7204,7205,7206
+2) Hub links open but inspectors don’t sync (or open wrong context)
+
+Most common causes:
+
+Inspectors started outside the repo context (missing config.R / gi_cfg() paths)
+
+Mixed sessions from previous runs still alive
+
+Fix:
+
+Always start via:
+
+Rscript --vanilla scripts/start_ALL_local.R
+
+Check logs under:
+
+app/_logs/hub.log
+
+app/_logs/gitools_*.err.log
+
+3) Missing packages (CRAN/Bioconductor) or enrichment packages not found
+
+Symptoms:
+
+there is no package called ...
+
+Enrichment tabs show errors (GO/KEGG)
+
+Fix:
+
+Install CRAN deps normally:
+
+install.packages(c("data.table","dplyr","DT","plotly","bslib","htmltools"))
+
+Install Bioconductor deps (commonly needed for enrichment):
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("clusterProfiler","enrichplot","org.Hs.eg.db","AnnotationDbi"))
+
+Notes:
+
+Some inspectors may require additional organism DBs (e.g., org.Mm.eg.db) depending on configuration.
+
+KEGG may require internet access at runtime for annotation retrieval, depending on your pipeline.
+
+4) External resources not found (GB-scale datasets)
+
+Symptoms:
+
+Warnings/errors about missing .rda, .rds, .tsv, reference panels, GTEx bundles, dbNSFP outputs, etc.
+
+Tabs load but tables are empty
+
+Fix:
+
+Ensure your external resource folder is present and matches your config.R / gi_cfg() configuration.
+
+Re-check paths resolved by gi_cfg() (typical variables: repo root, shared resources, inspector resources).
+
+Tip:
+
+Many inspectors can run in a “light” mode with example files, but enrichment/annotation requires full resources.
+
+5) Enrichment returns empty results (no significant terms)
+
+Common reasons:
+
+Very small gene set (few genes mapped)
+
+Very stringent cutoff (e.g., FDR ≤ 0.01)
+
+Background universe mismatch (wrong organism DB)
+
+Fix:
+
+Increase gene set size (use union of clusters, expand flank, or lower hit threshold)
+
+Relax cutoff (e.g., FDR ≤ 0.1)
+
+Confirm organism/background in the inspector configuration
+
+Use GO Slim to get higher-level terms when GO is sparse
+
+6) ngrok started but URLs are not detected
+
+Symptoms:
+
+--ngrok runs, but ngrok_urls.json is empty or missing
+
+Fix:
+
+Ensure ngrok is installed and in PATH:
+
+which ngrok
+
+Check:
+
+app/_logs/ngrok.log
+
+Make sure ngrok agent API is available:
+
+http://127.0.0.1:4040/api/tunnels
+
+Stop ngrok:
+
+Rscript --vanilla scripts/STOP_ALL_local.R --kill-ngrok
+7) Logs and where to look first
+
+Hub:
+
+app/_logs/hub.log
+
+Per app:
+
+app/_logs/gitools_<PORT>.out.log
+
+app/_logs/gitools_<PORT>.err.log
+
+Launcher console capture:
+
+app/_logs/start_all_console.log
+
+If something fails to start, the first file to open is:
+
+app/_logs/gitools_<PORT>.err.log
