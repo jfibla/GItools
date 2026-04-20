@@ -278,18 +278,6 @@ Outputs:
 ## Repository layout
 config.R
 app/
- GItools_Hub/
- Catalog_inspector/
- GTEX_inspector/
- NonSyn_Inspector/
- EWAS_cancer/
- EWAS_disease/
- LD_Inspector/
- _logs/
-=======
-
-config.R
-app/
 GItools_Hub/
 Catalog_inspector/
 GTEX_inspector/
