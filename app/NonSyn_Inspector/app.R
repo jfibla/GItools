@@ -429,6 +429,65 @@ add_cluster_stats_from_hits <- function(clusters_df, df_sig) {
   as.data.frame(cl)
 }
 
+# =============================================================================
+# helper Integrator
+# =============================================================================
+
+chr_map_integrator <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- sub("^CHR", "", x)
+  x[x == "X"] <- "23"
+  x[x == "Y"] <- "24"
+  x[x %in% c("MT", "M", "MTDNA")] <- "26"
+  suppressWarnings(as.integer(x))
+}
+
+norm_int <- function(x) {
+  suppressWarnings(as.integer(readr::parse_number(as.character(x))))
+}
+
+sanitize_bridge <- function(df) {
+  if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+  
+  df[] <- lapply(df, function(x) {
+    if (is.factor(x)) as.character(x) else x
+  })
+  
+  if ("chr" %in% names(df))   df$chr   <- chr_map_integrator(df$chr)
+  if ("start" %in% names(df)) df$start <- norm_int(df$start)
+  if ("end" %in% names(df))   df$end   <- norm_int(df$end)
+  
+  if ("start" %in% names(df) && "end" %in% names(df)) {
+    s0 <- df$start
+    e0 <- df$end
+    df$start <- pmin(s0, e0, na.rm = FALSE)
+    df$end   <- pmax(s0, e0, na.rm = FALSE)
+  }
+  
+  df
+}
+
+sanitize_bridge_genes <- function(df) {
+  if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+  if (!"gene" %in% names(df)) return(df)
+  
+  df %>%
+    dplyr::mutate(
+      gene = as.character(gene),
+      gene = trimws(gene)
+    ) %>%
+    tidyr::separate_rows(gene, sep = "\\s*;\\s*|\\s+-\\s+") %>%
+    dplyr::mutate(
+      gene = trimws(gene)
+    ) %>%
+    dplyr::filter(
+      !is.na(gene),
+      nzchar(gene),
+      tolower(gene) != "numeric",
+      !grepl("^[0-9]+$", gene)
+    ) %>%
+    dplyr::distinct()
+}
 ##############################################
 
 # hg38 chromosome lengths for cumulative positions
@@ -599,70 +658,6 @@ make_mode_thr_tag <- function(method, pthr, min_logp) {
 # -----------------------------
 # Helpers clustering methods
 # -----------------------------
-merge_significant_windowsXXXXXX <- function(win_df, gap_bp = 0L) {
-  library(data.table)
-  
-  # gap segur
-  gap_bp <- as.integer(gap_bp)
-  if (is.na(gap_bp)) gap_bp <- 0L
-  
-  dt <- as.data.table(win_df)
-  
-  # assegura columnes
-  stopifnot(all(c("chr","start","end") %in% names(dt)))
-  
-  # tipus + neteja NA
-  dt[, chr   := as.integer(chr)]
-  dt[, start := as.integer(start)]
-  dt[, end   := as.integer(end)]
-  dt <- dt[!is.na(chr) & !is.na(start) & !is.na(end)]
-  
-  # si no hi ha res, retorna buit
-  if (nrow(dt) == 0) return(as.data.frame(dt))
-  
-  setorder(dt, chr, start, end)
-  
-  merged <- dt[, {
-    # casos trivials
-    if (.N == 1L) {
-      data.table(start = start[1], end = end[1])
-    } else {
-      out_s <- integer()
-      out_e <- integer()
-      
-      cur_s <- start[1]
-      cur_e <- end[1]
-      
-      # només iterar si hi ha 2 o més files
-      for (i in 2L:.N) {
-        s <- start[i]
-        e <- end[i]
-        
-        # si per algun motiu hi ha NA, salta
-        if (is.na(s) || is.na(e) || is.na(cur_e)) next
-        
-        if (s <= (cur_e + gap_bp + 1L)) {
-          cur_e <- max(cur_e, e, na.rm = TRUE)
-        } else {
-          out_s <- c(out_s, cur_s)
-          out_e <- c(out_e, cur_e)
-          cur_s <- s
-          cur_e <- e
-        }
-      }
-      # tanca últim
-      out_s <- c(out_s, cur_s)
-      out_e <- c(out_e, cur_e)
-      
-      data.table(start = out_s, end = out_e)
-    }
-  }, by = chr]
-  
-  merged[, center := as.integer(round((start + end) / 2))]
-  merged[, cluster_size_kb := round((end - start) / 1000, 2)]
-  
-  as.data.frame(merged)
-}
 
 make_windows_dt <- function(chr_lengths, win_bp, step_bp) {
   library(data.table)
@@ -867,6 +862,51 @@ pick_first_col <- function(df, candidates) {
   for (nm in candidates) if (nm %in% names(df)) return(nm)
   NULL
 }
+
+##############################################################################
+slave_master_settings_text <- function(state_obj) {
+  if (is.null(state_obj) || !is.list(state_obj)) {
+    return("Master settings: not available")
+  }
+  
+  fmt <- function(x) {
+    if (is.null(x) || length(x) == 0) return("<empty>")
+    x <- unlist(x, use.names = FALSE)
+    x <- as.character(x)
+    x <- x[!is.na(x)]
+    if (!length(x)) return("<empty>")
+    paste(x, collapse = " | ")
+  }
+  
+  labels <- c(
+    sid = "Session ID",
+    updated_at = "Updated at",
+    cluster_method = "Cluster method",
+    hits_mode = "Hits mode",
+    thr_value = "Threshold value",
+    flank_bp = "Flank (bp)",
+    min_hits = "Minimum hits",
+    win_bp = "Window size (bp)",
+    step_bp = "Step size (bp)",
+    has_gwas = "GWAS loaded",
+    has_clusters = "Clusters available"
+  )
+  
+  present <- names(labels)[names(labels) %in% names(state_obj)]
+  
+  if (!length(present)) {
+    return("Master settings: no known fields found")
+  }
+  
+  paste(
+    vapply(
+      present,
+      function(nm) paste0(labels[[nm]], ": ", fmt(state_obj[[nm]])),
+      character(1)
+    ),
+    collapse = "\n"
+  )
+}
 ##############################################################################
 ############################# UI #############################################
 ##############################################################################
@@ -953,166 +993,162 @@ ui <- navbarPage(
       sidebarPanel(
         width = 3,
         
-        h4("Select analysis mode",
-           style = "color:#1A4E8A; font-size:22px; font-weight:700;"),
-        
-        radioButtons(
-          "use_preloaded_dbnsfp",
-          "",
-          c(
-            "🧪 Perform a new analysis (run steps 1–3)" = "new",
-            "🧾 Analyze a precomputed dbNSFP output file (skip steps 2–3)" = "old"
-          ),
-          selected = "new"
-        ),
-        
-        tags$hr(),
-        
-        h3("Step 1 · Load GWAS hits",
-           style = "color:#1A4E8A; font-size:22px; font-weight:700;"),
-        
-        fluidRow(
-          column(6, actionButton("info_00", "ℹ️ file format")),
-          column(6, actionButton(
-            "reset_case", "Reset",
-            icon = icon("rotate-left"),
-            class = "btn-warning"
-          ))
-        ),
-        
-        fileInput(
-          "gwas_file",
-          "GWAS p-value table (TSV/CSV)",
-          accept = c(".tsv", ".txt", ".csv")
-        ),
-        
-        checkboxInput("gwas_header", "First row contains column names", TRUE),
-        
-        radioButtons(
-          "gwas_sep",
-          "Separator",
-          c("Tab \\t" = "\t", "Comma ," = ",", "Semicolon ;" = ";"),
-          selected = "\t"
-        ),
-        
-        uiOutput("gwas_p_selector"),
-        
-        tags$hr(),
-        
         conditionalPanel(
-          condition = "input.use_preloaded_dbnsfp == 'old'",
-          fileInput(
-            "dbnsfp_preload",
-            "Load dbNSFP output file (CSV or RDS)",
-            accept = c(".csv", ".rds")
+          condition = "output.hub_mode == 'true'",
+          div(
+            style = "background:#fff3cd; border:1px solid #ffeeba; padding:10px; border-radius:10px; margin-bottom:10px;",
+            HTML("<b>Hub mode</b><br>
+         Inputs and clustering synchronized from the <b>Catalog Inspector</b>.<br>
+         To change parameters (filtering, clustering, thresholds…), go back to the <b>Catalog Inspector</b> and re-sync.")
+          ),
+          div(
+            class = "panelGrey",
+            tags$b("Master session settings"),
+            verbatimTextOutput("master_session_status")
           )
         ),
         
+        # Hide ONLY Step 1 + Step 2 when everything comes from Hub
         conditionalPanel(
-          condition = "input.use_preloaded_dbnsfp == 'new'",
-          tagList(
-            
-            h3("Step 2 · Clustering GWAS hits",
-               style = "color:#1A4E8A; font-size:22px; font-weight:700; margin-top:10px;"),
-            actionButton("info_01", "ℹ️ Clustering method", class = "btn btn-default"),
+          condition = "output.hub_mode == 'false'",
+          
+          # -----------------------------
+          # Step 1 · Load GWAS hits
+          # -----------------------------
+          h3("Step 1 · Load GWAS hits",
+             style = "color:#1A4E8A; font-size:22px; font-weight:700;"),
+          
+          fluidRow(
+            column(6, actionButton("info_00", "ℹ️ file format")),
+            column(6, actionButton(
+              "reset_case", "Reset",
+              icon = icon("rotate-left"),
+              class = "btn-warning"
+            ))
+          ),
+          
+          fileInput(
+            "gwas_file",
+            "GWAS p-value table (TSV/CSV)",
+            accept = c(".tsv", ".txt", ".csv")
+          ),
+          
+          checkboxInput("gwas_header", "First row contains column names", TRUE),
+          
+          radioButtons(
+            "gwas_sep",
+            "Separator",
+            c("Tab \\t" = "\t", "Comma ," = ",", "Semicolon ;" = ";"),
+            selected = "\t"
+          ),
+          
+          uiOutput("gwas_p_selector"),
+          tags$hr(),
+          
+          # -----------------------------
+          # Step 2 · Clustering
+          # -----------------------------
+          h3("Step 2 · Clustering GWAS hits",
+             style = "color:#1A4E8A; font-size:22px; font-weight:700; margin-top:10px;"),
+          actionButton("info_01", "ℹ️ Clustering method", class = "btn btn-default"),
+          
+          radioButtons(
+            "cluster_method",
+            "Clustering method:",
+            choices  = c(
+              "By hit intervals (thr + flank → merge)" = "window",
+              "By hit density (min_logp + min_hits)"   = "hits"
+            ),
+            selected = "window"
+          ),
+          
+          conditionalPanel(
+            condition = "input.cluster_method == 'window'",
+            sliderInput("pthr", "-log10(P) threshold", min = 2, max = 20, value = 8, step = 0.5),
+            numericInput("flank", "Flank (+/- bp)", value = 10000, min = 0, max = 10000000, step = 1000)
+          ),
+          
+          conditionalPanel(
+            condition = "input.cluster_method == 'hits'",
             
             radioButtons(
-              "cluster_method",
-              "Clustering method:",
-              choices  = c(
-                "By hit intervals (thr + flank → merge)" = "window",
-                "By hit density (min_logp + min_hits)"   = "hits"
+              "hits_mode", "Hits mode:",
+              choices = c(
+                "1Mb hit-span (consecutive hits within 1Mb)" = "span1mb",
+                "Tiled windows (non-overlapping)"            = "tiled",
+                "Sliding windows (overlapping)"              = "sliding"
               ),
-              selected = "window"
+              selected = "span1mb"
+            ),
+            
+            sliderInput(
+              "min_logp",
+              "-log10(P) threshold (hit significance)",
+              min = 2, max = 20, value = 8, step = 0.5
+            ),
+            
+            numericInput(
+              "min_hits",
+              "Minimum GWAS hits per cluster/window",
+              value = 3, min = 1, max = 1000, step = 1
+            ),
+            
+            numericInput(
+              "win_bp",
+              "Window size (bp)",
+              value = 1e6, min = 1e4, max = 5e7, step = 1e4
             ),
             
             conditionalPanel(
-              condition = "input.cluster_method == 'window'",
-              sliderInput("pthr", "-log10(P) threshold", min = 2, max = 20, value = 8, step = 0.5),
-              numericInput("flank", "Flank (+/- bp)", value = 10000, min = 0, max = 10000000, step = 1000)
+              condition = "input.hits_mode == 'sliding'",
+              numericInput("step_bp", "Step (bp)", value = 1e5, min = 1e3, max = 5e7, step = 1e3)
             ),
             
             conditionalPanel(
-              condition = "input.cluster_method == 'hits'",
-              
-              radioButtons(
-                "hits_mode", "Hits mode:",
-                choices = c(
-                  "1Mb hit-span (consecutive hits within 1Mb)" = "span1mb",
-                  "Tiled windows (non-overlapping)"            = "tiled",
-                  "Sliding windows (overlapping)"              = "sliding"
-                ),
-                selected = "span1mb"
-              ),
-              
-              sliderInput(
-                "min_logp",
-                "-log10(P) threshold (hit significance)",
-                min = 2, max = 20, value = 8, step = 0.5
-              ),
-              
-              numericInput(
-                "min_hits",
-                "Minimum GWAS hits per cluster/window",
-                value = 3, min = 1, max = 1000, step = 1
-              ),
-              
-              numericInput(
-                "win_bp",
-                "Window size (bp)",
-                value = 1e6, min = 1e4, max = 5e7, step = 1e4
-              ),
-              
-              conditionalPanel(
-                condition = "input.hits_mode == 'sliding'",
-                numericInput("step_bp", "Step (bp)", value = 1e5, min = 1e3, max = 5e7, step = 1e3)
-              ),
-              
-              conditionalPanel(
-                condition = "input.hits_mode != 'sliding'",
-                helpText("For 'tiled' and '1Mb hit-span', step is implicit.")
-              )
-            ),
-            
-            actionButton(
-              "build_ranges",
-              "Generate intervals & clusters",
-              style = "background-color:#ffdd57; font-weight:bold;"
-            ),
-            
-            h5("Preview selected intervals range"),
-            verbatimTextOutput("ranges_preview"),
-            
-            tags$hr(),
-            
-            h3("Step 3 · Extract nonsyn variants in all clusters",
-               style="color:#1A4E8A; font-weight:700;"),
-            
-            textInput(
-              "dbnsfp_out_all",
-              "Path to dbNSFP biallelic_nonsyn.out file",
-              value = ns_def$dbnsfp_all
-            ),
-            
-            actionButton(
-              "run_nonsyn_clusters",
-              "Extract nonsyn variants in all clusters",
-              style = "background-color:#ffdd57; font-weight:bold;"
-            ),
-            
-            h5("Extract log file"),
-            verbatimTextOutput("dbnsfp_log"),
-            
-            tags$hr(),
-            
-            h3("Step 4 · Download files",
-               style="color:#1A4E8A; font-weight:700;"),
-            downloadButton("dl_dbnsfp_csv", "Download normalized CSV"),
-            downloadButton("dl_dbnsfp_rds", "Download normalized RDS"),
-            tags$hr(),
-            downloadButton("dl_candidates_zip", "⬇️ Download NonSyn candidates (ZIP)")
-          )
-        )
+              condition = "input.hits_mode != 'sliding'",
+              helpText("For 'tiled' and '1Mb hit-span', step is implicit.")
+            )
+          ),
+          
+          actionButton(
+            "build_ranges",
+            "Generate intervals & clusters",
+            style = "background-color:#ffdd57; font-weight:bold;"
+          ),
+          
+          h5("Preview selected intervals range"),
+          verbatimTextOutput("ranges_preview"),
+          tags$hr()
+        ),
+        
+        # ------------------------------------------------------------
+        # ALWAYS VISIBLE: Step 3 + Step 4 (also in Hub mode)
+        # ------------------------------------------------------------
+        h3("Step 3 · Extract nonsyn variants in all clusters",
+           style="color:#1A4E8A; font-weight:700;"),
+        
+        textInput(
+          "dbnsfp_out_all",
+          "Path to dbNSFP biallelic_nonsyn.out file",
+          value = ns_def$dbnsfp_all
+        ),
+        
+        actionButton(
+          "run_nonsyn_clusters",
+          "Extract nonsyn variants in all clusters",
+          style = "background-color:#ffdd57; font-weight:bold;"
+        ),
+        
+        h5("Extract log file"),
+        verbatimTextOutput("dbnsfp_log"),
+        tags$hr(),
+        
+        h3("Step 4 · Download files",
+           style="color:#1A4E8A; font-weight:700;"),
+        downloadButton("dl_dbnsfp_csv", "Download normalized CSV"),
+        downloadButton("dl_dbnsfp_rds", "Download normalized RDS"),
+        tags$hr(),
+        downloadButton("dl_candidates_zip", "⬇️ Download NonSyn candidates (ZIP)")
       ),
       
       # --------------------------------------------------------------------
@@ -1120,7 +1156,6 @@ ui <- navbarPage(
       # --------------------------------------------------------------------
       mainPanel(
         
-        # This selector only makes sense inside Analysis.
         conditionalPanel(
           condition = "input.main_tabs == 'Manhattan' || input.main_tabs == 'Summary stats' || input.main_tabs == 'LD'",
           wellPanel(
@@ -1137,10 +1172,11 @@ ui <- navbarPage(
             value = "Manhattan",
             
             fluidRow(
-              column(12, 
-                     div(class = "panel-lite", shinycssloaders::withSpinner(plotlyOutput("manhattan_combo", height = "700px"))),
-                    # shinycssloaders::withSpinner(plotlyOutput("manhattan_combo", height = "600px")))
-            )),
+              column(
+                12, 
+                div(class = "panel-lite", shinycssloaders::withSpinner(plotlyOutput("manhattan_combo", height = "700px")))
+              )
+            ),
             
             tags$hr(),
             
@@ -1160,12 +1196,9 @@ ui <- navbarPage(
             fluidRow(
               column(
                 12,
-                conditionalPanel(
-                  condition = "input.use_preloaded_dbnsfp == 'new'",
-                  tags$hr(),
-                  h4("Clusters summary"),
-                  DTOutput("cluster_dt")
-                )
+                tags$hr(),
+                h4("Clusters summary"),
+                DTOutput("cluster_dt")
               )
             )
           ),
@@ -1234,19 +1267,18 @@ ui <- navbarPage(
                 radioButtons(
                   "radar_mode",
                   "Group by",
-                  choices = c("Cluster" = "cluster", "Chromosome" = "chr", "Genes" = "gene"),
-                  selected = "cluster"
+                  choices = c(
+                    "Global"  = "global",
+                    "Cluster" = "cluster",
+                    "Gene"    = "gene"
+                  ),
+                  selected = "global"
                 ),
                 
                 conditionalPanel(
                   condition = "input.radar_mode == 'cluster'",
                   selectInput("radar_chr_for_cluster", "Chromosome", choices = NULL),
                   selectInput("radar_cluster_id", "Cluster", choices = NULL)
-                ),
-                
-                conditionalPanel(
-                  condition = "input.radar_mode == 'chr'",
-                  selectInput("radar_chr", "Chromosome", choices = NULL)
                 ),
                 
                 conditionalPanel(
@@ -1258,7 +1290,7 @@ ui <- navbarPage(
               mainPanel(
                 width = 10,
                 actionButton("info_11", label = "Metric info", icon = icon("info-circle"), class = "btn btn-outline-secondary"),
-                shinycssloaders::withSpinner(plotOutput("nonsyn_radar", height = "650px")),
+                shinycssloaders::withSpinner(plotlyOutput("nonsyn_radar_plotly", height = "900px")),
                 tags$hr(),
                 DT::DTOutput("radar_selection_table")
               )
@@ -1286,9 +1318,6 @@ ui <- navbarPage(
       sidebarPanel(
         width = 3,
         
-        # -----------------------------
-        # Scope (aplica a tots)
-        # -----------------------------
         radioButtons(
           "func_scope",
           "Scope",
@@ -1306,10 +1335,6 @@ ui <- navbarPage(
           uiOutput("func_gene_ui")
         ),
         
-        # -----------------------------
-        # Background + cutoff (GO/KEGG/GoSlim)
-        # (si vols que predictors/terms també tinguin FDR cutoff propi, ho deixem separat)
-        # -----------------------------
         conditionalPanel(
           condition = "input.enrich_tabs != 'tab_enrich_pred' && input.enrich_tabs != 'tab_enrich_terms'",
           selectInput(
@@ -1321,9 +1346,6 @@ ui <- navbarPage(
           tags$hr()
         ),
         
-        # -----------------------------
-        # Predictors controls (only when Predictors tab)
-        # -----------------------------
         conditionalPanel(
           condition = "input.enrich_tabs == 'tab_enrich_pred'",
           
@@ -1334,9 +1356,6 @@ ui <- navbarPage(
           tags$hr()
         ),
         
-        # -----------------------------
-        # Terms controls (only when Terms tab)
-        # -----------------------------
         conditionalPanel(
           condition = "input.enrich_tabs == 'tab_enrich_terms'",
           
@@ -1350,9 +1369,6 @@ ui <- navbarPage(
           tags$hr()
         ),
         
-        # -----------------------------
-        # GO / GoSlim-only controls
-        # -----------------------------
         conditionalPanel(
           condition = "input.enrich_tabs == 'tab_enrich_go' || input.enrich_tabs == 'tab_enrich_goslim'",
           
@@ -1369,9 +1385,6 @@ ui <- navbarPage(
           checkboxInput("go_simplify", "Simplify GO terms (optional)", value = FALSE)
         ),
         
-        # -----------------------------
-        # KEGG-only controls
-        # -----------------------------
         conditionalPanel(
           condition = "input.enrich_tabs == 'tab_enrich_kegg'",
           numericInput("enrich_kegg_top", "Top KEGG pathways", value = 15, min = 1, max = 50, step = 1)
@@ -1379,9 +1392,6 @@ ui <- navbarPage(
         
         tags$hr(),
         
-        # -----------------------------
-        # GSSize (aplica a GO/KEGG/GoSlim; si també vols per Terms, treu el conditional)
-        # -----------------------------
         conditionalPanel(
           condition = "input.enrich_tabs == 'tab_enrich_go' || input.enrich_tabs == 'tab_enrich_kegg' || input.enrich_tabs == 'tab_enrich_goslim'",
           actionButton("info_12", "ℹ GSSize"),
@@ -1390,9 +1400,6 @@ ui <- navbarPage(
           tags$hr()
         ),
         
-        # -----------------------------
-        # Run button (one)
-        # -----------------------------
         actionButton(
           "run_enrich",
           label = "Run enrichment",
@@ -1414,8 +1421,6 @@ ui <- navbarPage(
           tabPanel(
             title = HTML("<span style='font-size:15px; font-weight:600;'>🧠 Predictors</span>"),
             value = "tab_enrich_pred",
-          #  shinycssloaders::withSpinner(plotly::plotlyOutput("enrich_nonsyn_pred_plotly", height = "420px")),
-          #  tags$hr(),
             shinycssloaders::withSpinner(plotly::plotlyOutput("enrich_nonsyn_pred_plotly_radial", height = "520px")),
             
             tags$hr(),
@@ -1427,7 +1432,6 @@ ui <- navbarPage(
           tabPanel(
             title = HTML("<span style='font-size:15px; font-weight:600;'>🧾 Terms</span>"),
             value = "tab_enrich_terms",
-           # shinycssloaders::withSpinner(plotOutput("enrich_nonsyn_terms_plot", height = 380)),
             shinycssloaders::withSpinner(plotly::plotlyOutput("enrich_nonsyn_terms_plotly", height = "480px")),
             
             tags$hr(),
@@ -1437,7 +1441,7 @@ ui <- navbarPage(
           tabPanel(
             title = HTML("<span style='font-size:15px; font-weight:600;'>GO</span>"),
             value = "tab_enrich_go",
-            shinycssloaders::withSpinner(plotOutput("go_bar", height = 400)),
+            shinycssloaders::withSpinner(plotlyOutput("go_bar", height = 400)),
             tags$hr(),
             shinycssloaders::withSpinner(DT::DTOutput("go_table"))
           ),
@@ -1445,7 +1449,7 @@ ui <- navbarPage(
           tabPanel(
             title = HTML("<span style='font-size:15px; font-weight:600;'>KEGG</span>"),
             value = "tab_enrich_kegg",
-            shinycssloaders::withSpinner(plotOutput("kegg_bar", height = 400)),
+            shinycssloaders::withSpinner(plotlyOutput("kegg_bar", height = 400)),
             tags$hr(),
             shinycssloaders::withSpinner(DT::DTOutput("kegg_table"))
           ),
@@ -1461,16 +1465,15 @@ ui <- navbarPage(
       )
     )
   ),
+  
   # ========================================================================
   # TOP TAB 3: LD
   # ========================================================================
   tabPanel(
     title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>🧩 LD</span>"),
-    ld_module_ui("ld")
+    ld_module_ui("ld", app_tag = "nonsyn")
   )
 )
-
-
 
 ##############################################################################
 ############################### SERVER #######################################
@@ -1510,19 +1513,84 @@ server <- function(input, output, session) {
                      type = "message", duration = 2)
   }, ignoreInit = FALSE)
   
+  ################################ DETECT HUB MODE ##############################
   
-#  # ===========================
-#  # 2) CANONICAL cluster engine (local build_ranges)
-#  # ===========================
-#  gwas_df <- reactive({
-#    # ### CHANGE ### si a la teva app NO tens input$use_preloaded_*,
-#    # simplement retorna sempre gwas_shared_rv()
-#    if (!exists("use_preloaded_dbnsfp", where = names(input), inherits = FALSE)) {
-#      return(gwas_shared_rv())
-#    }
-#    if (!identical(input$use_preloaded_dbnsfp, "new")) return(tibble::tibble())
-#    gwas_shared_rv()
-#  })
+  `%||%` <- function(a,b) if (!is.null(a) && length(a) && !all(is.na(a))) a else b
+  
+  hub_mode_r <- reactive({
+    qs <- session$clientData$url_search %||% ""
+    q  <- tryCatch(shiny::parseQueryString(sub("^\\?", "", qs)), error = function(e) list())
+    
+    sid_from_url <- q$sid %||% q$gi_sid %||% q$SID %||% NULL
+    has_sid_in_url <- !is.null(sid_from_url) && nzchar(as.character(sid_from_url))
+    
+    sid_ok <- FALSE
+    if (exists("gi_sync") && is.list(gi_sync) && "sid" %in% names(gi_sync)) {
+      s <- tryCatch(gi_sync$sid(), error = function(e) NULL)
+      sid_ok <- !is.null(s) && nzchar(as.character(s))
+    }
+    
+    hub_flag <- FALSE
+    if (exists("gi_sync") && is.list(gi_sync) && "state_shared" %in% names(gi_sync)) {
+      st <- tryCatch(gi_sync$state_shared(), error = function(e) NULL)
+      hub_flag <- is.list(st) && isTRUE(st$from_hub %||% st$hub %||% st$sync %||% FALSE)
+    }
+    
+    has_shared <- FALSE
+    if (exists("gi_sync") && is.list(gi_sync) && "gwas_shared" %in% names(gi_sync)) {
+      gw <- tryCatch(gi_sync$gwas_shared(), error = function(e) NULL)
+      has_shared <- is.data.frame(gw) && nrow(gw) > 0
+    }
+    if (!has_shared && exists("gi_sync") && is.list(gi_sync) && "clusters_shared" %in% names(gi_sync)) {
+      cl <- tryCatch(gi_sync$clusters_shared(), error = function(e) NULL)
+      has_shared <- is.data.frame(cl) && nrow(cl) > 0
+    }
+    
+    isTRUE(has_sid_in_url || sid_ok || hub_flag || has_shared)
+  })
+  
+  master_session_status <- reactive({
+    st <- NULL
+    
+    if (exists("gi_sync") && is.list(gi_sync) && "state_shared" %in% names(gi_sync)) {
+      st <- tryCatch(gi_sync$state_shared(), error = function(e) NULL)
+    }
+    
+    slave_master_settings_text(st)
+  })
+  
+  
+  output$master_session_status <- renderText({
+    master_session_status()
+  })
+  
+  output$hub_mode <- renderText({
+    if (isTRUE(hub_mode_r())) "true" else "false"
+  })
+  outputOptions(output, "hub_mode", suspendWhenHidden = FALSE)
+  
+  output$dbg_hub_mode <- renderPrint({
+    list(
+      url_search = session$clientData$url_search %||% NA,
+      hub_mode   = hub_mode_r()
+    )
+  })
+  outputOptions(output, "dbg_hub_mode", suspendWhenHidden = FALSE)
+  
+  ######################################################################################
+  ######################################################################################
+  #  # ===========================
+  #  # 2) CANONICAL cluster engine (local build_ranges)
+  #  # ===========================
+  #  gwas_df <- reactive({
+  #    # ### CHANGE ### si a la teva app NO tens input$use_preloaded_*,
+  #    # simplement retorna sempre gwas_shared_rv()
+  #    if (!exists("use_preloaded_dbnsfp", where = names(input), inherits = FALSE)) {
+  #      return(gwas_shared_rv())
+  #    }
+  #    if (!identical(input$use_preloaded_dbnsfp, "new")) return(tibble::tibble())
+  #    gwas_shared_rv()
+  #  })
   
   cl_engine <- gi_clusters_canonical_init(
     session = session, input = input, output = output,
@@ -1841,39 +1909,46 @@ server <- function(input, output, session) {
     df <- gwas_df()
     req(is.data.frame(df), nrow(df) > 0)
     
-    # threshold segons mètode
-    thr <- if (identical(input$cluster_method, "window")) input$pthr else input$min_logp
-    thr <- suppressWarnings(as.numeric(thr))
-    if (!is.finite(thr)) thr <- -Inf
+    cluster_method <- as.character(input$cluster_method %||% "")
+    hits_mode      <- as.character(input$hits_mode %||% "")
+    
+    thr <- if (identical(cluster_method, "window")) {
+      suppressWarnings(as.numeric(input$pthr))
+    } else if (identical(cluster_method, "hits")) {
+      suppressWarnings(as.numeric(input$min_logp))
+    } else {
+      NA_real_
+    }
+    
+    req(is.finite(thr))
     
     # garantir rsid (si no existeix, usa snp)
     if (!"rsid" %in% names(df)) df$rsid <- NA_character_
     if (!"snp"  %in% names(df)) df$snp  <- NA_character_
+    
     df$rsid <- as.character(df$rsid)
     df$snp  <- as.character(df$snp)
     df$rsid <- dplyr::coalesce(df$rsid, df$snp)
     
     df %>%
-      dplyr::filter(.data$logp >= thr) %>%
+      dplyr::filter(is.finite(logp), .data$logp >= thr) %>%
       dplyr::arrange(dplyr::desc(.data$logp)) %>%
       dplyr::select(
-        dplyr::all_of(c("CHR", "BP", "snp")),   # aquests han d'existir
-        dplyr::any_of("rsid"),                  # tolerant
+        dplyr::all_of(c("CHR", "BP", "snp")),
+        dplyr::any_of("rsid"),
         p = .data$Pval,
         .data$logp
       )
   })
   
-  
   output$hits_tbl <- renderDT({
-    req(input$use_preloaded_dbnsfp %||% "new")
-    req(identical(input$use_preloaded_dbnsfp, "new"))
-    
     h <- hits_df()
     
     if (is.null(h) || !nrow(h)) {
-      return(DT::datatable(data.frame(Message = "No hits above threshold."), 
-                           options = list(dom = "t")))
+      return(DT::datatable(
+        data.frame(Message = "No hits above threshold."),
+        options = list(dom = "t")
+      ))
     }
     
     h2 <- h %>%
@@ -1893,27 +1968,20 @@ server <- function(input, output, session) {
       rownames = FALSE,
       escape = FALSE,
       extensions = "Buttons",
-      options    = list(
-        dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf", "print"),
+      options = list(
+        dom = "Bfrtip",
+        buttons = list(
+          list(extend = "copy",  exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE)),
+          list(extend = "csv",   exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE)),
+          list(extend = "excel", exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE))
+        ),
         pageLength = 10,
-        scrollX    = TRUE
+        scrollX = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   output$gwas_tab_body <- renderUI({
-    req(input$use_preloaded_dbnsfp)
-    
-    if (!identical(input$use_preloaded_dbnsfp, "new")) {
-      return(
-        div(
-          style = "padding:20px; color:#777;",
-          em("GWAS hits are not available when using precomputed dbNSFP results.")
-        )
-      )
-    }
-    
     tagList(
       h4("GWAS hits used for clustering"),
       DTOutput("hits_tbl")
@@ -1952,17 +2020,34 @@ server <- function(input, output, session) {
     
     if ("cluster_size_kb" %in% names(out)) out$size_kb <- suppressWarnings(as.numeric(out$cluster_size_kb))
     
-    ns <- tryCatch(nonsyn_manhattan_df(), error = function(e) NULL)
-    ns_ok <- is.data.frame(ns) && nrow(ns) > 0 && all(c("CHR", "POS") %in% names(ns))
+    ############
+    final_rds <- tryCatch(dbnsfp_final_path_rds(), error = function(e) NULL)
+    
+    ns_ok <- is.character(final_rds) && length(final_rds) == 1 && nzchar(final_rds) && file.exists(final_rds)
     
     if (ns_ok) {
-      ns_chr <- suppressWarnings(as.integer(gsub("^chr", "", as.character(ns$CHR), ignore.case = TRUE)))
-      ns_pos <- suppressWarnings(as.integer(ns$POS))
+      ns <- readRDS(final_rds) %>%
+        dplyr::transmute(
+          cluster_id = as.character(cluster_id),
+          chr_num    = suppressWarnings(as.integer(readr::parse_number(as.character(chr)))),
+          pos        = suppressWarnings(as.integer(readr::parse_number(as.character(BP)))),
+          ref        = as.character(ref),
+          alt        = as.character(alt)
+        ) %>%
+        dplyr::filter(
+          !is.na(cluster_id), nzchar(cluster_id),
+          is.finite(chr_num), is.finite(pos)
+        ) %>%
+        dplyr::distinct(cluster_id, chr_num, pos, ref, alt)
       
-      out$n_nonsyn <- mapply(
-        function(cc, s, e) sum(ns_chr == cc & ns_pos >= s & ns_pos <= e, na.rm = TRUE),
-        out$chr_num, out$start, out$end
-      )
+      counts <- ns %>%
+        dplyr::count(cluster_id, name = "n_nonsyn")
+      
+      out <- out %>%
+        dplyr::left_join(counts, by = "cluster_id")
+      
+      out$n_nonsyn[is.na(out$n_nonsyn)] <- 0L
+      
     } else {
       out$n_nonsyn <- NA_integer_
     }
@@ -1991,35 +2076,54 @@ server <- function(input, output, session) {
         extensions = "Buttons",
         options    = list(
           dom        = "Bfrtip",
-          buttons    = c("copy", "csv", "excel", "pdf", "print"),
+          buttons = list(
+            list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+            list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+            list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+          ),
           pageLength = 10,
           options = list(dom = "t"),
           scrollX    = TRUE
         )
-  
+        
       ))
     }
     
     dt2 <- dt %>%
-      dplyr::select(cluster_id, chr, start, end, n_snps, n_nonsyn, top_snp, top_logp, size_kb)
+      dplyr::select(cluster_id, chr, start, end, n_snps, n_nonsyn, top_snp, top_logp, size_kb) %>%
+      dplyr::mutate(
+        cluster_id = as.character(cluster_id),
+        chr        = as.character(chr),
+        start      = as.integer(start),
+        end        = as.integer(end),
+        n_snps     = as.integer(n_snps),
+        n_nonsyn   = as.integer(n_nonsyn),
+        top_snp    = as.character(top_snp),
+        top_logp   = as.numeric(top_logp),
+        size_kb    = as.numeric(size_kb)
+      )
     
     DT::datatable(dt2, rownames = FALSE, 
                   extensions = "Buttons",
                   options    = list(
                     dom        = "Bfrtip",
-                    buttons    = c("copy", "csv", "excel", "pdf", "print"),
+                    buttons = list(
+                      list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+                      list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+                      list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+                    ),
                     pageLength = 10,
                     scrollX    = TRUE
                   )
     )  %>%
       DT::formatRound(c("top_logp", "size_kb"), digits = 2)
-  })
+  }, server = FALSE)
   
-
+  
   # ------------------------------------------------------------
   # Helper for Step 3: annotate dbNSFP rows with cluster membership
   # ------------------------------------------------------------
-
+  
   add_clusters_to_dbnsfp <- function(df, cl) {
     
     stopifnot(is.data.frame(df), is.data.frame(cl))
@@ -2123,12 +2227,12 @@ server <- function(input, output, session) {
   
   
   # ---- Override GWAS reactive: prefer shared GWAS if present ----
-#  gwas_df_local <- gwas_df
-#  gwas_df <- reactive({
-#    df <- gwas_shared_rv()
-#    if (is.data.frame(df) && nrow(df) > 0) return(df)
-#    gwas_df_local()
-#  })
+  #  gwas_df_local <- gwas_df
+  #  gwas_df <- reactive({
+  #    df <- gwas_shared_rv()
+  #    if (is.data.frame(df) && nrow(df) > 0) return(df)
+  #    gwas_df_local()
+  #  })
   
   
   # ============================================================
@@ -2157,85 +2261,6 @@ server <- function(input, output, session) {
     )
   }
   
-  # Helper: normalize chr to integer-like (1..23 etc.)
-  norm_chr_int_dbnsfpXXXXXXX <- function(x) {
-    x <- toupper(as.character(x))
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHROM", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHROMOSOME", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    
-    x <- sub("^CHR", "", x) # defensive
-    x <- sub("^CHROM", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- sub("^CHR", "", x)
-    x <- gsub("^CHR", "", x)
-    x <- gsub("^CHROM", "", x)
-    
-    x <- gsub("^CHR", "", x)
-    x <- gsub("^CHROM", "", x)
-    x <- gsub("^CHR", "", x)
-    
-    x <- gsub("^CHR", "", x)
-    x <- gsub("^CHROM", "", x)
-    
-    x <- gsub("^CHR", "", x)
-    x <- gsub("^CHROM", "", x)
-    
-    x <- gsub("^CHR", "", x)
-    x <- gsub("^CHROM", "", x)
-    
-    x <- gsub("^CHR", "", x)
-    x <- gsub("^CHROM", "", x)
-    
-    x <- gsub("^CHR", "", x)
-    x <- gsub("^CHROM", "", x)
-    
-    x <- gsub("^CHR", "", x)
-    x <- gsub("^CHROM", "", x)
-    
-    x <- gsub("^CHR", "", x)
-    x <- gsub("^CHROM", "", x)
-    
-    x <- gsub("^CHR", "", x)
-    x <- gsub("^CHROM", "", x)
-    
-    x <- gsub("^CHR", "", x)
-    x <- gsub("^CHROM", "", x)
-    
-    x[x == "X"]  <- "23"
-    x[x == "Y"]  <- "24"
-    x[x %in% c("MT","M")] <- "26"
-    
-    suppressWarnings(as.integer(x))
-  }
-  
-  # Helper: save final dataset paths (if you deleted the old helper)
-  save_dbnsfp_final_localXXXXXX <- function(df, out_dir, stem = "dbnsfp_normalized") {
-    stopifnot(is.data.frame(df))
-    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-    out_csv <- file.path(out_dir, paste0(stem, ".csv"))
-    out_rds <- file.path(out_dir, paste0(stem, ".rds"))
-    readr::write_csv(df, out_csv)
-    saveRDS(df, out_rds)
-    list(csv = out_csv, rds = out_rds)
-  }
   
   ##--- helpers (keep near server) ---
   
@@ -2287,15 +2312,6 @@ server <- function(input, output, session) {
     safe_log("[STEP] run_nonsyn_clusters clicked\n")
     
     tryCatch({
-      
-      # -------------------------
-      # Preconditions / blockers
-      # -------------------------
-      if (!identical(input$use_preloaded_dbnsfp, "new")) {
-        showNotification("STOP · Mode must be 'new'", type = "error", duration = 8)
-        safe_log("[STOP] use_preloaded_dbnsfp=", as.character(input$use_preloaded_dbnsfp), "\n")
-        return()
-      }
       
       validate(need(exists("workdir") && nzchar(workdir), "workdir is not defined."))
       if (!dir.exists(workdir)) dir.create(workdir, recursive = TRUE, showWarnings = FALSE)
@@ -2434,22 +2450,16 @@ server <- function(input, output, session) {
         return()
       }
       
-    # cl0 <- as.data.frame(cl0)
-    # nm <- names(cl0)
-      
       cl0 <- as.data.frame(cl0)
       
-      # --- CANONICAL: mai assumeixis cluster_chr_n; crea cluster_id sempre ---
-      # Evita warnings si algun origen NO té cluster_chr_n
+      # --- CANONICAL: always create cluster_id ---
       if (!"cluster_id" %in% names(cl0)) cl0$cluster_id <- NA_character_
       
-      # Si hi ha cluster_chr_n, l'aprofitem PER OMPLIR cluster_id (sense referenciar-la si no hi és)
       if ("cluster_chr_n" %in% names(cl0)) {
         cl0$cluster_id <- dplyr::coalesce(as.character(cl0$cluster_id),
                                           as.character(cl0$cluster_chr_n))
       }
       
-      # Fallbacks típics si encara està buit
       if ("label" %in% names(cl0)) {
         cl0$cluster_id <- dplyr::coalesce(as.character(cl0$cluster_id),
                                           as.character(cl0$label))
@@ -2458,7 +2468,6 @@ server <- function(input, output, session) {
         cl0$cluster_id <- dplyr::coalesce(as.character(cl0$cluster_id),
                                           paste0("cluster_", as.character(cl0$cluster)))
       }
-      # Últim recurs: id determinista
       if (all(is.na(cl0$cluster_id) | !nzchar(as.character(cl0$cluster_id)))) {
         cl0$cluster_id <- paste0("cluster_", seq_len(nrow(cl0)))
       }
@@ -2470,7 +2479,6 @@ server <- function(input, output, session) {
         "label" %in% nm ~ "label",
         TRUE ~ NA_character_
       )
-      
       
       chr_col <- dplyr::case_when(
         "chr" %in% nm ~ "chr",
@@ -2635,6 +2643,18 @@ server <- function(input, output, session) {
       df_norm <- readRDS(res$rds)
       validate(need(is.data.frame(df_norm) && nrow(df_norm) > 0, "Normalized subset is empty."))
       
+      safe_log("\n====================\n")
+      safe_log("[df_norm]  nrow=", nrow(df_norm), " ncol=", ncol(df_norm), "\n")
+      safe_log("[df_norm]  cols: ", paste(names(df_norm), collapse = ", "), "\n")
+      safe_log("====================\n")
+      safe_log(
+        paste0(
+          "[df_norm] head:\n",
+          paste(capture.output(print(utils::head(df_norm, 5))), collapse = "\n"),
+          "\n"
+        )
+      )
+      
       validate(need(exists("add_clusters_to_dbnsfp", mode = "function"),
                     "add_clusters_to_dbnsfp() not available."))
       
@@ -2642,11 +2662,20 @@ server <- function(input, output, session) {
       df_final <- df_final %>% dplyr::filter(.data$in_cluster)
       validate(need(nrow(df_final) > 0, "No normalized rows remained after cluster assignment."))
       
+      safe_log("\n====================\n")
+      safe_log("[df_final]  nrow=", nrow(df_final), " ncol=", ncol(df_final), "\n")
+      safe_log("[df_final]  cols: ", paste(names(df_final), collapse = ", "), "\n")
+      safe_log("====================\n")
+      safe_log(
+        paste0(
+          "[df_final] head:\n",
+          paste(capture.output(print(utils::head(df_final, 5))), collapse = "\n"),
+          "\n"
+        )
+      )
+      
       # -------------------------
       # Save final outputs
-      # -------------------------
-      # -------------------------
-      # Save final outputs (ROBUST)
       # -------------------------
       tg <- make_mode_thr_tag(
         isolate(input$cluster_method %||% "window"),
@@ -2672,7 +2701,6 @@ server <- function(input, output, session) {
       
       final_paths <- save_dbnsfp_final_local(df_final, out_dir = workdir, stem = stem)
       
-      # --- setters NA/len-safe (EVITA "replacement has length zero") ---
       if (exists("dbnsfp_final_path_rds", mode = "function") &&
           is.character(final_paths$rds) && length(final_paths$rds) == 1 && nzchar(final_paths$rds)) {
         dbnsfp_final_path_rds(final_paths$rds)
@@ -2693,116 +2721,949 @@ server <- function(input, output, session) {
         dbnsfp_norm_path_csv(res$csv)
       }
       
-   #   if (exists("dbnsfp_final_path_rds", mode = "function")) dbnsfp_final_path_rds(final_paths$rds)
-   #   if (exists("dbnsfp_final_path_csv", mode = "function")) dbnsfp_final_path_csv(final_paths$csv)
+      ###### Start INTEGRATOR CODE ####################################################################
+      # ------------------------------------------------------------
+      # INTEGRATOR export (NonSyn bridges)
+      # ------------------------------------------------------------
+      tryCatch({
+        
+        # ============================================================
+        # APP CONFIG (NonSyn)
+        # ============================================================
+        app_slug      <- "nonsyn"
+        app_hit_class <- "nonsyn_hit"
+        
+        # Main table in this app
+        hits <- df_final
+        
+        # Generic logger fallback
+        append_log <- if (exists("append_log", mode = "function", inherits = TRUE)) {
+          get("append_log", mode = "function", inherits = TRUE)
+        } else if (exists("safe_log", mode = "function", inherits = TRUE)) {
+          function(x) safe_log(x, "\n")
+        } else {
+          function(x) cat(x, "\n", sep = "")
+        }
+        
+        log_tag <- paste0("[INTEGRATOR][", app_slug, "]")
+        ld_tag  <- paste0("[LD-INTEGRATOR][", app_slug, "]")
+        
+        `%||%` <- function(a, b) if (!is.null(a) && length(a) && !all(is.na(a))) a else b
+        
+        # ============================================================
+        # HELPERS
+        # ============================================================
+        fmt_threshold_for_path <- function(x) {
+          x <- suppressWarnings(as.numeric(x))
+          if (is.na(x)) return("NA")
+          out <- format(x, scientific = FALSE, trim = TRUE)
+          gsub("\\.", "p", out)
+        }
+        
+        fmt_tag <- function(x) {
+          x <- as.character(x %||% "NA")
+          x <- trimws(x)
+          x <- gsub("[^A-Za-z0-9_\\-]", "_", x)
+          if (!nzchar(x)) x <- "NA"
+          x
+        }
+        
+        get_nonsyn_cluster_method <- function(input) {
+          cm <- as.character(input$cluster_method %||% NA_character_)
+          hm <- as.character(input$hits_mode %||% NA_character_)
+          
+          if (identical(cm, "window")) {
+            "window"
+          } else if (identical(cm, "hits")) {
+            if (identical(hm, "span1mb")) {
+              "hits_span1mb"
+            } else if (identical(hm, "tiled")) {
+              "hits_tiled"
+            } else if (identical(hm, "sliding")) {
+              "hits_sliding"
+            } else {
+              "hits_unknown"
+            }
+          } else {
+            "unknown"
+          }
+        }
+        
+        get_nonsyn_threshold <- function(input, cluster_method) {
+          if (identical(cluster_method, "window")) {
+            suppressWarnings(as.numeric(input$pthr))
+          } else if (cluster_method %in% c("hits_span1mb", "hits_tiled", "hits_sliding", "hits_unknown")) {
+            suppressWarnings(as.numeric(input$min_logp))
+          } else {
+            NA_real_
+          }
+        }
+        
+        get_nonsyn_gwas_name <- function(input) {
+          nm <- tryCatch(as.character(input$gwas_file$name %||% NA_character_), error = function(e) NA_character_)
+          if (!is.na(nm) && nzchar(trimws(nm))) return(trimws(nm))
+          "unknown_gwas_source"
+        }
+        
+        gi_get_integrator_session_dir <- function(gi_shared_root, cluster_method, threshold_used) {
+          integrator_root <- file.path(gi_shared_root, "integrator_exports")
+          dir.create(integrator_root, recursive = TRUE, showWarnings = FALSE)
+          
+          method_tag <- fmt_tag(cluster_method)
+          thr_tag    <- fmt_threshold_for_path(threshold_used)
+          
+          session_id <- paste0(
+            "clust_", method_tag,
+            "__thr_", thr_tag
+          )
+          
+          session_dir <- file.path(integrator_root, session_id)
+          dir.create(session_dir, recursive = TRUE, showWarnings = FALSE)
+          
+          list(
+            integrator_root = integrator_root,
+            session_id = session_id,
+            session_dir = session_dir,
+            method_tag = method_tag,
+            thr_tag = thr_tag
+          )
+        }
+        
+        gi_load_or_create_manifest <- function(session_dir, session_id, cluster_method, threshold_used, gwas_session_file) {
+          manifest_path <- file.path(session_dir, "manifest.rds")
+          
+          if (file.exists(manifest_path)) {
+            manifest <- tryCatch(readRDS(manifest_path), error = function(e) NULL)
+            if (is.list(manifest)) {
+              if (is.null(manifest$files)) manifest$files <- list()
+              if (is.null(manifest$apps_present)) manifest$apps_present <- character(0)
+              return(list(manifest = manifest, manifest_path = manifest_path))
+            }
+          }
+          
+          manifest <- list(
+            session_id = session_id,
+            created_at = as.character(Sys.time()),
+            cluster_method = cluster_method,
+            threshold_used = threshold_used,
+            gwas_session_file = gwas_session_file,
+            settings_key = paste0(
+              "cluster_method=", cluster_method,
+              ";threshold_used=", threshold_used
+            ),
+            apps_present = character(0),
+            files = list()
+          )
+          
+          list(manifest = manifest, manifest_path = manifest_path)
+        }
+        
+        # ============================================================
+        # SESSION / SETTINGS FOLDER
+        # ============================================================
+        current_cluster_method <- get_nonsyn_cluster_method(input)
+        current_threshold      <- get_nonsyn_threshold(input, current_cluster_method)
+        current_gwas_name      <- get_nonsyn_gwas_name(input)
+        
+        sess <- gi_get_integrator_session_dir(
+          gi_shared_root = gi_shared_root,
+          cluster_method = current_cluster_method,
+          threshold_used = current_threshold
+        )
+        
+        integrator_root <- sess$integrator_root
+        session_id      <- sess$session_id
+        session_dir     <- sess$session_dir
+        
+        manifest_obj <- gi_load_or_create_manifest(
+          session_dir = session_dir,
+          session_id = session_id,
+          cluster_method = current_cluster_method,
+          threshold_used = current_threshold,
+          gwas_session_file = current_gwas_name
+        )
+        
+        manifest      <- manifest_obj$manifest
+        manifest_path <- manifest_obj$manifest_path
+        
+        if (!identical(as.character(manifest$cluster_method %||% ""), as.character(current_cluster_method))) {
+          stop("Existing manifest cluster_method does not match current cluster_method.")
+        }
+        
+        if (!isTRUE(all.equal(
+          suppressWarnings(as.numeric(manifest$threshold_used)),
+          suppressWarnings(as.numeric(current_threshold))
+        ))) {
+          stop("Existing manifest threshold_used does not match current threshold_used.")
+        }
+        
+        manifest_gwas_files <- as.character(manifest$gwas_session_file %||% character(0))
+        manifest_gwas_files <- trimws(manifest_gwas_files)
+        manifest_gwas_files <- manifest_gwas_files[!is.na(manifest_gwas_files) & nzchar(manifest_gwas_files)]
+        
+        current_gwas_name_chr <- trimws(as.character(current_gwas_name %||% ""))
+        if (nzchar(current_gwas_name_chr)) {
+          manifest_gwas_files <- unique(c(manifest_gwas_files, current_gwas_name_chr))
+        }
+        
+        manifest$gwas_session_file <- manifest_gwas_files
+        
+        gene_hit_bridge_path <- file.path(session_dir, paste0(app_slug, "_gene_hit_bridge.rds"))
+        gene_bridge_path     <- file.path(session_dir, paste0(app_slug, "_gene_bridge.rds"))
+        term_bridge_path     <- file.path(session_dir, paste0(app_slug, "_term_bridge.rds"))
+        clusters_master_path <- file.path(session_dir, paste0(app_slug, "_clusters_master.rds"))
+        candidates_path      <- file.path(session_dir, paste0(app_slug, "_candidates.rds"))
+        
+        append_log(paste0(log_tag, " integrator_root=", integrator_root))
+        append_log(paste0(log_tag, " cluster_method=", current_cluster_method))
+        append_log(paste0(log_tag, " threshold_used=", current_threshold))
+        append_log(paste0(log_tag, " gwas_session_file=", paste(manifest$gwas_session_file, collapse = " | ")))
+        append_log(paste0(log_tag, " session_id=", session_id))
+        append_log(paste0(log_tag, " session_dir=", session_dir))
+        append_log(paste0(log_tag, " hits nrow=", nrow(hits), " ncol=", ncol(hits)))
+        append_log(paste0(log_tag, " hits cols: ", paste(names(hits), collapse = ", ")))
+        
+        # ============================================================
+        # A) GENE BRIDGE
+        # ============================================================
+        needed_gene_cols <- c("genename", "cluster_id", "chr", "cluster_start", "cluster_end")
+        
+        gene_bridge <- if (all(needed_gene_cols %in% names(hits))) {
+          hits %>%
+            dplyr::transmute(
+              gene = as.character(genename),
+              source_app = app_slug,
+              evidence_type = paste0(app_slug, "_gene"),
+              cluster_id = as.character(cluster_id),
+              chr = chr,
+              start = cluster_start,
+              end = cluster_end
+            ) %>%
+            sanitize_bridge() %>%
+            sanitize_bridge_genes() %>%
+            dplyr::filter(!is.na(gene), nzchar(gene)) %>%
+            dplyr::distinct()
+        } else {
+          append_log(paste0(
+            log_tag, " gene bridge skipped: missing columns -> ",
+            paste(setdiff(needed_gene_cols, names(hits)), collapse = ", ")
+          ))
+          tibble::tibble()
+        }
+        
+        append_log(paste0(log_tag, " gene_bridge nrow=", nrow(gene_bridge)))
+        
+        if (nrow(gene_bridge) > 0) {
+          saveRDS(gene_bridge, gene_bridge_path)
+          manifest$files[[paste0(app_slug, "_gene_bridge")]] <- basename(gene_bridge_path)
+          append_log(paste0(
+            log_tag, " saved ", basename(gene_bridge_path),
+            " | exists=", file.exists(gene_bridge_path)
+          ))
+        } else {
+          append_log(paste0(log_tag, " ", basename(gene_bridge_path), " NOT saved (0 rows)"))
+        }
+        
+        # ============================================================
+        # B) TERM BRIDGE
+        # ============================================================
+        # ============================================================
+        # B) TERM BRIDGE
+        # ============================================================
+        
+        term_bridge <- tibble::tibble(
+          term = character(),
+          term_type = character(),
+          source_app = character(),
+          evidence_type = character(),
+          cluster_id = character(),
+          chr = integer(),
+          start = integer(),
+          end = integer()
+        )
+        
+        split_term_values <- function(x) {
+          x <- as.character(x)
+          x <- x[!is.na(x)]
+          if (!length(x)) return(character())
+          
+          x <- trimws(x)
+          x <- x[nzchar(x)]
+          if (!length(x)) return(character())
+          
+          parts <- unlist(strsplit(x, "\\s*[;|]\\s*", perl = TRUE), use.names = FALSE)
+          parts <- trimws(parts)
+          parts <- parts[nzchar(parts)]
+          unique(parts)
+        }
+        
+        clean_term_value <- function(x, evidence_type) {
+          x <- as.character(x)
+          x <- trimws(x)
+          x <- gsub("\\s+", " ", x, perl = TRUE)
+          
+          bad_vals <- c(
+            "", ".", "-", "NA", "N/A", "na", "n/a",
+            "none", "None", "not provided", "not_provided",
+            "not_specified", "unknown", "Unknown", "unspecified", "Unspecified"
+          )
+          if (is.na(x) || x %in% bad_vals) return(NA_character_)
+          
+          x <- gsub("^[\"']+|[\"']+$", "", x, perl = TRUE)
+          
+          if (identical(evidence_type, "mim_disease")) {
+            x <- gsub("\\[MIM\\s*:\\s*[0-9]+\\]", "", x, ignore.case = TRUE, perl = TRUE)
+            x <- gsub("\\b(OMIM|MIM)\\s*[:#]*\\s*[0-9]+\\b", "", x, ignore.case = TRUE, perl = TRUE)
+          }
+          
+          if (identical(evidence_type, "gwas_trait")) {
+            # traiem PMIDs entre claudàtors
+            x <- gsub("\\[[^\\]]*\\]", "", x, perl = TRUE)
+          }
+          
+          x <- gsub("^[:;,_\\-\\s]+|[:;,_\\-\\s]+$", "", x, perl = TRUE)
+          x <- trimws(x)
+          if (!nzchar(x)) return(NA_character_)
+          
+          x_low <- tolower(x)
+          generic_bad <- c(
+            "disease", "diseases", "trait", "traits", "phenotype", "phenotypes",
+            "clinical significance", "pathogenic", "likely pathogenic",
+            "benign", "likely benign", "uncertain significance",
+            "risk factor", "association", "not specified"
+          )
+          if (x_low %in% generic_bad) return(NA_character_)
+          
+          x
+        }
+        
+        build_term_bridge_from_col <- function(df, col, term_type, evidence_type) {
+          if (!(col %in% names(df))) {
+            append_log(paste0(log_tag, " term source skipped: column not found -> ", col))
+            return(NULL)
+          }
+          
+          vals0 <- as.character(df[[col]])
+          vals0 <- vals0[!is.na(vals0)]
+          vals0 <- trimws(vals0)
+          vals0 <- vals0[nzchar(vals0)]
+          
+          append_log(paste0(
+            log_tag, " term source ", col,
+            " | non_empty=", length(vals0),
+            " | unique_non_empty=", length(unique(vals0))
+          ))
+          
+          if (!length(vals0)) {
+            append_log(paste0(log_tag, " built 0 rows from -> ", col))
+            return(NULL)
+          }
+          
+          out_list <- vector("list", nrow(df))
+          
+          for (i in seq_len(nrow(df))) {
+            vals <- split_term_values(df[[col]][i])
+            if (!length(vals)) next
+            
+            vals <- vapply(
+              vals,
+              FUN = clean_term_value,
+              evidence_type = evidence_type,
+              FUN.VALUE = character(1)
+            )
+            vals <- vals[!is.na(vals) & nzchar(vals)]
+            vals <- unique(vals)
+            if (!length(vals)) next
+            
+            out_list[[i]] <- tibble::tibble(
+              term = vals,
+              term_type = term_type,
+              source_app = app_slug,
+              evidence_type = evidence_type,
+              cluster_id = as.character(df$cluster_id[i]),
+              chr = as.integer(df$chr[i]),
+              start = as.integer(df$cluster_start[i]),
+              end = as.integer(df$cluster_end[i])
+            )
+          }
+          
+          out <- dplyr::bind_rows(out_list)
+          
+          if (!nrow(out)) {
+            append_log(paste0(log_tag, " built 0 rows from -> ", col))
+            return(NULL)
+          }
+          
+          append_log(paste0(log_tag, " built ", nrow(out), " rows from -> ", col))
+          out
+        }
+        
+        tryCatch({
+          
+          append_log(paste0(log_tag, " hits nrow=", nrow(hits)))
+          append_log(paste0(log_tag, " hits cols=", paste(names(hits), collapse = ", ")))
+          
+          # ------------------------------------------------
+          # Fonts per a nonsyn shared terms
+          # ------------------------------------------------
+          # Mantinc MIM_disease i Trait_association_GWAS com a principals.
+          # Disease_description i clinvar_trait es deixen fora del principal
+          # perquè introdueixen massa soroll textual.
+          term_specs <- list(
+            list(col = "MIM_disease",            term_type = "disease", evidence_type = "mim_disease"),
+            list(col = "Trait_association_GWAS", term_type = "trait",   evidence_type = "gwas_trait"),
+            list(col = "Orphanet_disorder",      term_type = "disease", evidence_type = "orphanet_disorder"),
+            list(col = "HPO_name",               term_type = "trait",   evidence_type = "hpo_name")
+          )
+          
+          term_bridge_list <- lapply(term_specs, function(sp) {
+            build_term_bridge_from_col(
+              df = hits,
+              col = sp$col,
+              term_type = sp$term_type,
+              evidence_type = sp$evidence_type
+            )
+          })
+          
+          term_bridge_list <- term_bridge_list[!vapply(term_bridge_list, is.null, logical(1))]
+          
+          if (length(term_bridge_list) > 0) {
+            term_bridge <- dplyr::bind_rows(term_bridge_list) %>%
+              sanitize_bridge() %>%
+              dplyr::filter(!is.na(term), nzchar(term)) %>%
+              dplyr::mutate(
+                term = trimws(as.character(term)),
+                term_type = as.character(term_type),
+                source_app = as.character(source_app),
+                evidence_type = as.character(evidence_type),
+                cluster_id = as.character(cluster_id),
+                chr = as.integer(chr),
+                start = as.integer(start),
+                end = as.integer(end)
+              ) %>%
+              dplyr::distinct()
+          }
+          
+          append_log(paste0(log_tag, " term_bridge nrow=", nrow(term_bridge)))
+          
+          if (nrow(term_bridge) > 0) {
+            append_log(
+              paste0(
+                log_tag, " term_bridge evidence counts: ",
+                paste(names(table(term_bridge$evidence_type)), table(term_bridge$evidence_type), collapse = " | ")
+              )
+            )
+          }
+          
+        }, error = function(e) {
+          append_log(paste0(log_tag, " ERROR building term_bridge: ", conditionMessage(e)))
+        })
+        
+        saveRDS(term_bridge, term_bridge_path)
+        manifest$files[[paste0(app_slug, "_term_bridge")]] <- basename(term_bridge_path)
+        append_log(paste0(
+          log_tag, " saved ", if (nrow(term_bridge) > 0) "" else "empty ",
+          basename(term_bridge_path),
+          " | exists=", file.exists(term_bridge_path)
+        ))
+        
+        # ============================================================
+        # C) CLUSTERS MASTER
+        # ============================================================
+        append_log(paste0(ld_tag, " dir=", session_dir))
+        append_log(paste0(ld_tag, " dir exists: ", dir.exists(session_dir)))
+        
+        clusters_master <- tibble::tibble()
+        
+        # Priority 1: use cl2 if available
+        if (exists("cl2", inherits = TRUE) && is.data.frame(cl2) && nrow(cl2) > 0) {
+          
+          append_log(paste0(ld_tag, "[CLUSTERS] using cl2"))
+          append_log(paste0(ld_tag, "[CLUSTERS] cl2 nrow=", nrow(cl2), " ncol=", ncol(cl2)))
+          append_log(paste0(ld_tag, "[CLUSTERS] cl2 cols: ", paste(names(cl2), collapse = ", ")))
+          
+          chr_col <- intersect(c("chr","CHR","chrom","CHROM","chromosome"), names(cl2))
+          st_col  <- intersect(c("start","START","cluster_start","start_bp","FROM","from","bp1"), names(cl2))
+          en_col  <- intersect(c("end","END","cluster_end","end_bp","TO","to","bp2"), names(cl2))
+          id_col  <- intersect(c("cluster_id","CLUSTER_ID","cluster","id"), names(cl2))
+          key_col <- intersect(c("cluster_key","CLUSTER_KEY"), names(cl2))
+          
+          chr_col <- if (length(chr_col)) chr_col[1] else NULL
+          st_col  <- if (length(st_col))  st_col[1]  else NULL
+          en_col  <- if (length(en_col))  en_col[1]  else NULL
+          id_col  <- if (length(id_col))  id_col[1]  else NULL
+          key_col <- if (length(key_col)) key_col[1] else NULL
+          
+          if (!is.null(chr_col) && !is.null(st_col) && !is.null(en_col) && !is.null(id_col)) {
+            clusters_master <- cl2 %>%
+              dplyr::transmute(
+                cluster_id = as.character(.data[[id_col]]),
+                chr        = suppressWarnings(as.integer(readr::parse_number(as.character(.data[[chr_col]])))),
+                start_raw  = suppressWarnings(as.integer(readr::parse_number(as.character(.data[[st_col]])))),
+                end_raw    = suppressWarnings(as.integer(readr::parse_number(as.character(.data[[en_col]])))),
+                cluster_key = if (!is.null(key_col)) as.character(.data[[key_col]]) else NA_character_
+              ) %>%
+              dplyr::mutate(
+                cluster_id = trimws(cluster_id),
+                start = pmin(start_raw, end_raw),
+                end   = pmax(start_raw, end_raw),
+                cluster_key = dplyr::if_else(
+                  !is.na(cluster_key) & nzchar(cluster_key),
+                  cluster_key,
+                  paste0(cluster_id, "|chr", chr, ":", start, "-", end)
+                )
+              ) %>%
+              dplyr::select(cluster_id, chr, start, end, cluster_key) %>%
+              dplyr::filter(
+                !is.na(cluster_id), nzchar(cluster_id),
+                is.finite(chr), is.finite(start), is.finite(end)
+              ) %>%
+              dplyr::distinct()
+          } else {
+            append_log(paste0(ld_tag, "[CLUSTERS] cl2 missing required columns"))
+          }
+          
+        } else if (all(c("cluster_id", "chr", "cluster_start", "cluster_end") %in% names(hits))) {
+          
+          # Priority 2: derive from df_final
+          append_log(paste0(ld_tag, "[CLUSTERS] deriving clusters_master from hits"))
+          
+          clusters_master <- hits %>%
+            dplyr::transmute(
+              cluster_id = as.character(cluster_id),
+              chr        = suppressWarnings(as.integer(readr::parse_number(as.character(chr)))),
+              start_raw  = suppressWarnings(as.integer(readr::parse_number(as.character(cluster_start)))),
+              end_raw    = suppressWarnings(as.integer(readr::parse_number(as.character(cluster_end))))
+            ) %>%
+            dplyr::mutate(
+              cluster_id = trimws(cluster_id),
+              start = pmin(start_raw, end_raw),
+              end   = pmax(start_raw, end_raw),
+              cluster_key = paste0(cluster_id, "|chr", chr, ":", start, "-", end)
+            ) %>%
+            dplyr::select(cluster_id, chr, start, end, cluster_key) %>%
+            dplyr::filter(
+              !is.na(cluster_id), nzchar(cluster_id),
+              is.finite(chr), is.finite(start), is.finite(end)
+            ) %>%
+            dplyr::distinct()
+        } else {
+          append_log(paste0(ld_tag, "[CLUSTERS] no usable source found for clusters_master"))
+        }
+        
+        append_log(paste0(ld_tag, "[CLUSTERS] clusters_master nrow=", nrow(clusters_master)))
+        
+        if (nrow(clusters_master) > 0) {
+          saveRDS(clusters_master, clusters_master_path)
+          manifest$files[[paste0(app_slug, "_clusters_master")]] <- basename(clusters_master_path)
+          append_log(paste0(ld_tag, "[CLUSTERS] saved: ", clusters_master_path))
+          append_log(paste0(ld_tag, "[CLUSTERS] exists after save: ", file.exists(clusters_master_path)))
+        } else {
+          append_log(paste0(ld_tag, "[CLUSTERS] ", basename(clusters_master_path), " NOT saved (0 rows)"))
+        }
+        
+        # ============================================================
+        # D) CANDIDATES FOR LD = GWAS + NONSYN HIT
+        # ============================================================
+        get_gwas_hits_for_ld <- function() {
+          if (exists("hits_df", mode = "function", inherits = TRUE)) {
+            x <- tryCatch(hits_df(), error = function(e) NULL)
+            if (is.data.frame(x) && nrow(x) > 0) {
+              return(list(name = "hits_df()", data = x))
+            }
+          }
+          
+          list(name = NULL, data = NULL)
+        }
+        
+        gwas_src   <- get_gwas_hits_for_ld()
+        gwas_df_ld <- gwas_src$data
+        
+        append_log(paste0(ld_tag, "[CANDIDATES][GWAS] filtered source picked: ", gwas_src$name %||% "NULL"))
+        
+        gwas_candidates <- tibble::tibble()
+        
+        if (is.data.frame(gwas_df_ld) && nrow(gwas_df_ld)) {
+          
+          # hits_df() té: CHR, BP, snp, rsid, p, logp
+          gwas_candidates0 <- gwas_df_ld %>%
+            dplyr::transmute(
+              cluster_id = NA_character_,
+              chr        = suppressWarnings(as.integer(readr::parse_number(as.character(CHR)))),
+              pos_ini    = suppressWarnings(as.integer(readr::parse_number(as.character(BP)))),
+              pos_end    = suppressWarnings(as.integer(readr::parse_number(as.character(BP)))),
+              id_hit     = dplyr::coalesce(as.character(rsid), as.character(snp)),
+              classe     = "GWAS"
+            ) %>%
+            dplyr::mutate(
+              cluster_id = trimws(cluster_id),
+              id_hit     = trimws(id_hit)
+            ) %>%
+            dplyr::filter(
+              is.finite(chr), is.finite(pos_ini), is.finite(pos_end),
+              !is.na(id_hit), nzchar(id_hit)
+            ) %>%
+            dplyr::distinct()
+          
+          gwas_candidates <- gwas_candidates0 %>%
+            dplyr::left_join(
+              clusters_master %>%
+                dplyr::rename(
+                  cluster_chr   = chr,
+                  cluster_start = start,
+                  cluster_end   = end
+                ),
+              by = dplyr::join_by(
+                chr == cluster_chr,
+                pos_ini >= cluster_start,
+                pos_ini <= cluster_end
+              )
+            ) %>%
+            dplyr::mutate(
+              cluster_id = cluster_id.y
+            ) %>%
+            dplyr::select(cluster_id, chr, pos_ini, pos_end, id_hit, classe) %>%
+            dplyr::filter(!is.na(cluster_id), nzchar(cluster_id)) %>%
+            dplyr::distinct()
+        }
+        
+        append_log(paste0(ld_tag, "[CANDIDATES][GWAS] nrow=", nrow(gwas_candidates)))
+        if (nrow(gwas_candidates) > 0) {
+          append_log(
+            paste0(
+              ld_tag, "[CANDIDATES][GWAS] head:\n",
+              paste(capture.output(print(utils::head(gwas_candidates, 10))), collapse = "\n")
+            )
+          )
+        }
+        
+        # NonSyn hits
+        # Construïm candidates a nivell de variant única per cluster,
+        # no a nivell de fila anotacional de dbNSFP.
+        
+        id_hit_col_candidates <- c("rsid", "RSID", "SNP", "snp", "id", "ID")
+        id_hit_col <- intersect(id_hit_col_candidates, names(hits))
+        id_hit_col <- if (length(id_hit_col)) id_hit_col[1] else NULL
+        
+        pos_hit_col_candidates <- c("pos", "POS", "position", "Position", "bp", "BP", "pos_ini", "variant_pos")
+        pos_hit_col <- intersect(pos_hit_col_candidates, names(hits))
+        pos_hit_col <- if (length(pos_hit_col)) pos_hit_col[1] else NULL
+        
+        ref_col_candidates <- c("ref", "REF", "a1", "A1", "allele1")
+        alt_col_candidates <- c("alt", "ALT", "a2", "A2", "allele2")
+        
+        ref_col <- intersect(ref_col_candidates, names(hits))
+        alt_col <- intersect(alt_col_candidates, names(hits))
+        
+        ref_col <- if (length(ref_col)) ref_col[1] else NULL
+        alt_col <- if (length(alt_col)) alt_col[1] else NULL
+        
+        nonsyn_candidates <- tibble::tibble()
+        
+        needed_hit_cols <- c("cluster_id", "chr")
+        
+        if (all(needed_hit_cols %in% names(hits)) && !is.null(pos_hit_col)) {
+          
+          nonsyn_candidates <- hits %>%
+            dplyr::transmute(
+              cluster_id = as.character(cluster_id),
+              chr        = suppressWarnings(as.integer(readr::parse_number(as.character(chr)))),
+              pos_ini    = suppressWarnings(as.integer(readr::parse_number(as.character(.data[[pos_hit_col]])))),
+              pos_end    = suppressWarnings(as.integer(readr::parse_number(as.character(.data[[pos_hit_col]])))),
+              rsid_raw   = if (!is.null(id_hit_col)) as.character(.data[[id_hit_col]]) else NA_character_,
+              ref_raw    = if (!is.null(ref_col)) as.character(.data[[ref_col]]) else NA_character_,
+              alt_raw    = if (!is.null(alt_col)) as.character(.data[[alt_col]]) else NA_character_
+            ) %>%
+            dplyr::mutate(
+              cluster_id = trimws(cluster_id),
+              rsid_raw   = trimws(rsid_raw),
+              ref_raw    = trimws(ref_raw),
+              alt_raw    = trimws(alt_raw)
+            ) %>%
+            dplyr::filter(
+              !is.na(cluster_id), nzchar(cluster_id),
+              is.finite(chr), is.finite(pos_ini), is.finite(pos_end)
+            ) %>%
+            dplyr::mutate(
+              variant_key = dplyr::case_when(
+                !is.na(ref_raw) & nzchar(ref_raw) & !is.na(alt_raw) & nzchar(alt_raw) ~
+                  paste0(cluster_id, "||chr", chr, ":", pos_ini, ":", ref_raw, ":", alt_raw),
+                TRUE ~
+                  paste0(cluster_id, "||chr", chr, ":", pos_ini)
+              )
+            ) %>%
+            dplyr::distinct(variant_key, .keep_all = TRUE) %>%
+            dplyr::mutate(
+              id_hit = dplyr::case_when(
+                !is.na(rsid_raw) & nzchar(rsid_raw) ~ rsid_raw,
+                !is.na(ref_raw) & nzchar(ref_raw) & !is.na(alt_raw) & nzchar(alt_raw) ~
+                  paste0("chr", chr, ":", pos_ini, ":", ref_raw, ":", alt_raw),
+                TRUE ~
+                  paste0("chr", chr, ":", pos_ini)
+              ),
+              classe = app_hit_class
+            ) %>%
+            dplyr::select(cluster_id, chr, pos_ini, pos_end, id_hit, classe)
+          
+        } else {
+          append_log(paste0(
+            ld_tag, "[CANDIDATES][APP] skipped: missing columns -> ",
+            paste(
+              c(
+                setdiff(needed_hit_cols, names(hits)),
+                if (is.null(pos_hit_col)) "variant_position_col" else NULL
+              ),
+              collapse = ", "
+            )
+          ))
+        }
+        
+        append_log(paste0(ld_tag, "[CANDIDATES][APP] nrow=", nrow(nonsyn_candidates)))
+        append_log(
+          paste0(
+            ld_tag, "[CANDIDATES][APP] cluster counts:\n",
+            paste(
+              capture.output(
+                print(
+                  nonsyn_candidates %>%
+                    dplyr::count(cluster_id, name = "n_candidates_nonsyn")
+                )
+              ),
+              collapse = "\n"
+            )
+          )
+        )
+        
+        if (nrow(nonsyn_candidates) > 0) {
+          append_log(
+            paste0(
+              ld_tag, "[CANDIDATES][APP] head:\n",
+              paste(capture.output(print(utils::head(nonsyn_candidates, 10))), collapse = "\n")
+            )
+          )
+        }
+        
+        candidates_ld <- dplyr::bind_rows(gwas_candidates, nonsyn_candidates) %>%
+          dplyr::mutate(
+            rsid     = id_hit,
+            position = pos_ini
+          ) %>%
+          dplyr::select(cluster_id, chr, pos_ini, pos_end, id_hit, rsid, position, classe) %>%
+          dplyr::filter(
+            !is.na(cluster_id), nzchar(cluster_id),
+            is.finite(chr), is.finite(pos_ini), is.finite(pos_end),
+            !is.na(id_hit), nzchar(id_hit)
+          ) %>%
+          dplyr::distinct() %>%
+          dplyr::arrange(chr, pos_ini, id_hit, classe)
+        
+        append_log(paste0(ld_tag, "[CANDIDATES] combined nrow=", nrow(candidates_ld), " ncol=", ncol(candidates_ld)))
+        append_log(paste0(ld_tag, "[CANDIDATES] combined cols: ", paste(names(candidates_ld), collapse = ", ")))
+        append_log(
+          paste0(
+            ld_tag, "[CANDIDATES] combined head:\n",
+            paste(capture.output(print(utils::head(candidates_ld, 10))), collapse = "\n")
+          )
+        )
+        
+        if (nrow(candidates_ld) > 0) {
+          append_log(paste0(
+            ld_tag, "[CANDIDATES] classe counts:\n",
+            paste(capture.output(print(table(candidates_ld$classe, useNA = "ifany"))), collapse = "\n")
+          ))
+        }
+        
+        if (nrow(candidates_ld) > 0) {
+          saveRDS(candidates_ld, candidates_path)
+          manifest$files[[paste0(app_slug, "_candidates")]] <- basename(candidates_path)
+          append_log(paste0(ld_tag, "[CANDIDATES] saved: ", candidates_path))
+          append_log(paste0(ld_tag, "[CANDIDATES] exists after save: ", file.exists(candidates_path)))
+        } else {
+          append_log(paste0(ld_tag, "[CANDIDATES] ", basename(candidates_path), " NOT saved (0 rows)"))
+        }
+        
+        # ============================================================
+        # E) GENE-HIT BRIDGE (NonSyn hit -> gene)
+        # ============================================================
+        
+        gene_hit_bridge <- tibble::tibble(
+          cluster_id = character(),
+          source_app = character(),
+          gene = character(),
+          chr = integer(),
+          position = integer(),
+          id_hit = character(),
+          hit_key = character()
+        )
+        
+        id_hit_col_candidates <- c("rsid", "RSID", "SNP", "snp", "id", "ID")
+        id_hit_col <- intersect(id_hit_col_candidates, names(hits))
+        id_hit_col <- if (length(id_hit_col)) id_hit_col[1] else NULL
+        
+        pos_hit_col_candidates <- c("pos", "POS", "position", "Position", "bp", "BP", "pos_ini", "variant_pos")
+        pos_hit_col <- intersect(pos_hit_col_candidates, names(hits))
+        pos_hit_col <- if (length(pos_hit_col)) pos_hit_col[1] else NULL
+        
+        ref_col_candidates <- c("ref", "REF", "a1", "A1", "allele1")
+        alt_col_candidates <- c("alt", "ALT", "a2", "A2", "allele2")
+        
+        ref_col <- intersect(ref_col_candidates, names(hits))
+        alt_col <- intersect(alt_col_candidates, names(hits))
+        
+        ref_col <- if (length(ref_col)) ref_col[1] else NULL
+        alt_col <- if (length(alt_col)) alt_col[1] else NULL
+        
+        if (all(c("cluster_id", "chr", "genename") %in% names(hits)) && !is.null(pos_hit_col)) {
+          
+          gene_hit_bridge <- hits %>%
+            dplyr::transmute(
+              cluster_id = trimws(as.character(cluster_id)),
+              source_app = app_slug,
+              gene = trimws(as.character(genename)),
+              chr = suppressWarnings(as.integer(readr::parse_number(as.character(chr)))),
+              position = suppressWarnings(as.integer(readr::parse_number(as.character(.data[[pos_hit_col]])))),
+              rsid_raw = if (!is.null(id_hit_col)) trimws(as.character(.data[[id_hit_col]])) else NA_character_,
+              ref_raw = if (!is.null(ref_col)) trimws(as.character(.data[[ref_col]])) else NA_character_,
+              alt_raw = if (!is.null(alt_col)) trimws(as.character(.data[[alt_col]])) else NA_character_
+            ) %>%
+            dplyr::filter(
+              !is.na(cluster_id), nzchar(cluster_id),
+              !is.na(gene), nzchar(gene),
+              is.finite(chr), is.finite(position)
+            ) %>%
+            dplyr::mutate(
+              hit_key = dplyr::case_when(
+                !is.na(rsid_raw) & nzchar(rsid_raw) ~ rsid_raw,
+                !is.na(ref_raw) & nzchar(ref_raw) & !is.na(alt_raw) & nzchar(alt_raw) ~
+                  paste0("chr", chr, ":", position, ":", ref_raw, ":", alt_raw),
+                TRUE ~
+                  paste0("chr", chr, ":", position)
+              ),
+              id_hit = hit_key
+            ) %>%
+            dplyr::select(cluster_id, source_app, gene, chr, position, id_hit, hit_key) %>%
+            dplyr::distinct()
+        }
+        
+        append_log(paste0(ld_tag, "[GENE_HIT_BRIDGE] nrow=", nrow(gene_hit_bridge)))
+        
+        if (nrow(gene_hit_bridge) > 0) {
+          saveRDS(gene_hit_bridge, gene_hit_bridge_path)
+          manifest$files[[paste0(app_slug, "_gene_hit_bridge")]] <- basename(gene_hit_bridge_path)
+          append_log(paste0(ld_tag, "[GENE_HIT_BRIDGE] saved: ", gene_hit_bridge_path))
+          append_log(paste0(ld_tag, "[GENE_HIT_BRIDGE] exists after save: ", file.exists(gene_hit_bridge_path)))
+        } else {
+          append_log(paste0(ld_tag, "[GENE_HIT_BRIDGE] ", basename(gene_hit_bridge_path), " NOT saved (0 rows)"))
+        }
+        
+        # ============================================================
+        # FINAL MANIFEST WRITE
+        # ============================================================
+        manifest$apps_present <- sort(unique(c(manifest$apps_present, app_slug)))
+        manifest$last_updated <- as.character(Sys.time())
+        
+        saveRDS(manifest, manifest_path)
+        
+        append_log(paste0(log_tag, " manifest saved: ", manifest_path))
+        append_log(
+          paste0(
+            log_tag, " manifest content:\n",
+            paste(capture.output(str(manifest, max.level = 2)), collapse = "\n")
+          )
+        )
+        
+      }, error = function(e) {
+        if (exists("append_log", mode = "function", inherits = TRUE)) {
+          append_log(paste0("[LD-INTEGRATOR][ERROR] ", conditionMessage(e)))
+        } else if (exists("safe_log", mode = "function", inherits = TRUE)) {
+          safe_log("[LD-INTEGRATOR][ERROR] ", conditionMessage(e), "\n")
+        } else {
+          cat("[LD-INTEGRATOR][ERROR] ", conditionMessage(e), "\n", sep = "")
+        }
+      })
       
-   #  if (exists("dbnsfp_norm_path_rds", mode = "function")) dbnsfp_norm_path_rds(res$rds)
-   #  if (exists("dbnsfp_norm_path_csv", mode = "function")) dbnsfp_norm_path_csv(res$csv)
+      ######################## END INTEGRATOR
+      incProgress(0.05, detail = "Done")
+      safe_log("[END] run_nonsyn_clusters finished OK\n")
       
-      showNotification(
-        paste0("OK · tabix lines=", total_lines, " | final rows=", nrow(df_final)),
-        type = "message",
-        duration = 8
-      )
-      
-      safe_log("[OK] Finished. tabix lines=", total_lines, " final=", nrow(df_final), "\n")
+      if (is.null(df_final) || !nrow(df_final)) {
+        showNotification("No NonSyn variants found in clusters.", type = "warning", duration = 6)
+      } else {
+        showNotification("NonSyn variants assigned to clusters and final outputs saved.", type = "message", duration = 4)
+      }
       
     }, error = function(e) {
-      msg <- conditionMessage(e)
-      showNotification(paste0("ERROR · ", msg), type = "error", duration = 12)
+      
+      dbnsfp_final_path_csv(NULL)
+      dbnsfp_final_path_rds(NULL)
+      dbnsfp_norm_path_csv(NULL)
+      dbnsfp_norm_path_rds(NULL)
+      
+      msg <- paste0("ERROR (run_nonsyn_clusters): ", conditionMessage(e))
+      
       safe_log("[ERROR] ", msg, "\n")
+      showNotification(conditionMessage(e), type = "error", duration = 12)
+      
+    }, finally = {
+      
+      # if (requireNamespace("shinyjs", quietly = TRUE)) shinyjs::enable("run_nonsyn_clusters")
+      
     })
     
   }, ignoreInit = TRUE)
-  
-  
-  ############################################################################  
+  ######################### END INTEGRATOR #########################################  
   # -------------------------
   # Single reactive: dbNSFP dataset used everywhere
   # - OLD mode: reads uploaded CSV/RDS
   # - NEW mode: reads FINAL paths (prefer RDS)
   # -------------------------
   dbnsfp_norm_df <- reactive({
-    
-    # -------------------------
-    # PRECOMPUTED MODE (old)
-    # -------------------------
-    if (identical(input$use_preloaded_dbnsfp, "old")) {
-      
-      req(input$dbnsfp_preload)
-      path <- input$dbnsfp_preload$datapath
-      ext  <- tolower(tools::file_ext(input$dbnsfp_preload$name))
-      
-      df <- tryCatch({
-        if (ext == "rds") readRDS(path) else utils::read.csv(path, check.names = FALSE, stringsAsFactors = FALSE)
-      }, error = function(e) NULL)
-      
-      validate(
-        need(is.data.frame(df), "Invalid dbNSFP file."),
-        need(all(c("chr", "BP") %in% names(df)), "dbNSFP file must contain columns: chr, BP.")
-      )
-      
-      df <- sanitize_colnames(df)
-      df <- harmonize_dbnsfp_loaded(df)
-      
-      # Optional: expose "final" paths also in old mode (so downstream logic is unified)
-      if (ext == "rds") {
-        dbnsfp_final_path_rds(path)
-        dbnsfp_final_path_csv(NULL)
-      } else {
-        dbnsfp_final_path_csv(path)
-        dbnsfp_final_path_rds(NULL)
-      }
-      
-      return(df)
-    }
-    
-    # -------------------------
-    # NEW MODE: read FINAL (prefer RDS)
-    # -------------------------
     rds <- dbnsfp_final_path_rds()
     csv <- dbnsfp_final_path_csv()
     
     if ((is.null(rds) || !file.exists(rds)) && (is.null(csv) || !file.exists(csv))) {
-      # Not ready yet
       return(tibble::tibble())
     }
     
     df <- NULL
+    
     if (!is.null(rds) && file.exists(rds)) {
       df <- readRDS(rds)
     } else {
       df <- utils::read.csv(csv, check.names = FALSE, stringsAsFactors = FALSE)
     }
     
+    validate(need(is.data.frame(df), "Invalid final dbNSFP output."))
+    
     df <- sanitize_colnames(df)
     df <- harmonize_dbnsfp_loaded(df)
     
-    # In NEW mode we require cluster_id
-    if (!"cluster_id" %in% names(df)) return(tibble::tibble())
+    if (!"cluster_id" %in% names(df)) {
+      return(tibble::tibble())
+    }
     
     df
   })
   
   detect_gene_col <- function(df) {
-  nm <- names(df)
-
-  # el teu cas real
-  if ("genename" %in% nm) return("genename")
-
-  # altres candidats habituals
-  cand <- c("gene","Gene","gene_name","Gene_name","symbol","SYMBOL",
-            "hgnc_symbol","HGNC","Gene.refGene","Gene_refGene","GeneRefGene")
-  hit <- cand[cand %in% nm]
-  if (length(hit)) return(hit[1])
-
-  # fallback regex
-  low <- tolower(nm)
-  ok <- grepl("gene|symbol", low) & !grepl("pred$", low)
-  if (any(ok)) return(nm[which(ok)[1]])
-
-  NULL
-}
+    nm <- names(df)
+    
+    # el teu cas real
+    if ("genename" %in% nm) return("genename")
+    
+    # altres candidats habituals
+    cand <- c("gene","Gene","gene_name","Gene_name","symbol","SYMBOL",
+              "hgnc_symbol","HGNC","Gene.refGene","Gene_refGene","GeneRefGene")
+    hit <- cand[cand %in% nm]
+    if (length(hit)) return(hit[1])
+    
+    # fallback regex
+    low <- tolower(nm)
+    ok <- grepl("gene|symbol", low) & !grepl("pred$", low)
+    if (any(ok)) return(nm[which(ok)[1]])
+    
+    NULL
+  }
   # ============================================================
   # Metric registry (score-only vs paired score/rankscore metrics)
   # ============================================================
@@ -3837,7 +4698,16 @@ server <- function(input, output, session) {
         displaylogo = FALSE,
         modeBarButtonsToRemove = c("select2d", "lasso2d", "hoverCompareCartesian")
       ) %>%
-      plotly::layout(showlegend = FALSE)
+      plotly::layout(showlegend = FALSE) %>% 
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "Combined_Manhattan_plot",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
+      )
     
   })
   
@@ -3949,12 +4819,16 @@ server <- function(input, output, session) {
       extensions = "Buttons",
       options    = list(
         dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf", "print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 10,
         scrollX    = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   # ========================================================================
   # 7) Summary tables + simple plots (gene bar + metric histogram)
@@ -4143,12 +5017,16 @@ server <- function(input, output, session) {
       extensions = "Buttons",
       options    = list(
         dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf", "print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 20,
         scrollX    = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   output$nonsyn_gene_bar <- renderPlot({
     dt <- nonsyn_manhattan_df()
@@ -4303,33 +5181,43 @@ server <- function(input, output, session) {
       )
   })
   
-  # A) Fill chromosomes
+  # A) Fill chromosomes for cluster mode
   observeEvent(radar_base_df(), {
     df <- radar_base_df()
     
-    if (!is.data.frame(df) || nrow(df) == 0) {
-      updateSelectInput(session, "radar_chr", choices = character(0), selected = NULL)
+    if (!is.data.frame(df) || nrow(df) == 0 || !"CHR" %in% names(df)) {
       updateSelectInput(session, "radar_chr_for_cluster", choices = character(0), selected = NULL)
+      updateSelectInput(session, "radar_cluster_id", choices = character(0), selected = NULL)
       return()
     }
     
-    chr_choices <- sort(unique(df$CHR))
+    chr_choices <- sort(unique(suppressWarnings(as.integer(df$CHR))))
     chr_choices <- chr_choices[is.finite(chr_choices)]
+    
     if (!length(chr_choices)) {
-      updateSelectInput(session, "radar_chr", choices = character(0), selected = NULL)
       updateSelectInput(session, "radar_chr_for_cluster", choices = character(0), selected = NULL)
+      updateSelectInput(session, "radar_cluster_id", choices = character(0), selected = NULL)
       return()
     }
     
     chr_labels <- paste0("chr", chr_label_plink(chr_choices))
     chr_map    <- stats::setNames(as.character(chr_choices), chr_labels)
     
-    sel_chr  <- if (!is.null(input$radar_chr) && input$radar_chr %in% chr_map) input$radar_chr else chr_map[[1]]
-    sel_chr2 <- if (!is.null(input$radar_chr_for_cluster) && input$radar_chr_for_cluster %in% chr_map) input$radar_chr_for_cluster else chr_map[[1]]
+    sel_chr <- if (!is.null(input$radar_chr_for_cluster) &&
+                   input$radar_chr_for_cluster %in% unname(chr_map)) {
+      input$radar_chr_for_cluster
+    } else {
+      unname(chr_map)[1]
+    }
     
-    updateSelectInput(session, "radar_chr", choices = chr_map, selected = sel_chr)
-    updateSelectInput(session, "radar_chr_for_cluster", choices = chr_map, selected = sel_chr2)
+    updateSelectInput(
+      session,
+      "radar_chr_for_cluster",
+      choices = chr_map,
+      selected = sel_chr
+    )
   }, ignoreInit = FALSE)
+  
   
   # B) Fill clusters for selected chromosome
   observeEvent(list(radar_base_df(), input$radar_chr_for_cluster), {
@@ -4347,7 +5235,10 @@ server <- function(input, output, session) {
     }
     
     ids <- df %>%
-      dplyr::filter(CHR == chr_sel, !is.na(cluster_id), nzchar(cluster_id)) %>%
+      dplyr::filter(
+        CHR == chr_sel,
+        !is.na(cluster_id), nzchar(cluster_id)
+      ) %>%
       dplyr::distinct(cluster_id) %>%
       dplyr::arrange(cluster_id) %>%
       dplyr::pull(cluster_id)
@@ -4357,9 +5248,21 @@ server <- function(input, output, session) {
       return()
     }
     
-    sel_id <- if (!is.null(input$radar_cluster_id) && input$radar_cluster_id %in% ids) input$radar_cluster_id else ids[1]
-    updateSelectInput(session, "radar_cluster_id", choices = ids, selected = sel_id)
+    sel_id <- if (!is.null(input$radar_cluster_id) &&
+                  input$radar_cluster_id %in% ids) {
+      input$radar_cluster_id
+    } else {
+      ids[1]
+    }
+    
+    updateSelectInput(
+      session,
+      "radar_cluster_id",
+      choices = ids,
+      selected = sel_id
+    )
   }, ignoreInit = FALSE)
+  
   
   # C) Fill genes grouped by cluster (optgroup)
   observeEvent(radar_base_df(), {
@@ -4371,7 +5274,10 @@ server <- function(input, output, session) {
     }
     
     dd <- df %>%
-      dplyr::filter(!is.na(cluster_id), nzchar(cluster_id), !is.na(genename), nzchar(genename)) %>%
+      dplyr::filter(
+        !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(genename),   nzchar(genename)
+      ) %>%
       dplyr::distinct(cluster_id, genename) %>%
       dplyr::arrange(cluster_id, genename)
     
@@ -4389,12 +5295,23 @@ server <- function(input, output, session) {
       })
     
     all_keys <- unlist(choices_list, use.names = FALSE)
-    sel <- if (!is.null(input$radar_gene) && input$radar_gene %in% all_keys) input$radar_gene else all_keys[1]
     
-    updateSelectInput(session, "radar_gene", choices = choices_list, selected = sel)
+    sel <- if (!is.null(input$radar_gene) && input$radar_gene %in% all_keys) {
+      input$radar_gene
+    } else {
+      all_keys[1]
+    }
+    
+    updateSelectInput(
+      session,
+      "radar_gene",
+      choices = choices_list,
+      selected = sel
+    )
   }, ignoreInit = FALSE)
   
-  # D) Aggregate row depending on mode (cluster / chr / gene)
+  
+  # D) Aggregate row depending on mode (global / cluster / gene)
   radar_group_row <- reactive({
     df <- radar_base_df()
     if (!is.data.frame(df) || nrow(df) == 0) return(NULL)
@@ -4404,34 +5321,55 @@ server <- function(input, output, session) {
     
     mode <- input$radar_mode %||% "cluster"
     
-    if (mode == "cluster") {
-      cl <- as.character(input$radar_cluster_id %||% "")
-      if (!nzchar(cl)) return(NULL)
-      df_use <- df %>% dplyr::filter(cluster_id == cl)
-      label  <- cl
+    if (mode == "global") {
+      df_use <- df
+      label  <- "Global"
       
-    } else if (mode == "chr") {
-      chr_sel <- suppressWarnings(as.integer(input$radar_chr))
-      if (!is.finite(chr_sel)) return(NULL)
-      df_use <- df %>% dplyr::filter(CHR == chr_sel)
-      label  <- paste0("chr", chr_label_plink(chr_sel))
+    } else if (mode == "cluster") {
+      chr_sel <- suppressWarnings(as.integer(input$radar_chr_for_cluster))
+      cl      <- as.character(input$radar_cluster_id %||% "")
       
-    } else { # gene: "cluster||gene"
+      if (!is.finite(chr_sel) || !nzchar(cl)) return(NULL)
+      
+      df_use <- df %>%
+        dplyr::filter(
+          CHR == chr_sel,
+          cluster_id == cl
+        )
+      
+      label <- paste0(cl, " (chr", chr_label_plink(chr_sel), ")")
+      
+    } else if (mode == "gene") {
       key <- as.character(input$radar_gene %||% "")
       if (!nzchar(key)) return(NULL)
+      
       parts <- strsplit(key, "\\|\\|")[[1]]
-      cluster_sel <- parts[1] %||% ""
-      gene_sel    <- parts[2] %||% ""
+      cluster_sel <- if (length(parts) >= 1) parts[1] else ""
+      gene_sel    <- if (length(parts) >= 2) parts[2] else ""
+      
       if (!nzchar(cluster_sel) || !nzchar(gene_sel)) return(NULL)
       
-      df_use <- df %>% dplyr::filter(cluster_id == cluster_sel, genename == gene_sel)
-      label  <- paste0(gene_sel, " (", cluster_sel, ")")
+      df_use <- df %>%
+        dplyr::filter(
+          cluster_id == cluster_sel,
+          genename == gene_sel
+        )
+      
+      label <- paste0(gene_sel, " (", cluster_sel, ")")
+      
+    } else {
+      return(NULL)
     }
     
     if (!is.data.frame(df_use) || nrow(df_use) == 0) return(NULL)
     
     row <- df_use %>%
-      dplyr::summarise(dplyr::across(dplyr::all_of(mets), \(x) mean(x, na.rm = TRUE)))
+      dplyr::summarise(
+        dplyr::across(
+          dplyr::all_of(mets),
+          ~ mean(.x, na.rm = TRUE)
+        )
+      )
     
     row$label <- label
     row
@@ -4490,6 +5428,194 @@ server <- function(input, output, session) {
       )
   })
   
+  output$nonsyn_radar_plotly <- plotly::renderPlotly({
+    row <- radar_group_row()
+    validate(need(
+      is.data.frame(row) && nrow(row) == 1,
+      "Radar: select a valid Cluster / Chromosome / Gene."
+    ))
+    
+    # ----------------------------------------------------------
+    # Build long table
+    # ----------------------------------------------------------
+    radar_long <- purrr::imap_dfr(radar_metrics_rank, function(mset, grp) {
+      mset <- intersect(as.character(mset), names(row))
+      if (!length(mset)) return(NULL)
+      
+      metric_lbl <- pretty_metric_2lines(mset)
+      metric_lbl <- gsub("\n", "<br>", metric_lbl, fixed = TRUE)
+      metric_lbl[is.na(metric_lbl) | !nzchar(metric_lbl)] <- mset[is.na(metric_lbl) | !nzchar(metric_lbl)]
+      
+      tibble::tibble(
+        group      = as.character(grp),
+        metric     = as.character(metric_lbl),
+        metric_raw = as.character(mset),
+        value      = as.numeric(row[1, mset])
+      )
+    })
+    
+    radar_long <- radar_long %>%
+      dplyr::filter(
+        is.finite(value),
+        !is.na(group), nzchar(group),
+        !is.na(metric), nzchar(metric)
+      ) %>%
+      dplyr::mutate(
+        value = pmin(pmax(value, 0), 1)
+      )
+    
+    validate(need(
+      nrow(radar_long) >= 3,
+      "Not enough rankscore metrics for radar plot (need >= 3)."
+    ))
+    
+    groups_present <- unique(radar_long$group)
+    validate(need(length(groups_present) > 0, "No radar groups available."))
+    
+    # ----------------------------------------------------------
+    # Grid geometry
+    # ----------------------------------------------------------
+    n_grp <- length(groups_present)
+    ncol  <- min(2, n_grp)
+    nrow  <- ceiling(n_grp / ncol)
+    
+    x_gap       <- 0.05   # prova entre 0.04 i 0.12
+    y_gap       <- 0.07   # prova entre 0.06 i 0.16
+    
+    cell_w <- (1 - x_gap * (ncol - 1)) / ncol
+    cell_h <- (1 - y_gap * (nrow - 1)) / nrow
+    
+    inner_pad_x <- 0.03   # prova entre 0.02 i 0.10
+    inner_pad_y <- 0.04   # prova entre 0.03 i 0.12
+    
+    # ----------------------------------------------------------
+    # Base figure
+    # ----------------------------------------------------------
+    fig <- plotly::plot_ly()
+    layout_args <- list()
+    annotations <- list()
+  
+    
+    for (i in seq_along(groups_present)) {
+      grp <- groups_present[i]
+      d <- radar_long %>% dplyr::filter(group == grp)
+      
+      validate(need(nrow(d) >= 3, paste("Not enough metrics in group:", grp)))
+      
+      # close polygon
+      d2 <- dplyr::bind_rows(d, d[1, , drop = FALSE])
+      
+      # panel position
+      col_i <- ((i - 1) %% ncol) + 1
+      row_i <- ((i - 1) %/% ncol) + 1
+      
+      x0 <- (col_i - 1) * (cell_w + x_gap)
+      x1 <- x0 + cell_w
+      
+      # row 1 = top
+      y1 <- 1 - (row_i - 1) * (cell_h + y_gap)
+      y0 <- y1 - cell_h
+      
+      polar_id <- if (i == 1) "polar" else paste0("polar", i)
+      
+      fig <- fig %>%
+        plotly::add_trace(
+          data = d2,
+          type = "scatterpolar",
+          mode = "lines+markers",
+          subplot = polar_id,
+          r = ~value,
+          theta = ~metric,
+          customdata = ~metric_raw,
+          hovertemplate = paste0(
+            "<b>", as.character(row$label[[1]]), "</b><br>",
+            "Group: ", grp, "<br>",
+            "Metric: %{customdata}<br>",
+            "Rankscore: %{r:.3f}<extra></extra>"
+          ),
+          fill = "toself",
+          fillcolor = "rgba(160,160,160,0.18)",
+          line = list(color = "rgba(80,80,80,0.9)", width = 2),
+          marker = list(
+            size = 10,
+            color = ~value,
+            colorscale = list(
+              list(0.00, "yellow"),
+              list(0.50, "orange"),
+              list(1.00, "red")
+            ),
+            cmin = 0,
+            cmax = 1,
+            showscale = TRUE,
+            colorbar = list(
+              title = list(text = "Rankscore", side = "right"),
+              len = 0.35,
+              thickness = 12,
+              y = 0.5,
+              yanchor = "middle",
+              tickfont = list(size = 10)
+            ),
+            line = list(color = "rgba(60,60,60,0.8)", width = 1)
+          ),
+          showlegend = FALSE,
+          inherit = FALSE
+        )
+      
+      xp0 <- x0 + inner_pad_x
+      xp1 <- x1 - inner_pad_x
+      yp0 <- y0 + inner_pad_y
+      yp1 <- y1 - inner_pad_y
+      
+      layout_args[[polar_id]] <- list(
+        domain = list(x = c(xp0, xp1), y = c(yp0, yp1)),
+        bgcolor = "white",
+        radialaxis = list(
+          range = c(0, 1),
+          tickvals = c(0, 0.25, 0.5, 0.75, 1),
+          ticktext = c("0", "0.25", "0.5", "0.75", "1"),
+          angle = 90,
+          gridcolor = "rgba(180,180,180,0.5)",
+          linecolor = "rgba(180,180,180,0.8)"
+        ),
+        angularaxis = list(
+          direction = "clockwise",
+          rotation = 90,
+          tickfont = list(size = 10),
+          gridcolor = "rgba(220,220,220,0.35)",
+          linecolor = "rgba(180,180,180,0.75)"
+        )
+      )
+      
+      annotations[[length(annotations) + 1]] <- list(
+        text = paste0("<b>", grp, "</b>"),
+        x = (x0 + x1) / 2,
+        y = min(1, y1 + 0.04),
+        xref = "paper",
+        yref = "paper",
+        showarrow = FALSE,
+        font = list(size = 13)
+      )
+    }
+    
+    layout_args$title <- list(
+      text = paste0("Clinical radar – ", as.character(row$label[[1]])),
+      x = 0.02,
+      xanchor = "left"
+    )
+    layout_args$paper_bgcolor <- "white"
+    layout_args$plot_bgcolor  <- "white"
+    layout_args$margin <- list(l = 20, r = 20, t = 80, b = 20)
+    layout_args$annotations <- annotations
+    
+    fig <- do.call(plotly::layout, c(list(p = fig), layout_args))
+    
+    fig %>% plotly::config(displayModeBar = TRUE)
+  })
+  
+  ##############################################################################
+  
+  
+  
   # F) Radar selection table (summary of IDs + genes with links)
   radar_selected_df <- reactive({
     df <- dbnsfp_norm_df()
@@ -4500,26 +5626,47 @@ server <- function(input, output, session) {
     mode <- input$radar_mode %||% "cluster"
     chr_num <- suppressWarnings(as.integer(norm_chr_generic(df[["chr"]])))
     
-    if (mode == "cluster") {
-      req(input$radar_cluster_id)
-      df_use <- df %>% dplyr::filter(!is.na(cluster_id), cluster_id == input$radar_cluster_id)
-      label <- input$radar_cluster_id
+    if (mode == "global") {
+      df_use <- df
+      label  <- "Global"
       
-    } else if (mode == "chr") {
-      req(input$radar_chr)
-      chr_sel <- suppressWarnings(as.integer(input$radar_chr))
-      df_use <- df %>% dplyr::mutate(.CHR = chr_num) %>% dplyr::filter(.CHR == chr_sel)
-      label <- paste0("chr", chr_label_plink(chr_sel))
+    } else if (mode == "cluster") {
+      req(input$radar_chr_for_cluster, input$radar_cluster_id)
       
-    } else {
+      chr_sel <- suppressWarnings(as.integer(input$radar_chr_for_cluster))
+      cl_sel  <- as.character(input$radar_cluster_id %||% "")
+      
+      req(is.finite(chr_sel), nzchar(cl_sel))
+      
+      df_use <- df %>%
+        dplyr::mutate(.CHR = chr_num) %>%
+        dplyr::filter(
+          .CHR == chr_sel,
+          !is.na(cluster_id),
+          cluster_id == cl_sel
+        )
+      
+      label <- paste0(cl_sel, " (chr", chr_label_plink(chr_sel), ")")
+      
+    } else if (mode == "gene") {
       req(input$radar_gene)
+      
       parts <- strsplit(as.character(input$radar_gene), "\\|\\|")[[1]]
       cluster_sel <- parts[1] %||% ""
       gene_sel    <- parts[2] %||% ""
+      
       req(nzchar(cluster_sel), nzchar(gene_sel))
       
-      df_use <- df %>% dplyr::filter(cluster_id == cluster_sel, genename == gene_sel)
-      label  <- paste0(gene_sel, " (", cluster_sel, ")")
+      df_use <- df %>%
+        dplyr::filter(
+          cluster_id == cluster_sel,
+          genename == gene_sel
+        )
+      
+      label <- paste0(gene_sel, " (", cluster_sel, ")")
+      
+    } else {
+      return(NULL)
     }
     
     validate(need(nrow(df_use) > 0, "No variants for the current radar selection."))
@@ -4607,14 +5754,18 @@ server <- function(input, output, session) {
       rownames = FALSE,
       escape = FALSE,
       extensions = "Buttons",
-      options    = list(
-        dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf", "print"),
+      options = list(
+        dom = "Bfrtip",
+        buttons = list(
+          list(extend = "copy",  exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE)),
+          list(extend = "csv",   exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE)),
+          list(extend = "excel", exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE))
+        ),
         pageLength = 1,
-        scrollX    = TRUE
+        scrollX = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   # ========================================================================
   # 9) UCSC viewer (GWAS + NonSyn) — custom tracks (dbSNP clickable)
@@ -5404,10 +6555,19 @@ server <- function(input, output, session) {
     if (!is.null(cl_ord)) {
       out <- out %>% plotly::layout(
         xaxis3 = list(categoryorder = "array", categoryarray = cl_ord)
-      )
+      ) 
     }
     
-    out %>% plotly::config(displaylogo = FALSE)
+    out %>% plotly::config(displaylogo = FALSE) %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "summary_stats",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
+      )
     
   })
   
@@ -5527,12 +6687,16 @@ server <- function(input, output, session) {
       extensions = "Buttons",
       options    = list(
         dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf", "print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 10,
         scrollX    = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   output$nonsyn_gene_stats_tbl <- DT::renderDT({
     df <- nonsyn_gene_stats()
@@ -5548,12 +6712,16 @@ server <- function(input, output, session) {
       extensions = "Buttons",
       options    = list(
         dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf", "print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 15,
         scrollX    = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   output$nonsyn_cluster_stats_tbl <- DT::renderDT({
     df <- nonsyn_cluster_stats()
@@ -5569,12 +6737,16 @@ server <- function(input, output, session) {
       extensions = "Buttons",
       options    = list(
         dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf", "print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 15,
         scrollX    = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   output$dl_nonsyn_chr_stats_csv <- downloadHandler(
     filename = function() {
@@ -6528,68 +7700,142 @@ server <- function(input, output, session) {
     out
   })
   
-  output$go_bar <- renderPlot({
-    dat <- go_top_df()
-    req(is.data.frame(dat), nrow(dat) > 0)
+  output$go_bar <- plotly::renderPlotly({
     
-    fb    <- isTRUE(attr(dat, "fallback"))
-    ttl   <- paste0("GO enrichment (", scope_label(), ")")
-    subttl <- if (fb) {
-      paste0(
-        "No terms at FDR ≤ ", input$go_kegg_pcut %||% 0.05,
-        " — showing top terms ranked by FDR; bar height = -log10(pvalue)"
-      )
-    } else {
-      paste0("FDR ≤ ", input$go_kegg_pcut %||% 0.05, " (bar height = -log10(pvalue))")
+    dat0 <- go_top_df()
+    
+    if (!is.data.frame(dat0) || !nrow(dat0)) {
+      return(plotly::plot_ly() %>% plotly::layout(title = "Run GO enrichment to see barplot."))
+    }
+    
+    # --- Build Catalog-like input: term + n_genes + Ontology (+ p.adjust/pvalue) ---
+    dat <- dat0 %>%
+      dplyr::transmute(
+        Ontology   = as.character(Ontology),
+        go_term    = as.character(Description),
+        term_short = if ("term_short" %in% names(dat0)) as.character(term_short) else as.character(Description),
+        n_genes    = suppressWarnings(as.integer(Count)),
+        p.adjust   = suppressWarnings(as.numeric(p.adjust)),
+        pvalue     = suppressWarnings(as.numeric(pvalue))
+      ) %>%
+      dplyr::filter(!is.na(n_genes), n_genes > 0, !is.na(Ontology), nzchar(Ontology), nzchar(go_term))
+    
+    validate(need(nrow(dat) > 0, "GO: no data to plot yet."))
+    
+    top_n <- input$go_class_top %||% 15
+    gap   <- 2
+    
+    # Helper: shorten/wrap terms
+    if (!exists("shorten_term", mode = "function")) {
+      shorten_term <- function(x, max = 55) {
+        x <- as.character(x)
+        x <- stringr::str_squish(x)
+        x <- stringr::str_to_sentence(x)
+        ifelse(nchar(x) > max, paste0(substr(x, 1, max - 1), "…"), x)
+      }
     }
     
     dat <- dat %>%
-      dplyr::mutate(Ontology = factor(as.character(Ontology), levels = c("BP","CC","MF")))
+      dplyr::mutate(
+        term_short = stringr::str_wrap(shorten_term(term_short, 55), width = 28)
+      )
     
-    cols_go <- c(BP = "darkgreen", CC = "orange", MF = "darkblue")
+    ont_order <- c("BP","CC","MF")
+    present   <- intersect(ont_order, unique(dat$Ontology))
+    validate(need(length(present) > 0, "No BP/CC/MF data to plot."))
     
-    mk <- function(onto) {
-      d <- dat %>% dplyr::filter(Ontology == onto)
-      if (!nrow(d)) {
-        return(ggplot2::ggplot() + ggplot2::theme_void() + ggplot2::labs(title = paste0(onto, " (none)")))
-      }
-      
-      ggplot2::ggplot(
-        d,
-        ggplot2::aes(
-          x    = stats::reorder(term_short, score),
-          y    = score,
-          fill = Ontology
-        )
-      ) +
-        ggplot2::geom_col() +
-        ggplot2::coord_flip() +
-        ggplot2::labs(title = onto, x = NULL, y = "-log10(pvalue)") +
-        ggplot2::scale_fill_manual(values = cols_go, guide = "none", drop = FALSE) +
-        ggplot2::theme_minimal(base_size = 12) +
-        ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-    }
+    dat <- dat %>%
+      dplyr::filter(Ontology %in% present) %>%
+      dplyr::mutate(Ontology = factor(Ontology, levels = ont_order))
     
-    if (requireNamespace("patchwork", quietly = TRUE)) {
-      (mk("BP") | mk("CC") | mk("MF")) +
-        patchwork::plot_annotation(title = ttl, subtitle = subttl)
+    # Top-N per ontology: use n_genes (consistent with goslim_bar)
+    dat <- dat %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::slice_max(order_by = n_genes, n = top_n, with_ties = FALSE) %>%
+      dplyr::arrange(Ontology, dplyr::desc(n_genes)) %>%
+      dplyr::mutate(rank = dplyr::row_number()) %>%
+      dplyr::ungroup()
+    
+    n_bp <- if ("BP" %in% present) max(dat$rank[dat$Ontology == "BP"], 0) else 0
+    n_cc <- if ("CC" %in% present) max(dat$rank[dat$Ontology == "CC"], 0) else 0
+    
+    offsets <- c(BP = 0, CC = n_bp + gap, MF = n_bp + gap + n_cc + gap)
+    dat$x <- dat$rank + offsets[as.character(dat$Ontology)]
+    
+    vlines <- c()
+    if (all(c("BP","CC") %in% present)) vlines <- c(vlines, offsets["CC"] - gap/2)
+    if (all(c("CC","MF") %in% present)) vlines <- c(vlines, offsets["MF"] - gap/2)
+    
+    centers <- dat %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::summarise(xmin=min(x), xmax=max(x), xmid=(xmin+xmax)/2, .groups="drop")
+    
+    ymax  <- max(dat$n_genes, na.rm = TRUE)
+    ylab  <- -0.12 * ymax
+    y_top <- ymax * 1.08
+    
+    sel_label <- if (exists("scope_label", mode = "function")) scope_label() else "global"
+    pcut <- input$enrich_pcut %||% 0.05
+    fb   <- isTRUE(attr(dat0, "fallback"))
+    subttl <- if (fb) {
+      paste0("No terms at FDR ≤ ", pcut, " — showing top terms ranked by FDR")
     } else {
-      ggplot2::ggplot(
-        dat,
-        ggplot2::aes(
-          x    = stats::reorder(term_short, score),
-          y    = score,
-          fill = Ontology
-        )
-      ) +
-        ggplot2::geom_col() +
-        ggplot2::coord_flip() +
-        ggplot2::facet_wrap(~Ontology, scales = "free_y") +
-        ggplot2::scale_fill_manual(values = cols_go, guide = "none", drop = FALSE) +
-        ggplot2::labs(title = ttl, subtitle = subttl, x = NULL, y = "-log10(pvalue)") +
-        ggplot2::theme_minimal(base_size = 12)
+      paste0("FDR ≤ ", pcut)
     }
-  }, height = 450)
+    
+    # fmt_p fallback (si no existeix a NonSyn)
+    if (!exists("fmt_p", mode = "function")) {
+      fmt_p <- function(x) {
+        x <- suppressWarnings(as.numeric(x))
+        ifelse(is.na(x), "NA", formatC(x, format = "e", digits = 2))
+      }
+    }
+    
+    dat$tooltip <- paste0(
+      "<b>", dat$Ontology, "</b>",
+      "<br><b>GO term:</b> ", htmltools::htmlEscape(dat$go_term),
+      "<br><b>Genes:</b> ", dat$n_genes,
+      "<br><b>p.adj:</b> ", fmt_p(dat$p.adjust),
+      "<br><b>p:</b> ", fmt_p(dat$pvalue)
+    )
+    
+    p <- ggplot2::ggplot(dat, ggplot2::aes(x=x, y=n_genes, fill=Ontology, text=tooltip)) +
+      ggplot2::geom_col(width=0.85, color="black", linewidth=0.25) +
+      { if (length(vlines)) ggplot2::geom_vline(xintercept=vlines, linewidth=0.4) } +
+      ggplot2::scale_x_continuous(breaks=dat$x, labels=dat$term_short, expand=c(0,0)) +
+      ggplot2::coord_cartesian(ylim=c(ylab, ymax*1.20), clip="off") +
+      { if ("BP" %in% present) ggplot2::annotate("text", x=centers$xmid[centers$Ontology=="BP"], y=y_top,
+                                                 label="Biological Process", fontface="bold", size=3.6) } +
+      { if ("CC" %in% present) ggplot2::annotate("text", x=centers$xmid[centers$Ontology=="CC"], y=y_top,
+                                                 label="Cellular Component", fontface="bold", size=3.6) } +
+      { if ("MF" %in% present) ggplot2::annotate("text", x=centers$xmid[centers$Ontology=="MF"], y=y_top,
+                                                 label="Molecular Function", fontface="bold", size=3.6) } +
+      ggplot2::labs(
+        x=NULL, y="Number of genes",
+        title=paste0("GO enrichment — ", sel_label),
+        subtitle=subttl
+      ) +
+      ggplot2::theme_minimal(base_size=10) +
+      ggplot2::theme(
+        plot.title    = ggplot2::element_text(size=11, face="bold"),
+        plot.subtitle = ggplot2::element_text(size=9),
+        axis.text.x   = ggplot2::element_text(angle=90, size=7, vjust=0.5, hjust=1),
+        legend.position="none",
+        plot.margin   = grid::unit(c(28,10,35,10), "pt")
+      ) +
+      ggplot2::scale_fill_manual(values=c(BP="darkgreen", CC="orange", MF="darkblue"), guide="none")
+    
+    plotly::ggplotly(p, tooltip="text") %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "enrich_GO",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
+      )
+  })
   
   output$go_table <- DT::renderDT({
     df0 <- go_enrich_raw()
@@ -6626,13 +7872,17 @@ server <- function(input, output, session) {
         pageLength = 15,
         scrollX    = TRUE,
         dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel","pdf"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         # FDR is column 9 in the displayed table (1-based index inside DataTables)
         order      = list(list(8, "asc"))
       )
     ) %>%
       DT::formatSignif(c("pvalue", "FDR", "qvalue"), digits = 3)
-  })
+  }, server = FALSE)
   
   
   # ==========================
@@ -6765,29 +8015,127 @@ server <- function(input, output, session) {
     df_use
   })
   
-  output$kegg_bar <- renderPlot({
-    df <- kegg_top_df()
-    if (!is.data.frame(df) || !nrow(df)) {
-      return(ggplot2::ggplot() + ggplot2::theme_void() +
-               ggplot2::labs(title = "KEGG enrichment", subtitle = "No KEGG pathways returned (mapping failed or none annotated)."))
+  output$kegg_bar <- plotly::renderPlotly({
+    df0 <- kegg_top_df()
+    
+    if (!is.data.frame(df0) || !nrow(df0)) {
+      p0 <- ggplot2::ggplot() + ggplot2::theme_void() +
+        ggplot2::labs(
+          title = "KEGG enrichment",
+          subtitle = "No KEGG pathways returned (mapping failed or none annotated)."
+        )
+      return(plotly::ggplotly(p0))
     }
     
-    note <- attr(df, "fallback_mode") %||% ""
+    note <- attr(df0, "fallback_mode") %||% ""
     ttl  <- paste0(
       "KEGG enrichment (", scope_label(), ")",
       if (nzchar(note)) paste0(" — ", note) else paste0(" — FDR ≤ ", (input$enrich_pcut %||% 0.05))
     )
     
-    df <- df %>% dplyr::mutate(score = -log10(pvalue))
-    ggplot2::ggplot(df, ggplot2::aes(x = stats::reorder(Description, score), y = score)) +
-      ggplot2::geom_col(color = "black", linewidth = 0.25) +
+    # robust columns
+    tcol <- pick_col(df0, c("Description","term","description","ID","Pathway","term_full","TERM"))
+    if (is.null(tcol)) tcol <- "Description"
+    
+    ccol <- pick_col(df0, c("Count","count","N","n_genes","genes","n"))
+    validate(need(!is.null(ccol), "KEGG: missing Count column (expected 'Count')."))
+    
+    fcol <- pick_col(df0, c("p.adjust","p_adj","FDR","padj","p_adjust"))
+    if (is.null(fcol)) fcol <- NA_character_
+    
+    pcol <- pick_col(df0, c("pvalue","p.value","p_value","PValue","p"))
+    if (is.null(pcol)) pcol <- NA_character_
+    
+    df <- df0 %>%
+      dplyr::mutate(
+        term_full = as.character(.data[[tcol]]),
+        counts    = suppressWarnings(as.integer(.data[[ccol]])),
+        pval      = if (!is.na(pcol)) suppressWarnings(as.numeric(.data[[pcol]])) else NA_real_,
+        fdr       = if (!is.na(fcol)) suppressWarnings(as.numeric(.data[[fcol]])) else NA_real_,
+        logFDR_raw = suppressWarnings(-log10(fdr)),
+        is_zero    = is.finite(fdr) & (fdr == 0),
+        logFDR     = dplyr::if_else(
+          is.finite(logFDR_raw),
+          logFDR_raw,
+          max(logFDR_raw[is.finite(logFDR_raw)], na.rm = TRUE) + 1
+        ),
+        tooltip = paste0(
+          "<b>", htmltools::htmlEscape(term_full), "</b>",
+          "<br><b>Counts:</b> ", counts,
+          dplyr::if_else(
+            is.finite(pval),
+            paste0("<br><b>p:</b> ", formatC(pval, format="e", digits=2)),
+            ""
+          ),
+          dplyr::if_else(
+            is.finite(fdr),
+            paste0("<br><b>FDR:</b> ", formatC(fdr, format="e", digits=2)),
+            "<br><b>FDR:</b> NA"
+          ),
+          "<br><b>-log10(FDR):</b> ",
+          dplyr::if_else(is.finite(logFDR_raw), sprintf("%.2f", logFDR_raw), "Inf/NA")
+        )
+      ) %>%
+      dplyr::filter(!is.na(counts), counts > 0)
+    
+    validate(need(nrow(df) > 0, "KEGG: no pathways with Count > 0."))
+    
+    # order: bigger counts first; tie-break by FDR if available
+    df <- df %>%
+      dplyr::arrange(dplyr::desc(counts), fdr) %>%
+      dplyr::mutate(term_full = factor(term_full, levels = rev(unique(term_full)))) # for coord_flip ordering
+    
+    # dynamic height
+    n <- nrow(df)
+    h <- max(420, 28 * n)
+    
+    p <- ggplot2::ggplot(
+      df,
+      ggplot2::aes(
+        x = term_full,
+        y = counts,
+        text = tooltip
+      )
+    ) +
+      # non-zero gradient
+      ggplot2::geom_col(
+        data = dplyr::filter(df, !is_zero),
+        ggplot2::aes(fill = logFDR),
+        color = "black", linewidth = 0.25
+      ) +
+      ggplot2::scale_fill_gradientn(
+        colours = c("red", "orange", "yellow"),
+        name = "-log10(FDR)"
+      ) +
+      # FDR==0 -> vermilion
+      ggplot2::geom_col(
+        data = dplyr::filter(df, is_zero),
+        fill = "#E34234",
+        color = "black", linewidth = 0.25
+      ) +
       ggplot2::coord_flip() +
-      ggplot2::labs(title = ttl, x = NULL, y = "-log10(p-value)") +
-      ggplot2::theme_minimal(base_size = 13) +
-      ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-  }, height = function() {
-    n <- tryCatch(nrow(kegg_top_df()), error = function(e) 0)
-    max(420, 28 * n)
+      ggplot2::labs(title = ttl, x = NULL, y = "NonSyn hit counts by term") +
+      ggplot2::theme_minimal(base_size = 12) +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(face = "bold"),
+        legend.position = "right"
+      )
+    
+    plotly::ggplotly(p, tooltip = "text") %>%
+      plotly::layout(
+        height = h,
+        margin = list(l = 280, r = 40, t = 60, b = 40),
+        font   = list(size = 11)
+      ) %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "KEGG_barplot_counts",
+          width = 1600,
+          height = max(900, h),
+          scale = 2
+        )
+      )
   })
   
   output$kegg_table <- DT::renderDT({
@@ -6830,11 +8178,15 @@ server <- function(input, output, session) {
         pageLength = 15,
         scrollX    = TRUE,
         dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf")
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        )
       )
     ) %>%
       DT::formatSignif(c("pvalue", "FDR", "qvalue"), digits = 3)
-  })
+  }, server = FALSE)
   
   ###############################################################################
   # GO selection helpers (chr / cluster / gene) - single source of truth via go_base_df()
@@ -7011,8 +8363,7 @@ server <- function(input, output, session) {
   })
   
   # ==========================================================
-  # ==========================================================
-  # GO slim classification (BP, CC, MF)
+  # GO slim classification (BP, CC, MF) GOSLIM_bar
   # ==========================================================
   
   go_slim_class_from_df <- function(df) {
@@ -7166,10 +8517,152 @@ server <- function(input, output, session) {
     go_filter_genes(if (length(gs)) gs else NULL)
   }, ignoreInit = FALSE)
   
-  
   output$goslim_bar <- renderPlotly({
     
-    dat <- go_slim_class_df_selected()
+    dat <- goslim_enrich_tbl()
+    validate(need(is.data.frame(dat) && nrow(dat) > 0, "GO slim: no enrichment data to plot yet."))
+    
+    top_n <- input$go_class_top %||% 15
+    gap   <- 2
+    
+    validate(need(all(c("Description","Count","Ontology") %in% names(dat)),
+                  "goslim_enrich_tbl() must return: Description, Count, Ontology"))
+    
+    if (!exists("shorten_term", mode = "function")) {
+      shorten_term <- function(x, max = 55) {
+        x <- as.character(x)
+        x <- stringr::str_squish(x)
+        x <- stringr::str_to_sentence(x)
+        ifelse(nchar(x) > max, paste0(substr(x, 1, max - 1), "…"), x)
+      }
+    }
+    
+    dat <- dat %>%
+      dplyr::mutate(
+        Ontology   = as.character(Ontology),
+        slim_term  = as.character(Description),
+        n_genes    = suppressWarnings(as.integer(Count)),
+        term_short = stringr::str_wrap(shorten_term(Description, 55), width = 28)
+      ) %>%
+      dplyr::filter(!is.na(n_genes), nzchar(slim_term))
+    
+    ont_order <- c("BP","CC","MF")
+    present   <- intersect(ont_order, unique(dat$Ontology))
+    validate(need(length(present) > 0, "No BP/CC/MF data to plot."))
+    
+    dat <- dat %>%
+      dplyr::filter(Ontology %in% present) %>%
+      dplyr::mutate(Ontology = factor(Ontology, levels = ont_order))
+    
+    dat <- dat %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+      dplyr::slice_head(n = top_n) %>%
+      dplyr::mutate(rank = dplyr::row_number()) %>%
+      dplyr::ungroup()
+    
+    n_bp <- if ("BP" %in% present) max(dat$rank[dat$Ontology == "BP"], 0) else 0
+    n_cc <- if ("CC" %in% present) max(dat$rank[dat$Ontology == "CC"], 0) else 0
+    
+    offsets <- c(
+      BP = 0,
+      CC = n_bp + gap,
+      MF = n_bp + gap + n_cc + gap
+    )
+    
+    dat$x <- dat$rank + offsets[as.character(dat$Ontology)]
+    
+    vlines <- c()
+    if (all(c("BP","CC") %in% present)) vlines <- c(vlines, offsets["CC"] - gap / 2)
+    if (all(c("CC","MF") %in% present)) vlines <- c(vlines, offsets["MF"] - gap / 2)
+    
+    centers <- dat %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::summarise(
+        xmin = min(x), xmax = max(x),
+        xmid = (xmin + xmax) / 2,
+        .groups = "drop"
+      )
+    
+    ymax  <- max(dat$n_genes, na.rm = TRUE)
+    ylab  <- -0.12 * ymax
+    y_top <- ymax * 1.08
+    
+    sel_label <- tryCatch(scope_label(), error = function(e) "")
+    
+    dat$tooltip <- paste0(
+      "<b>", dat$Ontology, "</b>",
+      "<br><b>GO slim term:</b> ", htmltools::htmlEscape(as.character(dat$slim_term)),
+      "<br><b>Count:</b> ", dat$n_genes,
+      "<br><b>GeneRatio:</b> ", dat$GeneRatio,
+      "<br><b>BgRatio:</b> ", dat$BgRatio,
+      "<br><b>p:</b> ", sprintf("%.3g", as.numeric(dat$pvalue)),
+      "<br><b>FDR:</b> ", sprintf("%.3g", as.numeric(dat$p.adjust))
+    )
+    
+    p <- ggplot2::ggplot(
+      dat,
+      ggplot2::aes(
+        x = x, y = n_genes,
+        fill = Ontology,
+        text = tooltip
+      )
+    ) +
+      ggplot2::geom_col(width = 0.85, color = "black", linewidth = 0.25) +
+      { if (length(vlines)) ggplot2::geom_vline(xintercept = vlines, linewidth = 0.4) } +
+      ggplot2::scale_x_continuous(
+        breaks = dat$x,
+        labels = dat$term_short,
+        expand = c(0, 0)
+      ) +
+      ggplot2::coord_cartesian(ylim = c(ylab, ymax * 1.20), clip = "off") +
+      { if ("BP" %in% present)
+        ggplot2::annotate("text",
+                          x = centers$xmid[centers$Ontology == "BP"], y = y_top,
+                          label = "Biological Process", fontface = "bold", size = 3.6) } +
+      { if ("CC" %in% present)
+        ggplot2::annotate("text",
+                          x = centers$xmid[centers$Ontology == "CC"], y = y_top,
+                          label = "Cellular Component", fontface = "bold", size = 3.6) } +
+      { if ("MF" %in% present)
+        ggplot2::annotate("text",
+                          x = centers$xmid[centers$Ontology == "MF"], y = y_top,
+                          label = "Molecular Function", fontface = "bold", size = 3.6) } +
+      ggplot2::labs(
+        x = NULL,
+        y = "Enriched genes per GO slim term",
+        title = paste0("GO slim enrichment by gene counts — ", sel_label)
+      ) +
+      ggplot2::theme_minimal(base_size = 10) +
+      ggplot2::theme(
+        plot.title   = ggplot2::element_text(size = 11, face = "bold"),
+        axis.title.x = ggplot2::element_text(size = 9),
+        axis.title.y = ggplot2::element_text(size = 9),
+        axis.text.x  = ggplot2::element_text(angle = 90, size = 7, vjust = 0.5, hjust = 1),
+        axis.text.y  = ggplot2::element_text(size = 8),
+        legend.position = "none",
+        plot.margin = grid::unit(c(28, 10, 35, 10), "pt")
+      ) +
+      ggplot2::scale_fill_manual(
+        values = c(BP = "darkgreen", CC = "orange", MF = "darkblue"),
+        guide = "none"
+      )
+    
+    plotly::ggplotly(p, tooltip = "text") %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "GOSlim_enrichment_plot",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
+      )
+  })
+  
+  output$goslim_barXXXXX <- renderPlotly({
+    
+    dat <- goslim_enrich_tbl()
     validate(need(is.data.frame(dat) && nrow(dat) > 0, "GO: no data to plot yet."))
     
     top_n <- input$go_class_top %||% 15
@@ -7245,10 +8738,11 @@ server <- function(input, output, session) {
     sel_label <- attr(go_selected_df(), "label") %||% ""
     
     # Tooltip summary
+    # Tooltip summary
     dat$tooltip <- paste0(
       "<b>", dat$Ontology, "</b>",
-      "<br><b>GO slim:</b> ", htmltools::htmlEscape(as.character(dat$slim_term)),
-      "<br><b>Genes:</b> ", dat$n_genes
+      "<br><b>GO slim term:</b> ", htmltools::htmlEscape(as.character(dat$slim_term)),
+      "<br><b>Selected genes in term:</b> ", dat$n_genes
     )
     
     p <- ggplot2::ggplot(
@@ -7284,8 +8778,8 @@ server <- function(input, output, session) {
       
       ggplot2::labs(
         x = NULL,
-        y = "Number of genes",
-        title = paste0("Gene Function Classification (GO slim generic) — ", sel_label)
+        y = "Selected genes per GO slim term",
+        title = paste0("GO slim classification by gene counts — ", sel_label)
       ) +
       ggplot2::theme_minimal(base_size = 10) +
       ggplot2::theme(
@@ -7302,10 +8796,94 @@ server <- function(input, output, session) {
         guide = "none"
       )
     
-    plotly::ggplotly(p, tooltip = "text")
+    plotly::ggplotly(p, tooltip = "text") %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "GOSlim_plot",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
+      )
   })
   
-  
+  output$goslim_barXXX <- renderPlotly({
+    
+    df <- goslim_enrich_tbl()
+    validate(need(is.data.frame(df) && nrow(df) > 0, "GO slim: no enrichment data to plot yet."))
+    
+    top_n <- input$go_topn %||% 10
+    
+    df <- df %>%
+      dplyr::mutate(
+        Ontology    = as.character(Ontology),
+        Description = as.character(Description),
+        p.adjust    = suppressWarnings(as.numeric(p.adjust)),
+        Count       = suppressWarnings(as.integer(Count))
+      ) %>%
+      dplyr::filter(is.finite(p.adjust), !is.na(Count), nzchar(Description)) %>%
+      dplyr::mutate(
+        term_short = stringr::str_wrap(Description, width = 35),
+        tooltip = paste0(
+          "<b>", htmltools::htmlEscape(Description), "</b>",
+          "<br><b>Ontology:</b> ", Ontology,
+          "<br><b>Count:</b> ", Count,
+          "<br><b>GeneRatio:</b> ", GeneRatio,
+          "<br><b>BgRatio:</b> ", BgRatio,
+          "<br><b>p:</b> ", sprintf("%.3g", pvalue),
+          "<br><b>FDR:</b> ", sprintf("%.3g", p.adjust)
+        )
+      )
+    
+    ont_order <- c("BP","CC","MF")
+    df <- df %>%
+      dplyr::filter(Ontology %in% ont_order) %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+      dplyr::slice_head(n = top_n) %>%
+      dplyr::ungroup()
+    
+    validate(need(nrow(df) > 0, "GO slim: no terms to plot."))
+    
+    df <- df %>%
+      dplyr::arrange(Ontology, Count, p.adjust) %>%
+      dplyr::mutate(term_short = factor(term_short, levels = unique(term_short)))
+    
+    p <- ggplot2::ggplot(
+      df,
+      ggplot2::aes(
+        x = term_short,
+        y = Count,
+        fill = Ontology,
+        text = tooltip
+      )
+    ) +
+      ggplot2::geom_col(color = "black", linewidth = 0.25) +
+      ggplot2::coord_flip() +
+      ggplot2::labs(
+        title = paste0("GO slim enrichment by term counts — ", attr(go_selected_df(), "label") %||% ""),
+        x = NULL,
+        y = "Enriched genes per GO slim term"
+      ) +
+      ggplot2::theme_minimal(base_size = 11) +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(face = "bold"),
+        legend.position = "right"
+      ) +
+      ggplot2::scale_fill_manual(values = c(BP = "darkgreen", CC = "orange", MF = "darkblue"))
+    
+    plotly::ggplotly(p, tooltip = "text") %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "goslim_enrichment_counts",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
+      )
+  })
   # ----------------------------
   # GO terms table
   # ----------------------------
@@ -7396,7 +8974,11 @@ server <- function(input, output, session) {
       extensions = "Buttons",
       options    = list(
         dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf", "print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 10,
         scrollX    = TRUE,
         autoWidth  = TRUE,
@@ -7409,7 +8991,7 @@ server <- function(input, output, session) {
         columns = c("GO_biological_process","GO_cellular_component","GO_molecular_function"),
         `white-space` = "normal"
       )
-  })
+  }, server = FALSE)
   
   # ==========================================================
   # GoSlim enrichment (clusterProfiler::enricher) — NonSyn
@@ -7417,23 +8999,24 @@ server <- function(input, output, session) {
   #     goslim_enrich_raw(), goslim_enrich_tbl(), output$goslim_table
   # ==========================================================
   
-  # Helper: get ENTREZ from selected genes (uses your existing mapping if present)
-  entrez_from_symbols_safe <- function(symbols) {
+  # Helper: SYMBOL -> ENTREZ mapping as data.frame (safe)
+  sym2ent_df_safe <- function(symbols) {
     symbols <- unique(na.omit(trimws(as.character(symbols))))
     symbols <- symbols[nzchar(symbols)]
-    if (!length(symbols)) return(character(0))
+    if (!length(symbols)) return(data.frame(SYMBOL = character(0), ENTREZID = character(0)))
     
-    # If you already have a symbol->entrez mapping reactive, use it:
+    # Prefer existing mapping
     if (exists("gene_map_all", mode = "function")) {
       m <- tryCatch(gene_map_all(), error = function(e) NULL)
-      if (is.data.frame(m) && all(c("SYMBOL","ENTREZID") %in% names(m))) {
-        ids <- unique(m$ENTREZID[m$SYMBOL %in% symbols])
-        ids <- ids[!is.na(ids) & nzchar(ids)]
-        return(ids)
+      if (is.data.frame(m) && all(c("SYMBOL", "ENTREZID") %in% names(m))) {
+        out <- m[m$SYMBOL %in% symbols, c("SYMBOL", "ENTREZID"), drop = FALSE]
+        out <- out[!is.na(out$ENTREZID) & nzchar(out$ENTREZID), ]
+        out$SYMBOL   <- as.character(out$SYMBOL)
+        out$ENTREZID <- as.character(out$ENTREZID)
+        return(unique(out))
       }
     }
     
-    # Fallback: map via org.Hs.eg.db
     validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler package is required."))
     validate(need(requireNamespace("org.Hs.eg.db", quietly = TRUE), "org.Hs.eg.db package is required."))
     
@@ -7446,80 +9029,84 @@ server <- function(input, output, session) {
       ))
     }, error = function(e) NULL)
     
-    if (!is.data.frame(mm) || !nrow(mm)) return(character(0))
-    ids <- unique(mm$ENTREZID)
+    if (!is.data.frame(mm) || !nrow(mm)) return(data.frame(SYMBOL = character(0), ENTREZID = character(0)))
+    mm <- mm[, c("SYMBOL", "ENTREZID"), drop = FALSE]
+    mm <- mm[!is.na(mm$ENTREZID) & nzchar(mm$ENTREZID), ]
+    unique(mm)
+  }
+  
+  # Helper: just ENTREZ vector
+  entrez_from_symbols_safe <- function(symbols) {
+    mm <- sym2ent_df_safe(symbols)
+    ids <- unique(as.character(mm$ENTREZID))
     ids <- ids[!is.na(ids) & nzchar(ids)]
     ids
   }
   
-  # Build TERM2GENE for a given ontology: slim_term -> ENTREZID
-  goslim_term2gene_for_onto <- function(df_selected, ontology = c("BP","CC","MF")) {
+  
+  # ==========================================================
+  # GoSlim TERM2GENE / TERM2NAME / universe from OrgDb + GO.db
+  #   ontology = BP / CC / MF
+  #   Uses:
+  #     - org.Hs.eg.db for ENTREZ <-> GO
+  #     - GO.db for ancestors
+  #     - GO_SLIM_GENERIC for slim terms
+  # ==========================================================
+  goslim_build_orgdb_sets_for_onto <- function(ontology = c("BP", "CC", "MF")) {
     ontology <- match.arg(ontology)
     
-    validate(need(is.data.frame(df_selected) && nrow(df_selected) > 0, "No data for GoSlim selection."))
-    
-    # Identify GO column per ontology
-    go_col <- switch(
-      ontology,
-      BP = "GO_biological_process",
-      CC = "GO_cellular_component",
-      MF = "GO_molecular_function"
-    )
-    validate(need(go_col %in% names(df_selected), paste0("Missing column: ", go_col)))
-    
-    validate(need(exists("GO_TERM_LUT"), "GO_TERM_LUT not loaded."))
+    validate(need(requireNamespace("AnnotationDbi", quietly = TRUE), "AnnotationDbi package is required."))
+    validate(need(requireNamespace("org.Hs.eg.db", quietly = TRUE), "org.Hs.eg.db package is required."))
+    validate(need(requireNamespace("GO.db", quietly = TRUE), "GO.db package is required."))
     validate(need(exists("GO_SLIM_GENERIC"), "GO_SLIM_GENERIC not loaded."))
-    validate(need(requireNamespace("GO.db", quietly = TRUE), "Package GO.db is required for GO ancestors."))
     
-    # SYMBOL->ENTREZ per gene
-    symbols <- unique(na.omit(trimws(as.character(df_selected$genename))))
-    symbols <- symbols[nzchar(symbols)]
-    entrez  <- entrez_from_symbols_safe(symbols)
-    validate(need(length(entrez) > 0, "No ENTREZ IDs available for selected genes (mapping failed)."))
-    
-    sym2ent <- tibble::tibble(
-      genename = symbols
-    ) %>%
-      dplyr::left_join(
-        tibble::tibble(
-          genename = symbols,
-          ENTREZID = entrez_from_symbols_safe(symbols)
-        ),
-        by = "genename"
-      )
-    
-    # Parse GO terms -> GOIDs
-    long <- df_selected %>%
-      dplyr::transmute(
-        genename = as.character(.data[["genename"]]),
-        term_raw = as.character(.data[[go_col]])
-      ) %>%
-      dplyr::filter(!is.na(genename), nzchar(genename)) %>%
-      dplyr::filter(!is.na(term_raw), nzchar(term_raw)) %>%
-      tidyr::separate_rows(term_raw, sep = ";", convert = FALSE) %>%
-      dplyr::mutate(
-        term_raw = stringr::str_squish(term_raw),
-        key_norm = norm_go_term(term_raw),
-        Ontology = ontology
-      ) %>%
-      dplyr::filter(nzchar(key_norm)) %>%
-      dplyr::left_join(
-        GO_TERM_LUT %>% dplyr::select(ONTOLOGY, key_norm, GOID),
-        by = c("Ontology" = "ONTOLOGY", "key_norm" = "key_norm")
-      ) %>%
-      dplyr::filter(!is.na(GOID)) %>%
-      dplyr::distinct(genename, GOID)
-    
-    validate(need(nrow(long) > 0, paste0("No GO IDs parsed for ontology ", ontology)))
-    
-    # GO -> GoSlim mapping (ancestors)
-    slim_ids <- GO_SLIM_GENERIC %>%
+    # --- GO slim IDs for this ontology ---
+    slim_df <- GO_SLIM_GENERIC %>%
       dplyr::filter(ONTOLOGY == ontology) %>%
-      dplyr::pull(GOID) %>%
-      unique()
+      dplyr::distinct(GOID, slim_term)
+    
+    slim_ids <- unique(as.character(slim_df$GOID))
+    slim_ids <- slim_ids[!is.na(slim_ids) & nzchar(slim_ids)]
     
     validate(need(length(slim_ids) > 0, paste0("No GoSlim IDs loaded for ", ontology)))
     
+    # --- Get ENTREZ -> GO mapping from OrgDb ---
+    eg_keys <- tryCatch(
+      AnnotationDbi::keys(org.Hs.eg.db, keytype = "ENTREZID"),
+      error = function(e) NULL
+    )
+    eg_keys <- unique(as.character(eg_keys))
+    eg_keys <- eg_keys[!is.na(eg_keys) & nzchar(eg_keys)]
+    
+    validate(need(length(eg_keys) > 0, "No ENTREZ keys found in org.Hs.eg.db"))
+    
+    org_map <- tryCatch({
+      AnnotationDbi::select(
+        org.Hs.eg.db,
+        keys    = eg_keys,
+        keytype = "ENTREZID",
+        columns = c("GO", "ONTOLOGY")
+      )
+    }, error = function(e) NULL)
+    
+    validate(need(is.data.frame(org_map) && nrow(org_map) > 0, "Could not retrieve GO mapping from org.Hs.eg.db"))
+    validate(need(all(c("ENTREZID", "GO", "ONTOLOGY") %in% names(org_map)),
+                  "OrgDb GO mapping did not return ENTREZID/GO/ONTOLOGY columns"))
+    
+    org_map <- org_map %>%
+      dplyr::transmute(
+        ENTREZID = as.character(ENTREZID),
+        GOID     = as.character(GO),
+        ONTOLOGY = as.character(ONTOLOGY)
+      ) %>%
+      dplyr::filter(!is.na(ENTREZID), nzchar(ENTREZID)) %>%
+      dplyr::filter(!is.na(GOID), nzchar(GOID)) %>%
+      dplyr::filter(ONTOLOGY == ontology) %>%
+      dplyr::distinct(ENTREZID, GOID)
+    
+    validate(need(nrow(org_map) > 0, paste0("No OrgDb GO mapping found for ontology ", ontology)))
+    
+    # --- Ancestor DB for this ontology ---
     anc_obj <- switch(
       ontology,
       BP = GO.db::GOBPANCESTOR,
@@ -7527,8 +9114,9 @@ server <- function(input, output, session) {
       MF = GO.db::GOMFANCESTOR
     )
     
-    # For each GOID -> slim GOIDs
-    goids <- unique(long$GOID)
+    # --- GOID -> slim GOIDs via ancestors ---
+    goids <- unique(org_map$GOID)
+    
     go2slim <- lapply(goids, function(goid) {
       anc <- tryCatch(anc_obj[[goid]], error = function(e) NULL)
       anc <- unique(c(goid, as.character(anc %||% character(0))))
@@ -7543,7 +9131,7 @@ server <- function(input, output, session) {
       tidyr::unnest(cols = c(slim_goid)) %>%
       dplyr::filter(!is.na(slim_goid), nzchar(slim_goid)) %>%
       dplyr::left_join(
-        GO_SLIM_GENERIC %>% dplyr::filter(ONTOLOGY == ontology) %>% dplyr::select(GOID, slim_term),
+        slim_df,
         by = c("slim_goid" = "GOID")
       ) %>%
       dplyr::filter(!is.na(slim_term), nzchar(slim_term)) %>%
@@ -7551,90 +9139,144 @@ server <- function(input, output, session) {
     
     validate(need(nrow(go2slim_df) > 0, paste0("No GoSlim mapping produced for ", ontology)))
     
-    # term2gene: slim_term -> ENTREZID
-    term2gene <- long %>%
-      dplyr::inner_join(go2slim_df, by = "GOID") %>%
-      dplyr::left_join(sym2ent, by = "genename") %>%
-      dplyr::filter(!is.na(ENTREZID), nzchar(ENTREZID)) %>%
-      dplyr::transmute(term = slim_term, gene = ENTREZID) %>%
+    # --- TERM2GENE: slim_goid -> ENTREZID ---
+    term2gene <- org_map %>%
+      dplyr::inner_join(
+        go2slim_df,
+        by = "GOID",
+        relationship = "many-to-many"
+      ) %>%
+      dplyr::transmute(
+        term = as.character(slim_goid),
+        gene = as.character(ENTREZID)
+      ) %>%
+      dplyr::filter(!is.na(term), nzchar(term), !is.na(gene), nzchar(gene)) %>%
       dplyr::distinct()
     
     validate(need(nrow(term2gene) > 0, paste0("TERM2GENE empty for ", ontology)))
-    term2gene
+    
+    # --- TERM2NAME ---
+    term2name <- go2slim_df %>%
+      dplyr::transmute(
+        term = as.character(slim_goid),
+        name = as.character(slim_term)
+      ) %>%
+      dplyr::filter(!is.na(term), nzchar(term), !is.na(name), nzchar(name)) %>%
+      dplyr::distinct()
+    
+    universe <- unique(term2gene$gene)
+    universe <- universe[!is.na(universe) & nzchar(universe)]
+    
+    validate(need(length(universe) > 0, paste0("Universe empty for ", ontology)))
+    
+    list(
+      term2gene = term2gene,
+      term2name = term2name,
+      universe  = universe
+    )
   }
   
-  # Trigger for GoSlim (you should have this like GO/KEGG)
+  goslim_orgdb_sets <- reactive({
+    withProgress(message = "Preparing GO slim reference…", value = 0, {
+      onts <- c("BP", "CC", "MF")
+      out <- vector("list", length(onts))
+      names(out) <- onts
+      
+      for (i in seq_along(onts)) {
+        ont <- onts[i]
+        incProgress(1 / length(onts), detail = paste("Reference:", ont))
+        out[[ont]] <- goslim_build_orgdb_sets_for_onto(ont)
+      }
+      
+      out
+    })
+  })
+  
+  # Trigger for GoSlim (assumed to exist)
   # goslim_trigger <- reactiveVal(0L)
   
   goslim_enrich_raw <- eventReactive(goslim_trigger(), {
     validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler package is required."))
     validate(need(requireNamespace("org.Hs.eg.db", quietly = TRUE), "org.Hs.eg.db package is required."))
+    validate(need(requireNamespace("GO.db", quietly = TRUE), "GO.db package is required."))
     
-    # Use the same ontologies selector as GO
-    ontos <- input$go_ontos %||% c("BP","CC","MF")
-    ontos <- intersect(c("BP","CC","MF"), ontos)
-    validate(need(length(ontos) > 0, "Select at least one GO ontology (BP/CC/MF)."))
-    
-    # Selected genes (symbols) -> ENTREZIDs
-    df_sel <- go_selected_df()
-    validate(need(is.data.frame(df_sel) && nrow(df_sel) > 0, "No data for current selection."))
-    
-    symbols <- unique(na.omit(trimws(as.character(df_sel$genename))))
-    symbols <- symbols[nzchar(symbols)]
-    validate(need(length(symbols) > 0, "No genes found for the current selection."))
-    
-    gene <- entrez_from_symbols_safe(symbols)
-    validate(need(length(gene) > 0, "No ENTREZ IDs for selected genes (mapping empty)."))
-    
-    # Universe: follow your background selector
-    uni <- NULL
-    if (identical(input$func_scope %||% "global", "cluster") &&
-        identical(input$enrich_background %||% "dataset", "dataset")) {
-      # dataset background = all genes in dbnsfp_norm_df mapped to entrez
-      df_all <- dbnsfp_norm_df()
-      if (is.data.frame(df_all) && nrow(df_all) && "genename" %in% names(df_all)) {
-        all_symbols <- unique(na.omit(trimws(as.character(df_all$genename))))
-        all_symbols <- all_symbols[nzchar(all_symbols)]
-        uni <- entrez_from_symbols_safe(all_symbols)
-        uni <- unique(uni[!is.na(uni) & nzchar(uni)])
-        if (!length(uni)) uni <- NULL
-      }
-    }
-    
-    minGS_in <- input$enrich_min_gs %||% 10
-    maxGS    <- input$enrich_max_gs %||% 500
-    
-    # No deixis que minGSSize mati tot quan hi ha pocs gens
-    minGS <- max(1L, min(as.integer(minGS_in), length(gene)))
-    
-    # Run enricher per ontology (TERM2GENE depends on ontology)
-    res <- purrr::map_dfr(ontos, function(ont) {
-      term2gene <- goslim_term2gene_for_onto(df_sel, ontology = ont)
+    withProgress(message = "Running GO slim enrichment…", value = 0, {
       
-      eg <- suppressMessages(
-        clusterProfiler::enricher(
-          gene          = gene,
-          universe      = uni,
-          TERM2GENE     = term2gene,
-          pAdjustMethod = "BH",
-          pvalueCutoff  = 1,
-          qvalueCutoff  = 1,
-          minGSSize     = minGS,
-          maxGSSize     = maxGS
+      ontos <- input$go_ontos %||% c("BP", "CC", "MF")
+      ontos <- intersect(c("BP", "CC", "MF"), ontos)
+      validate(need(length(ontos) > 0, "Select at least one GO ontology (BP/CC/MF)."))
+      
+      df_sel <- go_selected_df()
+      validate(need(is.data.frame(df_sel) && nrow(df_sel) > 0, "No data for current selection."))
+      validate(need("genename" %in% names(df_sel), "go_selected_df() must include 'genename'."))
+      
+      symbols_sel <- unique(na.omit(trimws(as.character(df_sel$genename))))
+      symbols_sel <- symbols_sel[nzchar(symbols_sel)]
+      validate(need(length(symbols_sel) > 0, "No genes found for the current selection."))
+      incProgress(0.15, detail = paste("Symbols:", length(symbols_sel)))
+      
+      gene_selected <- entrez_from_symbols_safe(symbols_sel)
+      validate(need(length(gene_selected) > 0, "No ENTREZ IDs for selected genes (mapping empty)."))
+      incProgress(0.10, detail = paste("ENTREZ:", length(gene_selected)))
+      
+      minGS_in <- input$enrich_min_gs %||% 10
+      maxGS    <- input$enrich_max_gs %||% 500
+      
+      gs_all <- goslim_orgdb_sets()
+      incProgress(0.10, detail = "Reference ready")
+      
+      res <- purrr::map_dfr(ontos, function(ont) {
+        incProgress(0.50 / length(ontos), detail = paste("Ontology:", ont))
+        
+        gs <- gs_all[[ont]]
+        
+        universe <- unique(gs$universe)
+        gene_use <- intersect(unique(gene_selected), universe)
+        
+        message(
+          "[GoSlim][", ont, "] ",
+          "selected_genes=", length(gene_selected),
+          " | universe=", length(universe),
+          " | gene_use=", length(gene_use),
+          " | term2gene_rows=", nrow(gs$term2gene),
+          " | n_terms=", dplyr::n_distinct(gs$term2gene$term)
         )
-      )
+        
+        if (!length(gene_use)) return(NULL)
+        
+        minGS <- max(1L, min(as.integer(minGS_in), length(gene_use)))
+        
+        eg <- suppressMessages(
+          clusterProfiler::enricher(
+            gene          = gene_use,
+            universe      = universe,
+            TERM2GENE     = gs$term2gene,
+            TERM2NAME     = gs$term2name,
+            pAdjustMethod = "BH",
+            pvalueCutoff  = 1,
+            qvalueCutoff  = 1,
+            minGSSize     = minGS,
+            maxGSSize     = maxGS
+          )
+        )
+        
+        if (is.null(eg) || is.null(eg@result) || !nrow(eg@result)) return(NULL)
+        
+        df <- as.data.frame(eg@result, stringsAsFactors = FALSE)
+        if (!nrow(df)) return(NULL)
+        
+        df$Ontology <- ont
+        df
+      })
       
-      if (is.null(eg) || is.null(eg@result) || !nrow(eg@result)) return(NULL)
+      incProgress(0.05, detail = "Finalizing")
       
-      df <- as.data.frame(eg@result, stringsAsFactors = FALSE)
-      if (!nrow(df)) return(NULL)
-      df$Ontology <- ont
-      df
+      if (!is.data.frame(res) || !nrow(res)) return(tibble::tibble())
+      res
     })
-    
-    if (!is.data.frame(res) || !nrow(res)) return(tibble::tibble())
-    res
   }, ignoreInit = TRUE)
+  
+  
   
   goslim_enrich_tbl <- reactive({
     df <- goslim_enrich_raw()
@@ -7678,8 +9320,23 @@ server <- function(input, output, session) {
         p.adjust = sprintf("%.3g", as.numeric(p.adjust))
       )
     
-    DT::datatable(out, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
-  })
+    DT::datatable(
+      out,
+      rownames = FALSE,
+      extensions = "Buttons",
+      options = list(
+        dom = "Bfrtip",
+        pageLength = 10,
+        scrollX = TRUE,
+        buttons = list(
+          list(extend = "copy",  exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE)),
+          list(extend = "csv",   exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE)),
+          list(extend = "excel", exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE))
+        )
+      )
+    )
+  }, server = FALSE)
+  
   ############################################################################
   ###############################################################################
   # ============================================================
@@ -7884,29 +9541,26 @@ server <- function(input, output, session) {
   
   map_orphanet_labels_to_ids <- function(labels, bg_df) {
     labels <- as.character(labels)
-    labels <- labels[!is.na(labels)]
+    labels[is.na(labels)] <- ""
     labels <- trimws(labels)
-    labels <- labels[nzchar(labels)]
-    if (!length(labels)) return(character(0))
     
-    if (!is.data.frame(bg_df) || !nrow(bg_df)) return(character(0))
+    if (!length(labels)) return(character(0))
+    if (!is.data.frame(bg_df) || !nrow(bg_df)) return(rep(NA_character_, length(labels)))
     
     lab_col <- if ("label_in" %in% names(bg_df)) "label_in" else if ("label" %in% names(bg_df)) "label" else NULL
-    if (is.null(lab_col)) return(character(0))
-    if (!("orpha_id" %in% names(bg_df))) return(character(0))
+    if (is.null(lab_col) || !("orpha_id" %in% names(bg_df))) return(rep(NA_character_, length(labels)))
     
     kk <- norm_orpha_key(bg_df[[lab_col]])
     vv <- as.character(bg_df$orpha_id)
     
     ok <- !is.na(kk) & nzchar(kk) & !is.na(vv) & nzchar(vv)
-    if (!any(ok)) return(character(0))
+    if (!any(ok)) return(rep(NA_character_, length(labels)))
     
     lut <- stats::setNames(paste0("ORPHA:", vv[ok]), kk[ok])
     
     lk <- norm_orpha_key(labels)
     mapped <- unname(lut[lk])
-    mapped <- mapped[!is.na(mapped) & nzchar(mapped)]
-    unique(mapped)
+    mapped
   }
   
   # --------------------------------------------
@@ -7935,43 +9589,55 @@ server <- function(input, output, session) {
     # -----------------------------
     # Orphanet disorder
     # -----------------------------
-    if (fld == "orphanet_disorder") {
+    if (fld_low == "orphanet_disorder") {
       
       raw_chr <- as.character(vec)
       raw_chr <- raw_chr[!is.na(raw_chr)]
       raw_chr <- trimws(raw_chr)
       raw_chr <- raw_chr[nzchar(raw_chr)]
+      if (!length(raw_chr)) return(character(0))
       
-      # split ONLY by ';' (safe)
+      # split ONLY by ';' safely (keeps per-row multi terms)
       parts <- split_orphanet_safe(raw_chr)
+      parts <- parts[!is.na(parts)]
+      parts <- trimws(parts)
+      parts <- parts[nzchar(parts)]
+      if (!length(parts)) return(character(0))
       
-      # 1) ORPHA:\d+ embedded
-      ids <- unique(unlist(regmatches(parts, gregexpr("ORPHA:\\d+", parts, perl = TRUE)), use.names = FALSE))
-      ids <- trimws(ids)
-      ids <- ids[nzchar(ids)]
+      # A) direct ORPHA:\d+ occurrences (KEEP DUPLICATES)
+      ids_vec <- unlist(regmatches(parts, gregexpr("ORPHA:\\d+", parts, perl = TRUE)), use.names = FALSE)
+      ids_vec <- trimws(ids_vec)
+      ids_vec <- ids_vec[nzchar(ids_vec)]
       
-      # 2) labels -> map to ORPHA:<id> via universe (label_in/orpha_id)
+      # B) labels (no ORPHA id inside) -> map to ORPHA:<id> (KEEP DUPLICATES)
       labels_only <- parts[!grepl("ORPHA:\\d+", parts, perl = TRUE)]
+      labels_only <- trimws(labels_only)
       labels_only <- labels_only[nzchar(labels_only)]
       
-      mapped <- map_orphanet_labels_to_ids(labels_only, bg_df)
+      mapped_vec <- character(0)
+      if (length(labels_only)) {
+        mapped_vec <- map_orphanet_labels_to_ids(labels_only, bg_df)
+        mapped_vec <- as.character(mapped_vec)
+        mapped_vec <- mapped_vec[!is.na(mapped_vec) & nzchar(mapped_vec)]
+      }
       
-      out <- unique(c(ids, mapped))
+      out <- c(ids_vec, mapped_vec)
       out <- out[nzchar(out)]
-      return(out)
+      return(out)  # IMPORTANT: no unique()
     }
     
     # -----------------------------
     # MIM disease
     # -----------------------------
-    if (fld == "mim_disease") {
+    if (fld_low == "mim_disease") {
       x <- as.character(vec)
       x <- x[!is.na(x)]
       x <- trimws(x)
       x <- x[nzchar(x)]
       if (!length(x)) return(character(0))
       
-      mim <- unique(unlist(regmatches(x, gregexpr("MIM:\\d+", x, perl = TRUE)), use.names = FALSE))
+      # IMPORTANT: keep duplicates (no unique)
+      mim <- unlist(regmatches(x, gregexpr("MIM:\\d+", x, perl = TRUE)), use.names = FALSE)
       mim <- trimws(mim)
       mim <- mim[nzchar(mim)]
       return(mim)
@@ -8132,8 +9798,8 @@ server <- function(input, output, session) {
     want <- c(
       "Orphanet disorder" = "orphanet_disorder",
       "MIM disease"       = "mim_disease",
-      "InterPro domain"   = "interpro_domain",
-      "ClinVar trait"     = "clinvar_trait"  
+      "ClinVar trait"     = "clinvar_trait",
+      "InterPro domain"   = "interpro_domain"
     )
     
     keep <- list()
@@ -8237,6 +9903,7 @@ server <- function(input, output, session) {
       message("[ENRICH CHECK] embedded MIM ids found n=", length(ids),
               " head=", paste(head(ids, 12), collapse = ", "))
     }
+    
     if (tolower(fld) == "orphanet_disorder") {
       ids <- unique(unlist(regmatches(raw_chr, gregexpr("ORPHA:\\d+", raw_chr, perl = TRUE)), use.names = FALSE))
       message("[ENRICH CHECK] embedded ORPHA ids found n=", length(ids),
@@ -8244,6 +9911,27 @@ server <- function(input, output, session) {
     }
     
     fg_term_ids <- fg_terms_to_term_id(fld, dt2[[fld]], bg_df = tabU)
+    
+    # DEBUG: verify duplicates in foreground
+    tabS_all <- table(fg_term_ids)
+    message("[ENRICH DBG] field=", fld,
+            " | fg_tokens=", length(fg_term_ids),
+            " | fg_unique=", length(unique(fg_term_ids)),
+            " | max_a=", if (length(tabS_all)) max(as.integer(tabS_all)) else NA_integer_,
+            " | a_ge2=", sum(as.integer(tabS_all) >= 2),
+            " | a_ge3=", sum(as.integer(tabS_all) >= 3))
+    
+    print(sort(tabS_all, decreasing = TRUE)[1:min(15, length(tabS_all))])
+    
+    if (tolower(fld) == "mim_disease") {
+      tabS_all <- table(fg_term_ids)
+      message("[MIM DBG] fg_tokens=", length(fg_term_ids),
+              " | fg_unique=", length(unique(fg_term_ids)),
+              " | max_a=", if (length(tabS_all)) max(as.integer(tabS_all)) else NA_integer_,
+              " | a_ge2=", sum(as.integer(tabS_all) >= 2),
+              " | a_ge3=", sum(as.integer(tabS_all) >= 3))
+      print(sort(tabS_all, decreasing = TRUE)[1:min(15, length(tabS_all))])
+    }
     
     # Map for MIM labels from foreground (to fill empty universe label)
     fg_label_map <- NULL
@@ -8314,7 +10002,7 @@ server <- function(input, output, session) {
               " | min_a=", min_a,
               " | hits_in_universe=", sum(names(tabS_keep) %in% tabU$term_id))
       
-
+      
       u_terms <- unique(as.character(tabU$term_id))
       hit_n   <- sum(names(tabS_keep) %in% u_terms)
       
@@ -8338,6 +10026,14 @@ server <- function(input, output, session) {
     
   }, ignoreInit = TRUE)
   
+  #--------------------------------------------
+  strip_orphanet_prefix <- function(x) {
+    x <- as.character(x)
+    x[is.na(x)] <- ""
+    x <- trimws(x)
+    x <- sub("^Orphanet:\\s*", "", x, ignore.case = TRUE)
+    trimws(x)
+  }
   # --------------------------------------------
   # Outputs: table
   # --------------------------------------------
@@ -8384,6 +10080,16 @@ server <- function(input, output, session) {
         dis <- ifelse(nzchar(dis), dis, fill)
       }
       
+      # Fill missing disease names from OMIM dictionary (RDS)
+      mp_omim <- omim_title_map()
+      if (length(mp_omim)) {
+        keys  <- mim_termid_to_num(as.character(tab$term_id))
+        fill2 <- unname(mp_omim[keys])
+        fill2[is.na(fill2)] <- ""
+        fill2 <- trimws(fill2)
+        dis <- ifelse(nzchar(dis), dis, fill2)
+      }
+      
       dis <- ifelse(nzchar(dis), dis, as.character(tab$term_id))
       dis <- clean_mim_label(dis)
       
@@ -8396,10 +10102,15 @@ server <- function(input, output, session) {
       
     } else if (fld_low == "orphanet_disorder") {
       
+      dis0 <- dplyr::coalesce(as.character(tab$label), as.character(tab$label_in), "")
+      dis0 <- strip_orphanet_prefix(dis0)
+      dis0 <- ifelse(nzchar(dis0), dis0, as.character(tab$term_id))
+      
       out <- tab %>%
+        dplyr::mutate(Disorder = dis0) %>%
         dplyr::transmute(
           `Orphanet id` = as.character(.data$term_id),
-          Disorder      = dplyr::coalesce(as.character(.data$label), as.character(.data$label_in), ""),
+          Disorder,
           in_subset_ratio, in_bg_ratio, OR, p, FDR
         )
       
@@ -8443,55 +10154,95 @@ server <- function(input, output, session) {
       out, rownames = FALSE,
       extensions = "Buttons",
       options = list(
+        extensions = "Buttons",
         dom = "Bfrtip",
-        buttons = c("copy","csv","excel","pdf","print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 10,
         scrollX = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   # --------------------------------------------
   # Outputs: plot (COUNTS)
   # --------------------------------------------
- 
+  
+  short_label_1line <- function(x, max_chars = 55) {
+    x <- as.character(x)
+    x <- stringr::str_squish(x)               # treu salts/espais dobles
+    x <- ifelse(nchar(x) > max_chars, paste0(substr(x, 1, max_chars - 1), "…"), x)
+    x
+  }
   
   output$enrich_nonsyn_terms_plotly <- plotly::renderPlotly({
     r <- nonsyn_terms_res(); req(r)
     tab <- r$tab
     fld <- r$field
     fld_low <- tolower(as.character(fld))
+    
     if (!is.data.frame(tab) || !nrow(tab)) {
       return(plotly::plotly_empty(type = "bar") %>% plotly::layout(title = "No enriched terms"))
     }
     
     fg_label_map <- r$fg_label_map
     
+    # 1) pick top rows first
     top <- tab %>%
       dplyr::filter(is.finite(p_adj), is.finite(p)) %>%
       dplyr::arrange(p_adj, p) %>%
-      dplyr::slice_head(n = 15) %>%
+      dplyr::slice_head(n = 15)
+    
+    # 2) build lab0 OUTSIDE dplyr NSE (fixes '... incorrect context')
+    lab0 <- if ("label" %in% names(top)) as.character(top$label) else rep("", nrow(top))
+    lab0[is.na(lab0)] <- ""
+    lab0 <- ifelse(nzchar(trimws(lab0)), lab0, as.character(top$term_id))
+    
+    # MIM: fill missing labels then clean
+    if (fld_low == "mim_disease") {
+      
+      # a) foreground-derived names (if any)
+      if (!is.null(fg_label_map) && length(fg_label_map)) {
+        fill <- unname(fg_label_map[as.character(top$term_id)])
+        fill[is.na(fill)] <- ""
+        fill <- trimws(as.character(fill))
+        miss <- (!nzchar(trimws(lab0)) | lab0 == as.character(top$term_id)) & nzchar(fill)
+        lab0[miss] <- fill[miss]
+      }
+      
+      # b) OMIM dictionary (RDS)
+      mp_omim <- omim_title_map()
+      if (length(mp_omim)) {
+        keys  <- mim_termid_to_num(as.character(top$term_id))
+        fill2 <- unname(mp_omim[keys])
+        fill2[is.na(fill2)] <- ""
+        fill2 <- trimws(as.character(fill2))
+        miss2 <- (!nzchar(trimws(lab0)) | lab0 == as.character(top$term_id)) & nzchar(fill2)
+        lab0[miss2] <- fill2[miss2]
+      }
+      
+      lab0 <- clean_mim_label(lab0)
+    }
+    
+    # Orphanet: strip "Orphanet:"
+    if (fld_low == "orphanet_disorder") {
+      lab0 <- strip_orphanet_prefix(lab0)
+    }
+    
+    # 3) one-line short labels for axis
+    term_show_vec <- short_label_1line(lab0, max_chars = 55)
+    
+    # 4) attach plotting columns
+    top <- top %>%
       dplyr::mutate(
-        term_show = {
-          lab0 <- ifelse(!is.na(label) & nzchar(label), as.character(label), as.character(term_id))
-          
-          # MIM: fill missing universe label from foreground map, then clean
-          if (fld_low == "mim_disease") {
-            if (!is.null(fg_label_map) && length(fg_label_map)) {
-              fill <- unname(fg_label_map[as.character(term_id)])
-              fill[is.na(fill)] <- ""
-              lab0 <- ifelse(lab0 == as.character(term_id) & nzchar(fill), fill, lab0)
-            }
-            lab0 <- clean_mim_label(lab0)
-          }
-          
-          short_label(lab0, max_chars = 55, wrap_width = 18)
-        },
-        term_key = make.unique(as.character(term_show)),
-        term_key = factor(term_key, levels = rev(unique(term_key))),
-        zebra = factor(seq_len(dplyr::n()) %% 2),
+        term_show = term_show_vec,
+        term_key  = make.unique(as.character(term_show)),
+        term_key  = factor(term_key, levels = rev(unique(term_key))),
+        zebra     = factor(seq_len(dplyr::n()) %% 2),
         
-        # nice formatting for tooltip
         p_txt   = formatC(as.numeric(p),     format = "e", digits = 2),
         fdr_txt = formatC(as.numeric(p_adj), format = "e", digits = 2),
         or_txt  = sprintf("%.3f", as.numeric(or)),
@@ -8499,7 +10250,7 @@ server <- function(input, output, session) {
         a_txt   = as.integer(a),
         
         tooltip = paste0(
-          "<b>", gsub("\n", "<br>", as.character(term_show)), "</b>",
+          "<b>", as.character(term_show), "</b>",
           "<br><b>a</b> (fg count): ", a_txt,
           "<br><b>Tt</b> (bg count): ", tt_txt,
           "<br><b>OR</b>: ", or_txt,
@@ -8508,20 +10259,43 @@ server <- function(input, output, session) {
         )
       )
     
-    g <- ggplot2::ggplot(top, ggplot2::aes(x = term_key, y = a, fill = zebra, text = tooltip)) +
+    top <- top %>%
+      dplyr::mutate(
+        neglogFDR = -log10(pmax(as.numeric(p_adj), 1e-300))
+      )
+    
+    # 5) ggplot + ggplotly
+    g <- ggplot2::ggplot(top, ggplot2::aes(x = term_key, y = a, fill = neglogFDR, text = tooltip)) +
       ggplot2::geom_col() +
       ggplot2::coord_flip() +
       ggplot2::scale_x_discrete(labels = stats::setNames(as.character(top$term_show), as.character(top$term_key))) +
-      ggplot2::scale_fill_manual(values = c("0" = "orange", "1" = "darkgreen"), guide = "none") +
+      ggplot2::scale_fill_gradientn(
+        colours = c("yellow", "orange", "red"),
+        values  = c(0, 0.5, 1),
+        name    = "−log10(FDR)"
+      ) +
       ggplot2::labs(
         title = paste0("Top enriched terms (counts) — ", fld),
         x = NULL,
-        y = "Count in foreground"
+        y = paste0("Nonsynonym hit count in ", input$nonsyn_term_field, " term")
       ) +
       ggplot2::theme_minimal(base_size = 13)
     
     plotly::ggplotly(g, tooltip = "text", source = "terms_enrich") %>%
-      plotly::layout(hoverlabel = list(align = "left"))
+      plotly::layout(
+        hoverlabel = list(align = "left"),
+        yaxis = list(tickfont = list(size = 10)),
+        margin = list(l = 240, r = 30, t = 60, b = 40)
+      ) %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "enrichment_nonsyn_terms",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
+      )
   })
   
   ###############################################################################
@@ -8534,7 +10308,7 @@ server <- function(input, output, session) {
   # - Adds: full predictor name + item meaning
   # ============================================================
   
- 
+  
   # -----------------------------
   # Helpers: predictor full name
   # -----------------------------
@@ -8692,6 +10466,22 @@ server <- function(input, output, session) {
     
     NA_character_
   }
+  
+  # -----------------------------
+  omim_title_map <- local({
+    .cache <- NULL
+    function(path = "/Volumes/DISK1TB/Inspector_app_slaves_ngroc/GItools/_shared/omim_mim_titles_map.rds") {
+      if (!is.null(.cache)) return(.cache)
+      if (!file.exists(path)) {
+        .cache <- stats::setNames(character(0), character(0))
+        return(.cache)
+      }
+      .cache <- readRDS(path)
+      .cache
+    }
+  })
+  
+  mim_termid_to_num <- function(x) sub("^MIM:", "", as.character(x))
   
   # -----------------------------
   # Universe loader
@@ -9038,13 +10828,18 @@ server <- function(input, output, session) {
       df, rownames = FALSE,
       extensions = "Buttons",
       options = list(
+        extensions = "Buttons",
         dom = "Bfrtip",
-        buttons = c("copy","csv","excel","pdf","print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 15,
         scrollX = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   # ============================================================
   # OUTPUT: PLOT
@@ -9103,10 +10898,21 @@ server <- function(input, output, session) {
     cd$OR  <- formatC(as.numeric(cd$OR),  format = "f", digits = 3)
     cd$neglogFDR <- round(as.numeric(cd$neglogFDR), 3)
     
-    DT::datatable(cd, rownames = FALSE, options = list(dom = "t", scrollX = TRUE))
-  })
+    DT::datatable(cd, 
+                  rownames = FALSE, 
+                  options = list(dom = "t", 
+                                 extensions = "Buttons",
+                                 scrollX = TRUE,
+                                 buttons = list(
+                                   list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+                                   list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+                                   list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+                                 )
+                  )
+    )
+  }, server = FALSE)
   
- 
+  
   
   output$enrich_nonsyn_pred_click_dbg <- renderPrint({
     ed <- plotly::event_data("plotly_click", source = "pred_enrich")
@@ -9239,7 +11045,7 @@ server <- function(input, output, session) {
       )
   })
   
-
+  
   # Helper: convert named color + alpha to RGBA hex string
   to_rgba <- function(col, alpha) {
     rgb <- grDevices::col2rgb(col)
@@ -9343,6 +11149,15 @@ server <- function(input, output, session) {
           angularaxis = list(direction = "clockwise")
         ),
         margin = list(l = 40, r = 40, t = 60, b = 40)
+      ) %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "enrichment_nonsyn_predictors",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
       )
   })
   
@@ -9385,12 +11200,12 @@ server <- function(input, output, session) {
     
     validate(
       need(is.data.frame(df) && nrow(df) > 0, "Final output not available yet (build + normalize + clusters first)."),
-      need(all(c("genename","cluster_id","Function_description","Disease_description","Orphanet_disorder","MIM_disease","clinvar_trait",
+      need(all(c("SNP","genename","cluster_id","Function_description","Disease_description",
+                 "Orphanet_disorder","MIM_disease","clinvar_trait",
                  "cluster_chr_n","cluster_start","cluster_end") %in% names(df)),
            "Missing required cluster/function/disease columns in final output.")
     )
     
-    # Detectar columna OMIM (acepta OMIM_id o MIM_phenotype_id)
     omim_col <- dplyr::case_when(
       "OMIM_id" %in% names(df) ~ "OMIM_id",
       "MIM_phenotype_id" %in% names(df) ~ "MIM_phenotype_id",
@@ -9409,21 +11224,6 @@ server <- function(input, output, session) {
       )
     }
     
-    make_omim_url <- function(x) {
-      if (is.null(x) || is.na(x)) return(NA_character_)
-      s <- trimws(as.character(x))
-      if (!nzchar(s) || s %in% c(".", "NA")) return(NA_character_)
-      
-      # Puede venir "616573;614123" o "616573" → consideramos el primero
-      ids <- unlist(strsplit(s, "[,;|\\s]+"))
-      ids <- ids[nzchar(ids)]
-      if (!length(ids)) return(NA_character_)
-      id1 <- gsub("[^0-9]", "", ids[1])
-      if (!nzchar(id1)) return(NA_character_)
-      
-      paste0("https://omim.org/entry/", id1)
-    }
-    
     make_genecards_url <- function(g) {
       if (is.null(g) || is.na(g)) return(NA_character_)
       s <- trimws(as.character(g))
@@ -9431,8 +11231,177 @@ server <- function(input, output, session) {
       paste0("https://www.genecards.org/cgi-bin/carddisp.pl?gene=", utils::URLencode(s, reserved = TRUE))
     }
     
+    # extreu el primer MIM:#### de MIM_disease (si existeix) i genera URL OMIM
+    omim_from_mim_disease <- function(x) {
+      s <- trimws(as.character(x %||% ""))
+      if (!nzchar(s) || s %in% c(".", "NA")) return(NA_character_)
+      id <- regmatches(s, regexpr("MIM:\\d+", s, perl = TRUE))
+      if (!length(id) || !nzchar(id)) return(NA_character_)
+      paste0("https://omim.org/entry/", gsub("^MIM:", "", id))
+    }
+    
+    make_dbsnp_url <- function(snp) {
+      s <- trimws(as.character(snp))
+      if (!nzchar(s) || s %in% c(".", "NA")) return(NA_character_)
+      # dbSNP: només per rsIDs (si tens chr:pos també es podria fer UCSC, però aquí fem dbSNP)
+      if (grepl("^rs\\d+$", s, ignore.case = TRUE)) {
+        paste0("https://www.ncbi.nlm.nih.gov/snp/", s)
+      } else {
+        NA_character_
+      }
+    }
+    
+    # ---- Multi-link helpers (MIM + Orphanet) ----
+    
+    strip_orphanet_prefix <- function(x) {
+      x <- as.character(x)
+      x[is.na(x)] <- ""
+      x <- trimws(x)
+      x <- sub("^Orphanet:\\s*", "", x, ignore.case = TRUE)
+      x
+    }
+    
+    # split by ';' but keep tokens
+    split_semicol <- function(x) {
+      x <- as.character(x)
+      x[is.na(x)] <- ""
+      x <- trimws(x)
+      if (!nzchar(x)) return(character(0))
+      v <- unlist(strsplit(x, ";", fixed = TRUE), use.names = FALSE)
+      v <- trimws(v)
+      v[nzchar(v)]
+    }
+    
+    # Build OMIM links for a single MIM_disease cell (possibly multi ';')
+    link_mim_cell <- function(x) {
+      parts <- split_semicol(x)
+      if (!length(parts)) return(as.character(x))
+      
+      out <- vapply(parts, function(p) {
+        id <- regmatches(p, regexpr("MIM:\\d+", p, perl = TRUE))
+        lab <- trimws(p)
+        if (!length(id) || !nzchar(id)) return(lab)
+        
+        url <- paste0("https://omim.org/entry/", sub("^MIM:", "", id))
+        sprintf("<a href='%s' target='_blank'>%s</a>", url, lab)
+      }, character(1))
+      
+      paste(out, collapse = "<br>")
+    }
+    
+    # ---- ClinVar helpers ----
+    
+    # ClinVar Variation link
+    make_clinvar_variation_url <- function(variation_id, rsid) {
+      vid <- trimws(as.character(variation_id %||% ""))
+      rs  <- trimws(as.character(rsid %||% ""))
+      
+      vid_num <- gsub("[^0-9]", "", vid)
+      if (nzchar(vid_num)) {
+        q <- utils::URLencode(paste0('"', rs, '"'), reserved = TRUE)
+        return(paste0("https://www.ncbi.nlm.nih.gov/clinvar/variation/", vid_num, "/?term=", q))
+      }
+      
+      # fallback: search by rs
+      if (grepl("^rs\\d+$", rs, ignore.case = TRUE)) {
+        q <- utils::URLencode(paste0('"', rs, '"'), reserved = TRUE)
+        return(paste0("https://www.ncbi.nlm.nih.gov/clinvar/?term=", q))
+      }
+      
+      NA_character_
+    }
+    
+    # MedGen link (ClinVar trait)
+    make_medgen_url <- function(medgen_id) {
+      s <- trimws(as.character(medgen_id %||% ""))
+      if (!nzchar(s)) return(NA_character_)
+      # expect C########
+      if (!grepl("^C\\d+$", s)) return(NA_character_)
+      paste0("https://www.ncbi.nlm.nih.gov/medgen/", s)
+    }
+    
+    # Split by ';' (your current convention)
+    split_semicol <- function(x) {
+      x <- as.character(x)
+      x[is.na(x)] <- ""
+      x <- trimws(x)
+      if (!nzchar(x)) return(character(0))
+      v <- unlist(strsplit(x, ";", fixed = TRUE), use.names = FALSE)
+      v <- trimws(v)
+      v[nzchar(v)]
+    }
+    
+    # Multi-link for clinvar traits with aligned medgen ids (if provided)
+    link_clinvar_trait_cell <- function(trait_cell, medgen_cell = NA_character_) {
+      traits <- split_semicol(trait_cell)
+      if (!length(traits)) return(as.character(trait_cell))
+      
+      ids <- split_semicol(medgen_cell)
+      # align lengths (if 1 id only, recycle it)
+      if (length(ids) == 1L && length(traits) > 1L) ids <- rep(ids, length(traits))
+      if (length(ids) < length(traits)) ids <- c(ids, rep("", length(traits) - length(ids)))
+      ids <- ids[seq_len(length(traits))]
+      
+      out <- mapply(function(tr, id) {
+        tr <- trimws(tr)
+        u <- make_medgen_url(id)
+        if (is.na(u) || !nzchar(u)) return(tr)
+        sprintf("<a href='%s' target='_blank'>%s</a>", u, tr)
+      }, traits, ids, SIMPLIFY = TRUE, USE.NAMES = FALSE)
+      
+      paste(out, collapse = "<br>")
+    }
+    # eliminar valors "escombreria"
+    drop_bad_tokens <- function(x) {
+      x <- as.character(x)
+      x[is.na(x)] <- ""
+      x <- trimws(x)
+      x <- x[nzchar(x)]
+      low <- tolower(x)
+      bad <- low %in% c(".", "na", "n/a", "nan", "null", "none", "not_provided", "not provided", "not_specified", "not specified", "unspecified", "unknown")
+      x <- x[!bad]
+      x[nzchar(x)]
+    }
+    
+    # Build Orphanet links for a single cell + optional id cell (both may be multi ';')
+    link_orpha_cell <- function(name_cell, id_cell = NA_character_) {
+      nm <- split_semicol(name_cell)
+      if (!length(nm)) return(as.character(name_cell))
+      
+      ids <- split_semicol(id_cell)
+      # if ids not provided, try to extract ORPHA:#### from name
+      if (!length(ids)) {
+        ids <- vapply(nm, function(p) {
+          m <- regmatches(p, regexpr("ORPHA:\\d+", p, perl = TRUE))
+          if (!length(m) || !nzchar(m)) "" else sub("^ORPHA:", "", m)
+        }, character(1))
+      } else {
+        # if ids like "ORPHA:123" or "123" -> normalize to "123"
+        ids <- sub("^ORPHA:", "", ids)
+      }
+      
+      # align lengths
+      if (length(ids) < length(nm)) ids <- c(ids, rep("", length(nm) - length(ids)))
+      ids <- ids[seq_len(length(nm))]
+      
+      out <- mapply(function(p, id) {
+        lab <- strip_orphanet_prefix(p)
+        if (!nzchar(id)) return(lab)
+        
+        url <- paste0(
+          "https://www.orpha.net/en/disease/detail/", id,
+          "?name=", utils::URLencode(lab, reserved = TRUE),
+          "&mode=name"
+        )
+        sprintf("<a href='%s' target='_blank'>%s</a>", url, lab)
+      }, nm, ids, SIMPLIFY = TRUE, USE.NAMES = FALSE)
+      
+      paste(out, collapse = "<br>")
+    }
+    
     out <- df %>%
       dplyr::transmute(
+        SNP    = as.character(SNP),
         genename    = as.character(genename),
         cluster_id  = as.character(cluster_id),
         cluster_chr_n = as.character(cluster_chr_n),
@@ -9441,32 +11410,150 @@ server <- function(input, output, session) {
         Function_description = dplyr::na_if(trimws(as.character(Function_description)), ""),
         Disease_description  = dplyr::na_if(trimws(as.character(Disease_description)), ""),
         Orphanet_disorder  = dplyr::na_if(trimws(as.character(Orphanet_disorder)), ""),
+        Orphanet_disorder_id = if ("Orphanet_disorder_id" %in% names(df)) as.character(Orphanet_disorder_id) else NA_character_,
         MIM_disease  = dplyr::na_if(trimws(as.character(MIM_disease)), ""),
         clinvar_trait  = dplyr::na_if(trimws(as.character(clinvar_trait)), ""),
+        HPO_name = dplyr::na_if(trimws(as.character(HPO_name)), ""),
+        clinvar_var_id   = if ("clinvar_id" %in% names(df)) dplyr::na_if(trimws(as.character(clinvar_id)), "") else NA_character_,
+        clinvar_medgen_id = dplyr::case_when(
+          "clinvar_MedGen_id" %in% names(df) ~ dplyr::na_if(trimws(as.character(clinvar_MedGen_id)), ""),
+          # fallback if your clinvar_id is actually MedGen like C0950123
+          "clinvar_id" %in% names(df) ~ dplyr::na_if(trimws(as.character(clinvar_id)), ""),
+          TRUE ~ NA_character_
+        ),
         OMIM_raw = .data[[omim_col]]
       ) %>%
       dplyr::filter(!is.na(cluster_id) & nzchar(cluster_id)) %>%
-      dplyr::distinct(
-        cluster_id, cluster_chr_n, cluster_start, cluster_end, genename,
-        Function_description, Disease_description, OMIM_raw,Orphanet_disorder,MIM_disease,clinvar_trait
-      ) %>%
-      dplyr::mutate(
-        UCSC = {
-          u <- mapply(make_ucsc_url, cluster_chr_n, cluster_start, cluster_end,
-                      MoreArgs = list(db = "hg38"))
-          ifelse(is.na(u), "", sprintf("<a href='%s' target='_blank'>Open UCSC</a>", u))
+      
+      # ---- aggregate SNPs into a single row per unique (cluster + gene + descriptions) ----
+    dplyr::group_by(
+      cluster_id, cluster_chr_n, cluster_start, cluster_end,
+      genename,
+      Function_description, Disease_description
+    )%>%
+      dplyr::summarise(
+        
+        # SNPs + links ClinVar (com ho tens) però ara agregant sobre totes les files del grup
+        NonSyn_SNP = {
+          dd <- dplyr::distinct(
+            dplyr::tibble(SNP = SNP, clinvar_var_id = clinvar_var_id),
+            SNP, clinvar_var_id
+          )
+          dd$SNP <- trimws(as.character(dd$SNP))
+          dd <- dd[!is.na(dd$SNP) & nzchar(dd$SNP), , drop = FALSE]
+          
+          dd2 <- dd %>%
+            dplyr::group_by(SNP) %>%
+            dplyr::summarise(
+              clinvar_var_id = {
+                v <- trimws(as.character(clinvar_var_id))
+                v[is.na(v)] <- ""
+                v_num <- v[nzchar(gsub("[^0-9]", "", v))]
+                if (length(v_num)) v_num[1] else (if (length(v) && nzchar(v[1])) v[1] else "")
+              },
+              .groups = "drop"
+            )
+          
+          labs <- vapply(seq_len(nrow(dd2)), function(i) {
+            rs  <- dd2$SNP[i]
+            vid <- dd2$clinvar_var_id[i]
+            url <- make_clinvar_variation_url(vid, rs)
+            if (!is.na(url) && nzchar(url)) sprintf("<a href='%s' target='_blank'>%s</a>", url, rs) else rs
+          }, character(1))
+          
+          paste(labs, collapse = "<br>")
         },
-        OMIM = {
-          o <- vapply(OMIM_raw, make_omim_url, character(1))
-          ifelse(is.na(o), "", sprintf("<a href='%s' target='_blank'>Open OMIM</a>", o))
+        
+        n_NonSyn = {
+          s <- unique(na.omit(trimws(as.character(SNP))))
+          s <- s[nzchar(s)]
+          length(s)
         },
-        genename = {
-          g <- vapply(genename, make_genecards_url, character(1))
-          ifelse(is.na(g), genename, sprintf("<a href='%s' target='_blank'>%s</a>", g, genename))
-        }
+        
+        # Orphanet disorders (merge + clean)
+        Orphanet_disorder = {
+          v <- unlist(strsplit(paste0(na.omit(Orphanet_disorder), collapse = ";"), ";", fixed = TRUE), use.names = FALSE)
+          v <- drop_bad_tokens(v)
+          # optional: de-dup
+          v <- unique(v)
+          paste(v, collapse = ";")
+        },
+        
+        Orphanet_disorder_id = {
+          v <- unlist(strsplit(paste0(na.omit(Orphanet_disorder_id), collapse = ";"), ";", fixed = TRUE), use.names = FALSE)
+          v <- drop_bad_tokens(v)
+          v <- unique(sub("^ORPHA:", "", v))
+          paste(v, collapse = ";")
+        },
+        
+        # MIM disease (merge + clean)
+        MIM_disease = {
+          v <- unlist(strsplit(paste0(na.omit(MIM_disease), collapse = ";"), ";", fixed = TRUE), use.names = FALSE)
+          v <- drop_bad_tokens(v)
+          v <- unique(v)
+          paste(v, collapse = ";")
+        },
+        
+        # ClinVar trait + MedGen ids (merge + clean)
+        clinvar_trait = {
+          v <- unlist(strsplit(paste0(na.omit(clinvar_trait), collapse = ";"), ";", fixed = TRUE), use.names = FALSE)
+          v <- drop_bad_tokens(v)
+          v <- unique(v)
+          paste(v, collapse = ";")
+        },
+        
+        HPO_name = {
+          v <- unlist(strsplit(paste0(na.omit(HPO_name), collapse = ";"), ";", fixed = TRUE), use.names = FALSE)
+          v <- drop_bad_tokens(v)
+          v <- trimws(v)
+          v <- unique(v)
+          paste(v, collapse = ";")
+        },
+        
+        clinvar_medgen_id_agg = {
+          v <- unlist(strsplit(paste0(na.omit(clinvar_medgen_id), collapse = ";"), ";", fixed = TRUE), use.names = FALSE)
+          v <- drop_bad_tokens(v)
+          v <- unique(v)
+          paste(v, collapse = ";")
+        },
+        
+        .groups = "drop"
       ) %>%
-      dplyr::select(UCSC, OMIM, genename, cluster_id, Function_description, Disease_description,Orphanet_disorder,MIM_disease,clinvar_trait)
-    
+      
+      # ---- apply links to existing columns (no UCSC/OMIM columns) ----
+    dplyr::mutate(
+      # cluster_id → UCSC link (com ja ho tenies)
+      cluster_id = {
+        u <- mapply(make_ucsc_url, cluster_chr_n, cluster_start, cluster_end,
+                    MoreArgs = list(db = "hg38"))
+        cid <- as.character(cluster_id)
+        ifelse(is.na(u) | !nzchar(u),
+               cid,
+               sprintf("<a href='%s' target='_blank'>%s</a>", u, cid))
+      },
+      
+      # genename → GeneCards (com ja ho tenies)
+      genename = {
+        g <- vapply(genename, make_genecards_url, character(1))
+        gn <- as.character(genename)
+        ifelse(is.na(g), gn, sprintf("<a href='%s' target='_blank'>%s</a>", g, gn))
+      },
+      
+      # MIM_disease → multiple OMIM links
+      MIM_disease = vapply(MIM_disease, link_mim_cell, character(1)),
+      # clinvar_trait
+      clinvar_trait = mapply(link_clinvar_trait_cell, clinvar_trait, clinvar_medgen_id_agg),
+      # Orphanet_disorder → multiple Orphanet links (needs ids if available)
+      Orphanet_disorder = mapply(link_orpha_cell, Orphanet_disorder, Orphanet_disorder_id)
+      
+    ) %>%
+      dplyr::select(
+        cluster_id, genename,
+        n_NonSyn, NonSyn_SNP,
+        Function_description, Disease_description,
+        Orphanet_disorder, MIM_disease, clinvar_trait,
+        HPO_name
+      )
     
     out
   })
@@ -9475,20 +11562,122 @@ server <- function(input, output, session) {
     dat <- func_disease_df()
     req(nrow(dat) > 0)
     
+    # ---- helper per text llarg pla ----
+    mk_collapsible <- function(x, nchar_preview = 80) {
+      x <- ifelse(is.na(x) | !nzchar(trimws(x)), "", as.character(x))
+      
+      vapply(x, function(txt) {
+        txt_esc <- htmltools::htmlEscape(txt)
+        
+        if (nchar(txt) <= nchar_preview) {
+          return(txt_esc)
+        }
+        
+        preview <- paste0(substr(txt, 1, nchar_preview), "...")
+        preview_esc <- htmltools::htmlEscape(preview)
+        
+        paste0(
+          "<details>",
+          "<summary style='cursor:pointer; color:#1A4E8A;'>", preview_esc, "</summary>",
+          "<div style='white-space:normal; min-width:300px; max-width:600px; padding-top:6px;'>",
+          txt_esc,
+          "</div>",
+          "</details>"
+        )
+      }, character(1))
+    }
+    
+    # ---- helper per columnes HTML amb <br> (ex: NonSyn_SNP) ----
+    # ---- helper per columnes HTML amb <br> (ex: NonSyn_SNP) ----
+    mk_collapsible_br <- function(x, max_items_preview = 5) {
+      x <- ifelse(is.na(x) | !nzchar(trimws(x)), "", as.character(x))
+      
+      vapply(x, function(txt) {
+        parts <- unlist(strsplit(txt, "<br>", fixed = TRUE), use.names = FALSE)
+        parts <- trimws(parts)
+        parts <- parts[nzchar(parts)]
+        
+        if (length(parts) <= max_items_preview) {
+          return(txt)
+        }
+        
+        preview <- paste(parts[seq_len(max_items_preview)], collapse = "<br>")
+        
+        paste0(
+          "<details>",
+          "<summary style='cursor:pointer; color:#1A4E8A;'>",
+          preview, "<br><span style='font-size:11px;color:#666;'>(", 
+          length(parts) - max_items_preview, " more SNPs)</span>",
+          "</summary>",
+          "<div style='white-space:normal; min-width:220px; max-width:500px; padding-top:6px;'>",
+          txt,
+          "</div>",
+          "</details>"
+        )
+      }, character(1))
+    }
+    
+    # ---- convertir columnes llargues ----
+    long_cols <- c(
+      "Function_description",
+      "Disease_description",
+      "HPO_name"
+    )
+    
+    for (cc in intersect(long_cols, names(dat))) {
+      dat[[cc]] <- mk_collapsible(dat[[cc]], nchar_preview = 70)
+    }
+    
+    # ---- NonSyn_SNP desplegable si hi ha > 5 SNPs ----
+    if ("NonSyn_SNP" %in% names(dat)) {
+      dat$NonSyn_SNP <- mk_collapsible_br(dat$NonSyn_SNP, max_items_preview = 5)
+    }
+    
     DT::datatable(
       dat,
       rownames = FALSE,
       escape = FALSE,
       filter = "top",
       extensions = "Buttons",
-      options    = list(
-        dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf", "print"),
-        pageLength = 15,
-        scrollX    = TRUE
-      )
+      selection = "none",
+      options = list(
+        dom = "Bfrtip",
+        pageLength = 10,
+        scrollX = TRUE,
+        buttons = list(
+          list(
+            extend = "copy",
+            exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE)
+          ),
+          list(
+            extend = "csv",
+            exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE)
+          ),
+          list(
+            extend = "excel",
+            exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE)
+          )
+        ),
+        columnDefs = list(
+          list(
+            targets = which(names(dat) %in% c(
+              "NonSyn_SNP",
+              "Function_description",
+              "Disease_description",
+              "HPO_name"
+            )) - 1,
+            className = "dt-left"
+          )
+        )
+      ),
+      callback = DT::JS("
+      table.on('click', 'details, summary, details *', function(e) {
+        e.stopPropagation();
+      });
+    ")
     )
-  })
+  }, server = FALSE)
+  
   #################################################################################  
   ########################### LD MODULE NonSyn #################################### 
   #################################################################################  
@@ -9601,24 +11790,16 @@ server <- function(input, output, session) {
     out
   }
   
-  # -----------------------------
-  # LD PANEL (NonSyn -> shared mod_ld.R)
-  # -----------------------------
-  clusters_r <- reactive({
-    build_ld_clusters_from_app_nonsyn()
-  })
-  
-  candidates_r <- reactive({
-    build_ld_candidates_from_app_nonsyn()
-  })
+  #  ##############################################################################
+  #  ############################ LD Module   #####################################
+  #  ################# GWAS -> LD module canonical cluster input###################
   
   ld_module_server(
     "ld",
-    clusters_r   = clusters_r,
-    candidates_r = candidates_r
+    app_tag = "nonsyn",
+    activate_r = reactive(TRUE)
   )
   
- 
   #################################################################################  
   ##############################  RESET session   #################################  
   #################################################################################  
@@ -9701,16 +11882,8 @@ server <- function(input, output, session) {
     message("[KEGG] genes n=", length(g), " head=", paste(head(g, 6), collapse = ","))
   }, ignoreInit = TRUE)
   
- # temporal:
-  observe({
-    df <- tryCatch(dbnsfp_norm_df(), error = function(e) NULL)
-    if (is.data.frame(df) && nrow(df) > 0) {
-      cat("[dbNSFP] nrow=", nrow(df), " ncol=", ncol(df), "\n")
-      cat("[dbNSFP] interpro cols = ",
-          paste(grep("interpro", names(df), ignore.case = TRUE, value = TRUE), collapse = ", "),
-          "\n")
-    }
-  })  
+
+  ##≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠
   
   
 }  # end server

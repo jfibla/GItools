@@ -624,6 +624,50 @@ cumrange_to_ucsc_region <- function(x0, x1, ref = .ref_hg38) {
   paste0("chr", chr, ":", format(st, scientific = FALSE), "-", format(en, scientific = FALSE))
 }
 
+##############################################################################
+slave_master_settings_text <- function(state_obj) {
+  if (is.null(state_obj) || !is.list(state_obj)) {
+    return("Master settings: not available")
+  }
+  
+  fmt <- function(x) {
+    if (is.null(x) || length(x) == 0) return("<empty>")
+    x <- unlist(x, use.names = FALSE)
+    x <- as.character(x)
+    x <- x[!is.na(x)]
+    if (!length(x)) return("<empty>")
+    paste(x, collapse = " | ")
+  }
+  
+  labels <- c(
+    sid = "Session ID",
+    updated_at = "Updated at",
+    cluster_method = "Cluster method",
+    hits_mode = "Hits mode",
+    thr_value = "Threshold value",
+    flank_bp = "Flank (bp)",
+    min_hits = "Minimum hits",
+    win_bp = "Window size (bp)",
+    step_bp = "Step size (bp)",
+    has_gwas = "GWAS loaded",
+    has_clusters = "Clusters available"
+  )
+  
+  present <- names(labels)[names(labels) %in% names(state_obj)]
+  
+  if (!length(present)) {
+    return("Master settings: no known fields found")
+  }
+  
+  paste(
+    vapply(
+      present,
+      function(nm) paste0(labels[[nm]], ": ", fmt(state_obj[[nm]])),
+      character(1)
+    ),
+    collapse = "\n"
+  )
+}
 
 # -----------------------------
 # UI
@@ -756,89 +800,131 @@ ui <- navbarPage(
       sidebarPanel(
         width = 3,
         
-        h3("Step 1 · Load GWAS hits", style="color:#1A4E8A; font-weight:700;"),
-        fluidRow(
-          column(6, actionButton("info_00", "ℹ️ file format")),
-          column(6, actionButton(
-            "reset_case",
-            "Reset",
-            icon = icon("rotate-left"),
-            class = "btn-warning"
-          ))),
-        fileInput("gwas_file", "GWAS p-value table (TSV/CSV)", accept = c(".tsv",".txt",".csv")),
-        checkboxInput("gwas_header", "First row contains column names", TRUE),
-        radioButtons("gwas_sep", "Separator",
-                     c("Tab \\t" = "\t", "Comma ," = ",", "Semicolon ;" = ";"),
-                     selected = "\t"),
-        uiOutput("gwas_p_selector"),
-        
-        tags$hr(),
-        
-        h3("Step 2 · Clustering GWAS hits", style="color:#1A4E8A; font-weight:700;"),
-        actionButton("info_01", "ℹ️ Clustering method", class = "btn btn-default"),
-        
-        radioButtons(
-          "cluster_method", "Clustering method:",
-          choices  = c("By hit intervals (thr + flank → merge)" = "window",
-                       "By hit density (min_logp + min_hits)"   = "hits"),
-          selected = "window"
-        ),
-        
         conditionalPanel(
-          condition = "input.cluster_method == 'window'",
-          sliderInput("pthr", "-log10(P) threshold", min = 2, max = 20, value = 8, step = 0.5),
-          numericInput("flank", "Flank (+/- bp)", value = 10000, min = 0, max = 10000000, step = 1000)
-        ),
-        
-        conditionalPanel(
-          condition = "input.cluster_method == 'hits'",
-          
-          radioButtons(
-            "hits_mode", "Hits mode:",
-            choices = c("1Mb hit-span (consecutive hits within win_bp)" = "span1mb",
-                        "Tiled windows (non-overlapping)"              = "tiled",
-                        "Sliding windows (overlapping)"                = "sliding"),
-            selected = "span1mb"
+          condition = "output.hub_mode == 'true'",
+          div(
+            style = "background:#fff3cd; border:1px solid #ffeeba; padding:10px; border-radius:10px; margin-bottom:10px;",
+            HTML("<b>Hub mode</b><br>
+         Inputs and clustering synchronized from the <b>Catalog Inspector</b>.<br>
+         To change parameters (filtering, clustering, thresholds…), go back to the <b>Catalog Inspector</b> and re-sync.")
           ),
-          
-          sliderInput("min_logp", "-log10(P) threshold (hit significance)",
-                      min = 2, max = 20, value = 8, step = 0.5),
-          
-          numericInput("min_hits", "Minimum GWAS hits per cluster/window",
-                       value = 3, min = 1, max = 1000, step = 1),
-          
-          numericInput("win_bp", "Window size (bp)", value = 1e6, min = 1e4, max = 5e7, step = 1e4),
-          
-          conditionalPanel(
-            condition = "input.hits_mode == 'sliding'",
-            numericInput("step_bp", "Step (bp)", value = 1e5, min = 1e3, max = 5e7, step = 1e3)
-          ),
-          
-          conditionalPanel(
-            condition = "input.hits_mode != 'sliding'",
-            helpText("For 'tiled' and '1Mb hit-span', step is implicit.")
+          div(
+            class = "panelGrey",
+            tags$b("Master session settings"),
+            verbatimTextOutput("master_session_status")
           )
         ),
-        
-        actionButton(
-          "build_ranges", "➊ intervals → merge → clusters",
-          style="background-color:#ffdd57; color:black; font-weight:bold;"
+        # Hide ONLY Step 1 + Step 2 (+ new/old) when everything comes from Hub
+        conditionalPanel(
+          condition = "output.hub_mode == 'false'",
+          
+          h3("Step 1 · Load GWAS hits", style="color:#1A4E8A; font-weight:700;"),
+          fluidRow(
+            column(6, actionButton("info_00", "ℹ️ file format")),
+            column(6, actionButton(
+              "reset_case",
+              "Reset",
+              icon = icon("rotate-left"),
+              class = "btn-warning"
+            ))
+          ),
+          fileInput("gwas_file", "GWAS p-value table (TSV/CSV)", accept = c(".tsv",".txt",".csv")),
+          checkboxInput("gwas_header", "First row contains column names", TRUE),
+          radioButtons(
+            "gwas_sep", "Separator",
+            c("Tab \\t" = "\t", "Comma ," = ",", "Semicolon ;" = ";"),
+            selected = "\t"
+          ),
+          uiOutput("gwas_p_selector"),
+          
+          tags$hr(),
+          
+          h3("Step 2 · Clustering GWAS hits", style="color:#1A4E8A; font-weight:700;"),
+          actionButton("info_01", "ℹ️ Clustering method", class = "btn btn-default"),
+          
+          radioButtons(
+            "cluster_method", "Clustering method:",
+            choices  = c(
+              "By hit intervals (thr + flank → merge)" = "window",
+              "By hit density (min_logp + min_hits)"   = "hits"
+            ),
+            selected = "window"
+          ),
+          
+          conditionalPanel(
+            condition = "input.cluster_method == 'window'",
+            sliderInput("pthr", "-log10(P) threshold", min = 2, max = 20, value = 8, step = 0.5),
+            numericInput("flank", "Flank (+/- bp)", value = 10000, min = 0, max = 10000000, step = 1000)
+          ),
+          
+          conditionalPanel(
+            condition = "input.cluster_method == 'hits'",
+            
+            radioButtons(
+              "hits_mode", "Hits mode:",
+              choices = c(
+                "1Mb hit-span (consecutive hits within win_bp)" = "span1mb",
+                "Tiled windows (non-overlapping)"              = "tiled",
+                "Sliding windows (overlapping)"                = "sliding"
+              ),
+              selected = "span1mb"
+            ),
+            
+            sliderInput(
+              "min_logp", "-log10(P) threshold (hit significance)",
+              min = 2, max = 20, value = 8, step = 0.5
+            ),
+            
+            numericInput(
+              "min_hits", "Minimum GWAS hits per cluster/window",
+              value = 3, min = 1, max = 1000, step = 1
+            ),
+            
+            numericInput(
+              "win_bp", "Window size (bp)",
+              value = 1e6, min = 1e4, max = 5e7, step = 1e4
+            ),
+            
+            conditionalPanel(
+              condition = "input.hits_mode == 'sliding'",
+              numericInput("step_bp", "Step (bp)", value = 1e5, min = 1e3, max = 5e7, step = 1e3)
+            ),
+            
+            conditionalPanel(
+              condition = "input.hits_mode != 'sliding'",
+              helpText("For 'tiled' and '1Mb hit-span', step is implicit.")
+            )
+          ),
+          
+          actionButton(
+            "build_ranges", "➊ intervals → merge → clusters",
+            style="background-color:#ffdd57; color:black; font-weight:bold;"
+          ),
+          verbatimTextOutput("ranges_preview"),
+          
+          tags$hr()
         ),
-        verbatimTextOutput("ranges_preview"),
         
-        tags$hr(),
-        
+        # ------------------------------------------------------------
+        # ALWAYS VISIBLE: Step 3 + Step 4 + downloads + log (also Hub)
+        # ------------------------------------------------------------
         h3("Step 3 · EWAS resources", style="color:#1A4E8A; font-weight:700;"),
-        textInput("slim_dir", "slim_disease_by_chr directory",
-                  value = ref_paths$slim_dir),
-        textInput("meta_rds", "meta_slim_disease.rds path",
-                  value = "www/meta_slim_disease.rds"),
+        textInput(
+          "slim_dir", "slim_disease_by_chr directory",
+          value = ref_paths$slim_dir
+        ),
+        textInput(
+          "meta_rds", "meta_slim_disease.rds path",
+          value = "www/meta_slim_disease.rds"
+        ),
         
         tags$hr(),
         
         h3("Step 4 · EWAS bin-disease hits", style="color:#1A4E8A; font-weight:700;"),
-        actionButton("run_ewas_all","➋ Compute EWAS bins for ALL clusters",
-                     style="background-color:#ffdd57; color:black; font-weight:bold;"),
+        actionButton(
+          "run_ewas_all", "➋ Compute EWAS bins for ALL clusters",
+          style="background-color:#ffdd57; color:black; font-weight:bold;"
+        ),
         
         tags$hr(),
         downloadButton("dl_candidates_zip", "⬇️ Download catalog candidates (ZIP)"),
@@ -973,7 +1059,7 @@ ui <- navbarPage(
   
   # ========================================================================
   tabPanel(
-    title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>🧩 Table genes</span>"),
+    title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>🧬 Table genes</span>"),
     tags$hr(),
     div(class="panel-lite", withSpinner(DT::DTOutput("genes_nearby_debug"))),
   ),
@@ -1122,9 +1208,7 @@ ui <- navbarPage(
   ),
   tabPanel(
     title = HTML("<span style='font-size:16px; font-weight:600; color:#1A4E8A;'>🧩 LD</span>"),
-    # opcional: si vols que LD tingui sidebar + main:
-    # sidebarLayout(sidebarPanel(...), mainPanel(ld_module_ui("ld")))
-    ld_module_ui("ld")
+    ld_module_ui("ld", app_tag = "ewasdis")
   )
 )
 
@@ -1261,7 +1345,71 @@ server <- function(input, output, session) {
     
   }, ignoreInit = FALSE)
   
+  ################################ DETECT HUB MODE ##############################
   
+  `%||%` <- function(a,b) if (!is.null(a) && length(a) && !all(is.na(a))) a else b
+  
+  hub_mode_r <- reactive({
+    qs <- session$clientData$url_search %||% ""
+    q  <- tryCatch(shiny::parseQueryString(sub("^\\?", "", qs)), error = function(e) list())
+    
+    sid_from_url <- q$sid %||% q$gi_sid %||% q$SID %||% NULL
+    has_sid_in_url <- !is.null(sid_from_url) && nzchar(as.character(sid_from_url))
+    
+    sid_ok <- FALSE
+    if (exists("gi_sync") && is.list(gi_sync) && "sid" %in% names(gi_sync)) {
+      s <- tryCatch(gi_sync$sid(), error = function(e) NULL)
+      sid_ok <- !is.null(s) && nzchar(as.character(s))
+    }
+    
+    hub_flag <- FALSE
+    if (exists("gi_sync") && is.list(gi_sync) && "state_shared" %in% names(gi_sync)) {
+      st <- tryCatch(gi_sync$state_shared(), error = function(e) NULL)
+      hub_flag <- is.list(st) && isTRUE(st$from_hub %||% st$hub %||% st$sync %||% FALSE)
+    }
+    
+    has_shared <- FALSE
+    if (exists("gi_sync") && is.list(gi_sync) && "gwas_shared" %in% names(gi_sync)) {
+      gw <- tryCatch(gi_sync$gwas_shared(), error = function(e) NULL)
+      has_shared <- is.data.frame(gw) && nrow(gw) > 0
+    }
+    if (!has_shared && exists("gi_sync") && is.list(gi_sync) && "clusters_shared" %in% names(gi_sync)) {
+      cl <- tryCatch(gi_sync$clusters_shared(), error = function(e) NULL)
+      has_shared <- is.data.frame(cl) && nrow(cl) > 0
+    }
+    
+    isTRUE(has_sid_in_url || sid_ok || hub_flag || has_shared)
+  })
+  
+  master_session_status <- reactive({
+    st <- NULL
+    
+    if (exists("gi_sync") && is.list(gi_sync) && "state_shared" %in% names(gi_sync)) {
+      st <- tryCatch(gi_sync$state_shared(), error = function(e) NULL)
+    }
+    
+    slave_master_settings_text(st)
+  })
+  
+  
+  output$master_session_status <- renderText({
+    master_session_status()
+  })
+  
+  output$hub_mode <- renderText({
+    if (isTRUE(hub_mode_r())) "true" else "false"
+  })
+  outputOptions(output, "hub_mode", suspendWhenHidden = FALSE)
+  
+  output$dbg_hub_mode <- renderPrint({
+    list(
+      url_search = session$clientData$url_search %||% NA,
+      hub_mode   = hub_mode_r()
+    )
+  })
+  outputOptions(output, "dbg_hub_mode", suspendWhenHidden = FALSE)
+  
+  ######################################################################################
   ################## end slave step
   
   # UCSC region state (MUST be defined before observers that use it)
@@ -1536,17 +1684,24 @@ server <- function(input, output, session) {
   
   hits_df <- reactive({
     df <- gwas_df()
-    if ((input$cluster_method %||% "window") == "window") {
-      req(input$pthr)
-      df %>% dplyr::filter(logp >= input$pthr) %>%
-        dplyr::arrange(dplyr::desc(logp)) %>%
-        dplyr::select(CHR, BP, snp, p = Pval, logp)
+    req(is.data.frame(df), nrow(df) > 0)
+    
+    cluster_method <- as.character(input$cluster_method %||% "")
+    
+    thr <- if (identical(cluster_method, "window")) {
+      suppressWarnings(as.numeric(input$pthr))
+    } else if (identical(cluster_method, "hits")) {
+      suppressWarnings(as.numeric(input$min_logp))
     } else {
-      req(input$min_logp)
-      df %>% dplyr::filter(logp >= input$min_logp) %>%
-        dplyr::arrange(dplyr::desc(logp)) %>%
-        dplyr::select(CHR, BP, snp, p = Pval, logp)
+      NA_real_
     }
+    
+    req(is.finite(thr))
+    
+    df %>%
+      dplyr::filter(is.finite(logp), logp >= thr) %>%
+      dplyr::arrange(dplyr::desc(logp)) %>%
+      dplyr::select(CHR, BP, snp, p = Pval, logp)
   })
   
   output$hits_tbl <- renderDT({
@@ -1644,7 +1799,11 @@ server <- function(input, output, session) {
       extensions = "Buttons",
       options   = list(
         dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf", "print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 10,
         scrollX    = TRUE,
         columnDefs = list(
@@ -1674,7 +1833,7 @@ server <- function(input, output, session) {
     }
     
     dt
-  })
+  }, server = FALSE)
   # -----------------------------
   # Step 2: build clusters (from gi_clusters_canonical_init())
   # -----------------------------
@@ -1731,13 +1890,17 @@ server <- function(input, output, session) {
       extensions = "Buttons",
       options    = list(
         dom        = "Bfrtip",
-        buttons    = c("copy", "csv", "excel", "pdf", "print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 10,
         scrollX    = TRUE
       )
     ) %>%
       formatRound(columns = c("top_logp","cluster_size_kb"), digits = 2)
-  })
+  }, server = FALSE)
   
   # -----------------------------
   # Subset extraction helper (per cluster)
@@ -1836,7 +1999,7 @@ server <- function(input, output, session) {
         need(!is.na(bin_sz)  && bin_sz > 0,            "bin_size must be a positive integer."),
         need(!is.na(min_n)   && min_n >= 2,            "min_n_any must be an integer >= 2."),
         need(!is.na(min_cpg) && min_cpg >= 1,          "min_cpg_any must be an integer >= 1."),
-        need(nzchar(test_m),                         "bin_test_any is empty.")
+        need(nzchar(test_m),                           "bin_test_any is empty.")
       )
       
       append_log(
@@ -1857,10 +2020,8 @@ server <- function(input, output, session) {
           
           cl0 <- cl[i, , drop = FALSE]
           
-          # --- robust column access ---
           cid <- if ("cluster_id" %in% names(cl0)) as.character(cl0$cluster_id[1]) else paste0("cluster_", i)
           
-          # chr can be numeric (5) or "chr5"
           chr_raw <- NULL
           if ("chr" %in% names(cl0)) chr_raw <- cl0$chr[1]
           if (is.null(chr_raw) && "cluster_chr" %in% names(cl0)) chr_raw <- cl0$cluster_chr[1]
@@ -1897,7 +2058,6 @@ server <- function(input, output, session) {
             use_adj_as_ctl = use_adj
           )
           
-          # --- guard: out must be a list ---
           if (!is.list(out)) {
             append_log("[EWAS-ALL] skip (compute returned non-list): ", cid)
             next
@@ -1916,12 +2076,39 @@ server <- function(input, output, session) {
           }
         }
         
-        # rbind only non-null entries
         all_bins_list   <- Filter(Negate(is.null), all_bins_list)
         all_detail_list <- Filter(Negate(is.null), all_detail_list)
         
         rv$ewas_bins_all   <- if (length(all_bins_list))   rbindlist(all_bins_list, fill = TRUE)   else data.table()
         rv$ewas_detail_all <- if (length(all_detail_list)) rbindlist(all_detail_list, fill = TRUE) else data.table()
+        
+        append_log("\n====================\n")
+        append_log("[ewas_bins_all]  nrow=", nrow(rv$ewas_bins_all), " ncol=", ncol(rv$ewas_bins_all), "\n")
+        append_log("[ewas_bins_all]  cols: ", paste(names(rv$ewas_bins_all), collapse = ", "), "\n")
+        append_log("====================\n")
+        if (is.data.frame(rv$ewas_bins_all) && nrow(rv$ewas_bins_all)) {
+          append_log(
+            paste0(
+              "[ewas_bins_all] head:\n",
+              paste(capture.output(print(utils::head(as.data.frame(rv$ewas_bins_all), 5))), collapse = "\n"),
+              "\n"
+            )
+          )
+        }
+        
+        append_log("\n====================\n")
+        append_log("[ewas_detail_all]  nrow=", nrow(rv$ewas_detail_all), " ncol=", ncol(rv$ewas_detail_all), "\n")
+        append_log("[ewas_detail_all]  cols: ", paste(names(rv$ewas_detail_all), collapse = ", "), "\n")
+        append_log("====================\n")
+        if (is.data.frame(rv$ewas_detail_all) && nrow(rv$ewas_detail_all)) {
+          append_log(
+            paste0(
+              "[ewas_detail_all] head:\n",
+              paste(capture.output(print(utils::head(as.data.frame(rv$ewas_detail_all), 5))), collapse = "\n"),
+              "\n"
+            )
+          )
+        }
       })
       
       counts <- data.table(cluster_id = character(), n_EWAS_bins = integer())
@@ -1937,8 +2124,6 @@ server <- function(input, output, session) {
       cldt[is.na(n_EWAS_bins), n_EWAS_bins := 0L]
       cldt[, n_EWAS_bins := as.integer(n_EWAS_bins)]
       
-      # order safely
-      # order safely (data.table: setorder wants column names, not expressions)
       if (all(c("chr","start","end") %in% names(cldt))) {
         cldt[, chr   := suppressWarnings(as.integer(chr))]
         cldt[, start := suppressWarnings(as.integer(start))]
@@ -1950,20 +2135,731 @@ server <- function(input, output, session) {
       
       rv$clusters <- as.data.frame(cldt)
       
-      nb <- if (!is.data.frame(rv$ewas_bins_all) || !nrow(rv$ewas_bins_all)) 0L else nrow(rv$ewas_bins_all)
       
-      if (nb == 0) {
-        notify_err("No significant EWAS bins across ALL clusters (try higher alpha / lower min_n / lower min_cpg).")
+      ######################### START INTEGRATOR ######################################
+      
+      # ------------------------------------------------------------
+      # INTEGRATOR export (EWAS disease bridges)
+      # ------------------------------------------------------------
+      tryCatch({
+        
+        # ============================================================
+        # APP CONFIG (EWAS Disease)
+        # ============================================================
+        app_slug      <- "ewasdis"
+        app_hit_class <- "ewasdis_hit"
+        
+        # Generic logger fallback
+        append_log <- if (exists("append_log", mode = "function", inherits = TRUE)) {
+          get("append_log", mode = "function", inherits = TRUE)
+        } else {
+          function(...) cat(..., "\n", sep = "")
+        }
+        
+        log_tag <- paste0("[INTEGRATOR][", app_slug, "]")
+        ld_tag  <- paste0("[LD-INTEGRATOR][", app_slug, "]")
+        
+        `%||%` <- function(a, b) if (!is.null(a) && length(a) && !all(is.na(a))) a else b
+        
+        # ============================================================
+        # HELPERS
+        # ============================================================
+        fmt_threshold_for_path <- function(x) {
+          x <- suppressWarnings(as.numeric(x))
+          if (is.na(x)) return("NA")
+          out <- format(x, scientific = FALSE, trim = TRUE)
+          gsub("\\.", "p", out)
+        }
+        
+        fmt_tag <- function(x) {
+          x <- as.character(x %||% "NA")
+          x <- trimws(x)
+          x <- gsub("[^A-Za-z0-9_\\-]", "_", x)
+          if (!nzchar(x)) x <- "NA"
+          x
+        }
+        
+        get_ewasdis_cluster_method <- function(input) {
+          cm <- as.character(input$cluster_method %||% NA_character_)
+          hm <- as.character(input$hits_mode %||% NA_character_)
+          
+          if (identical(cm, "window")) {
+            "window"
+          } else if (identical(cm, "hits")) {
+            if (identical(hm, "span1mb")) {
+              "hits_span1mb"
+            } else if (identical(hm, "tiled")) {
+              "hits_tiled"
+            } else if (identical(hm, "sliding")) {
+              "hits_sliding"
+            } else {
+              "hits_unknown"
+            }
+          } else {
+            "unknown"
+          }
+        }
+        
+        get_ewasdis_threshold <- function(input, cluster_method) {
+          if (identical(cluster_method, "window")) {
+            suppressWarnings(as.numeric(input$pthr))
+          } else if (cluster_method %in% c("hits_span1mb", "hits_tiled", "hits_sliding", "hits_unknown")) {
+            suppressWarnings(as.numeric(input$min_logp))
+          } else {
+            NA_real_
+          }
+        }
+        
+        get_ewasdis_gwas_name <- function(input) {
+          nm <- tryCatch(as.character(input$gwas_file$name %||% NA_character_), error = function(e) NA_character_)
+          if (!is.na(nm) && nzchar(trimws(nm))) return(trimws(nm))
+          
+          pre_nm1 <- tryCatch(as.character(input$preloaded_gwas %||% NA_character_), error = function(e) NA_character_)
+          pre_nm2 <- tryCatch(as.character(input$gwas_case %||% NA_character_), error = function(e) NA_character_)
+          pre_nm3 <- tryCatch(as.character(input$example_gwas %||% NA_character_), error = function(e) NA_character_)
+          
+          cand <- c(pre_nm1, pre_nm2, pre_nm3)
+          cand <- cand[!is.na(cand) & nzchar(trimws(cand))]
+          
+          if (length(cand)) return(cand[1])
+          
+          "unknown_gwas_source"
+        }
+        
+        gi_get_integrator_session_dir <- function(gi_shared_root, cluster_method, threshold_used) {
+          integrator_root <- file.path(gi_shared_root, "integrator_exports")
+          dir.create(integrator_root, recursive = TRUE, showWarnings = FALSE)
+          
+          method_tag <- fmt_tag(cluster_method)
+          thr_tag    <- fmt_threshold_for_path(threshold_used)
+          
+          session_id <- paste0(
+            "clust_", method_tag,
+            "__thr_", thr_tag
+          )
+          
+          session_dir <- file.path(integrator_root, session_id)
+          dir.create(session_dir, recursive = TRUE, showWarnings = FALSE)
+          
+          list(
+            integrator_root = integrator_root,
+            session_id = session_id,
+            session_dir = session_dir,
+            method_tag = method_tag,
+            thr_tag = thr_tag
+          )
+        }
+        
+        gi_load_or_create_manifest <- function(session_dir, session_id, cluster_method, threshold_used, gwas_session_file) {
+          manifest_path <- file.path(session_dir, "manifest.rds")
+          
+          if (file.exists(manifest_path)) {
+            manifest <- tryCatch(readRDS(manifest_path), error = function(e) NULL)
+            if (is.list(manifest)) {
+              if (is.null(manifest$files)) manifest$files <- list()
+              if (is.null(manifest$apps_present)) manifest$apps_present <- character(0)
+              return(list(manifest = manifest, manifest_path = manifest_path))
+            }
+          }
+          
+          manifest <- list(
+            session_id = session_id,
+            created_at = as.character(Sys.time()),
+            cluster_method = cluster_method,
+            threshold_used = threshold_used,
+            gwas_session_file = gwas_session_file,
+            settings_key = paste0(
+              "cluster_method=", cluster_method,
+              ";threshold_used=", threshold_used
+            ),
+            apps_present = character(0),
+            files = list()
+          )
+          
+          list(manifest = manifest, manifest_path = manifest_path)
+        }
+        
+        # ============================================================
+        # SESSION / SETTINGS FOLDER
+        # ============================================================
+        current_cluster_method <- get_ewasdis_cluster_method(input)
+        current_threshold      <- get_ewasdis_threshold(input, current_cluster_method)
+        current_gwas_name      <- get_ewasdis_gwas_name(input)
+        
+        sess <- gi_get_integrator_session_dir(
+          gi_shared_root = gi_shared_root,
+          cluster_method = current_cluster_method,
+          threshold_used = current_threshold
+        )
+        
+        integrator_root <- sess$integrator_root
+        session_id      <- sess$session_id
+        session_dir     <- sess$session_dir
+        
+        manifest_obj <- gi_load_or_create_manifest(
+          session_dir = session_dir,
+          session_id = session_id,
+          cluster_method = current_cluster_method,
+          threshold_used = current_threshold,
+          gwas_session_file = current_gwas_name
+        )
+        
+        manifest      <- manifest_obj$manifest
+        manifest_path <- manifest_obj$manifest_path
+        
+        if (!identical(as.character(manifest$cluster_method %||% ""), as.character(current_cluster_method))) {
+          stop("Existing manifest cluster_method does not match current cluster_method.")
+        }
+        
+        if (!isTRUE(all.equal(
+          suppressWarnings(as.numeric(manifest$threshold_used)),
+          suppressWarnings(as.numeric(current_threshold))
+        ))) {
+          stop("Existing manifest threshold_used does not match current threshold_used.")
+        }
+        
+        manifest_gwas_files <- as.character(manifest$gwas_session_file %||% character(0))
+        manifest_gwas_files <- trimws(manifest_gwas_files)
+        manifest_gwas_files <- manifest_gwas_files[!is.na(manifest_gwas_files) & nzchar(manifest_gwas_files)]
+        
+        current_gwas_name_chr <- trimws(as.character(current_gwas_name %||% ""))
+        if (nzchar(current_gwas_name_chr)) {
+          manifest_gwas_files <- unique(c(manifest_gwas_files, current_gwas_name_chr))
+        }
+        
+        manifest$gwas_session_file <- manifest_gwas_files
+        
+        gene_bridge_path     <- file.path(session_dir, paste0(app_slug, "_gene_bridge.rds"))
+        term_bridge_path     <- file.path(session_dir, paste0(app_slug, "_term_bridge.rds"))
+        clusters_master_path <- file.path(session_dir, paste0(app_slug, "_clusters_master.rds"))
+        candidates_path      <- file.path(session_dir, paste0(app_slug, "_candidates.rds"))
+        
+        append_log(paste0(log_tag, " integrator_root=", integrator_root))
+        append_log(paste0(log_tag, " cluster_method=", current_cluster_method))
+        append_log(paste0(log_tag, " threshold_used=", current_threshold))
+        append_log(paste0(log_tag, " gwas_session_file=", paste(manifest$gwas_session_file, collapse = " | ")))
+        append_log(paste0(log_tag, " session_id=", session_id))
+        append_log(paste0(log_tag, " session_dir=", session_dir))
+        
+        # ============================================================
+        # A) GENE BRIDGE from nearby genes around EWAS bins
+        # ============================================================
+        bins_df <- if (is.data.frame(rv$ewas_bins_all) && nrow(rv$ewas_bins_all)) {
+          as.data.frame(rv$ewas_bins_all)
+        } else {
+          NULL
+        }
+        
+        if (is.data.frame(bins_df) && nrow(bins_df)) {
+          append_log(paste0(log_tag, " bins_df nrow=", nrow(bins_df), " ncol=", ncol(bins_df)))
+          append_log(paste0(log_tag, " bins_df cols: ", paste(names(bins_df), collapse = ", ")))
+          
+          if (!"start" %in% names(bins_df) && "bin_start" %in% names(bins_df)) bins_df$start <- bins_df$bin_start
+          if (!"end"   %in% names(bins_df) && "bin_end"   %in% names(bins_df)) bins_df$end   <- bins_df$bin_end
+          
+          bins_df$chr   <- as.character(bins_df$chr)
+          bins_df$start <- suppressWarnings(as.integer(bins_df$start))
+          bins_df$end   <- suppressWarnings(as.integer(bins_df$end))
+        }
+        
+        gene_bridge <- tibble::tibble(
+          gene = character(),
+          source_app = character(),
+          evidence_type = character(),
+          cluster_id = character(),
+          chr = integer(),
+          start = integer(),
+          end = integer()
+        )
+        
+        if (is.data.frame(bins_df) && nrow(bins_df)) {
+          req_cols <- c("chr", "start", "end")
+          if (all(req_cols %in% names(bins_df))) {
+            gdf <- tryCatch(
+              gi_ewas_genes_nearby(bins_df = bins_df, flank_bp = 25000L),
+              error = function(e) {
+                append_log(paste0(log_tag, " gi_ewas_genes_nearby() failed: ", conditionMessage(e)))
+                NULL
+              }
+            )
+            
+            if (is.data.frame(gdf) && nrow(gdf)) {
+              append_log(paste0(log_tag, " nearby genes nrow=", nrow(gdf), " ncol=", ncol(gdf)))
+              append_log(paste0(log_tag, " nearby genes cols: ", paste(names(gdf), collapse = ", ")))
+              
+              if (!"gene" %in% names(gdf)) {
+                if ("SYMBOL" %in% names(gdf)) {
+                  gdf$gene <- gdf$SYMBOL
+                } else if ("symbol" %in% names(gdf)) {
+                  gdf$gene <- gdf$symbol
+                } else {
+                  gdf$gene <- NA_character_
+                }
+              }
+              
+              if (!"cluster_start" %in% names(gdf) && "bin_start" %in% names(gdf)) gdf$cluster_start <- gdf$bin_start
+              if (!"cluster_end"   %in% names(gdf) && "bin_end"   %in% names(gdf)) gdf$cluster_end   <- gdf$bin_end
+              
+              if (!"cluster_id" %in% names(gdf) && "cluster_id" %in% names(bins_df)) {
+                join_by_cols <- intersect(c("chr","bin_start","bin_end"), intersect(names(gdf), names(bins_df)))
+                add_cols <- intersect(c("chr","bin_start","bin_end","cluster_id","cluster_start","cluster_end"), names(bins_df))
+                
+                if (length(join_by_cols) > 0 && length(add_cols) > 0) {
+                  gdf <- dplyr::left_join(
+                    gdf,
+                    bins_df[, add_cols, drop = FALSE],
+                    by = join_by_cols
+                  )
+                }
+              }
+              
+              if (!"cluster_start" %in% names(gdf) && "start" %in% names(gdf)) gdf$cluster_start <- gdf$start
+              if (!"cluster_end"   %in% names(gdf) && "end"   %in% names(gdf)) gdf$cluster_end   <- gdf$end
+              
+              gene_bridge <- gdf %>%
+                dplyr::transmute(
+                  gene = as.character(gene),
+                  source_app = app_slug,
+                  evidence_type = "ewas_nearby_gene",
+                  cluster_id = as.character(cluster_id),
+                  chr = suppressWarnings(as.integer(readr::parse_number(as.character(chr)))),
+                  start = suppressWarnings(as.integer(readr::parse_number(as.character(cluster_start)))),
+                  end = suppressWarnings(as.integer(readr::parse_number(as.character(cluster_end))))
+                ) %>%
+                sanitize_bridge() %>%
+                sanitize_bridge_genes() %>%
+                dplyr::filter(!is.na(gene), nzchar(gene)) %>%
+                dplyr::distinct()
+            }
+          } else {
+            append_log(paste0(
+              log_tag, " gene bridge skipped: missing columns -> ",
+              paste(setdiff(req_cols, names(bins_df)), collapse = ", ")
+            ))
+          }
+        }
+        
+        saveRDS(gene_bridge, gene_bridge_path)
+        manifest$files[[paste0(app_slug, "_gene_bridge")]] <- basename(gene_bridge_path)
+        append_log(paste0(
+          log_tag, " saved ", basename(gene_bridge_path),
+          " | exists=", file.exists(gene_bridge_path),
+          " | nrow=", nrow(gene_bridge)
+        ))
+        
+        # ============================================================
+        # B) TERM BRIDGE from detailed disease-level EWAS results
+        # ============================================================
+        detail_df <- if (is.data.frame(rv$ewas_detail_all) && nrow(rv$ewas_detail_all)) {
+          as.data.frame(rv$ewas_detail_all)
+        } else {
+          NULL
+        }
+        
+        term_bridge <- tibble::tibble(
+          term = character(),
+          term_type = character(),
+          source_app = character(),
+          evidence_type = character(),
+          cluster_id = character(),
+          chr = integer(),
+          start = integer(),
+          end = integer()
+        )
+        
+        if (is.data.frame(detail_df) && nrow(detail_df)) {
+          append_log(paste0(log_tag, " detail_df nrow=", nrow(detail_df), " ncol=", ncol(detail_df)))
+          append_log(paste0(log_tag, " detail_df cols: ", paste(names(detail_df), collapse = ", ")))
+          
+          needed_term_cols <- c("disease", "cluster_id", "chr", "cluster_start", "cluster_end")
+          
+          if (all(needed_term_cols %in% names(detail_df))) {
+            term_bridge <- detail_df %>%
+              dplyr::transmute(
+                term = as.character(disease),
+                term_type = "disease",
+                source_app = app_slug,
+                evidence_type = "ewas_disease",
+                cluster_id = as.character(cluster_id),
+                chr = suppressWarnings(as.integer(readr::parse_number(as.character(chr)))),
+                start = suppressWarnings(as.integer(readr::parse_number(as.character(cluster_start)))),
+                end = suppressWarnings(as.integer(readr::parse_number(as.character(cluster_end))))
+              ) %>%
+              sanitize_bridge() %>%
+              dplyr::filter(!is.na(term), nzchar(term)) %>%
+              dplyr::distinct()
+          } else {
+            append_log(paste0(
+              log_tag, " term bridge skipped: missing columns -> ",
+              paste(setdiff(needed_term_cols, names(detail_df)), collapse = ", ")
+            ))
+          }
+        }
+        
+        saveRDS(term_bridge, term_bridge_path)
+        manifest$files[[paste0(app_slug, "_term_bridge")]] <- basename(term_bridge_path)
+        append_log(paste0(
+          log_tag, " saved ", basename(term_bridge_path),
+          " | exists=", file.exists(term_bridge_path),
+          " | nrow=", nrow(term_bridge)
+        ))
+        
+        # ============================================================
+        # C) CLUSTERS MASTER
+        # ============================================================
+        append_log(paste0(ld_tag, " dir=", session_dir))
+        append_log(paste0(ld_tag, " dir exists: ", dir.exists(session_dir)))
+        
+        clusters_master <- tibble::tibble()
+        
+        if (exists("cl2", inherits = TRUE) && is.data.frame(cl2) && nrow(cl2) > 0) {
+          
+          append_log(paste0(ld_tag, "[CLUSTERS] using cl2"))
+          append_log(paste0(ld_tag, "[CLUSTERS] cl2 nrow=", nrow(cl2), " ncol=", ncol(cl2)))
+          append_log(paste0(ld_tag, "[CLUSTERS] cl2 cols: ", paste(names(cl2), collapse = ", ")))
+          
+          chr_col <- intersect(c("chr","CHR","chrom","CHROM","chromosome"), names(cl2))
+          st_col  <- intersect(c("start","START","cluster_start","start_bp","FROM","from","bp1"), names(cl2))
+          en_col  <- intersect(c("end","END","cluster_end","end_bp","TO","to","bp2"), names(cl2))
+          id_col  <- intersect(c("cluster_id","CLUSTER_ID","cluster","id"), names(cl2))
+          key_col <- intersect(c("cluster_key","CLUSTER_KEY"), names(cl2))
+          
+          chr_col <- if (length(chr_col)) chr_col[1] else NULL
+          st_col  <- if (length(st_col))  st_col[1]  else NULL
+          en_col  <- if (length(en_col))  en_col[1]  else NULL
+          id_col  <- if (length(id_col))  id_col[1]  else NULL
+          key_col <- if (length(key_col)) key_col[1] else NULL
+          
+          if (!is.null(chr_col) && !is.null(st_col) && !is.null(en_col) && !is.null(id_col)) {
+            clusters_master <- cl2 %>%
+              dplyr::transmute(
+                cluster_id = as.character(.data[[id_col]]),
+                chr        = suppressWarnings(as.integer(readr::parse_number(as.character(.data[[chr_col]])))),
+                start_raw  = suppressWarnings(as.integer(readr::parse_number(as.character(.data[[st_col]])))),
+                end_raw    = suppressWarnings(as.integer(readr::parse_number(as.character(.data[[en_col]])))),
+                cluster_key = if (!is.null(key_col)) as.character(.data[[key_col]]) else NA_character_
+              ) %>%
+              dplyr::mutate(
+                cluster_id = trimws(cluster_id),
+                start = pmin(start_raw, end_raw),
+                end   = pmax(start_raw, end_raw),
+                cluster_key = dplyr::if_else(
+                  !is.na(cluster_key) & nzchar(cluster_key),
+                  cluster_key,
+                  paste0(cluster_id, "|chr", chr, ":", start, "-", end)
+                )
+              ) %>%
+              dplyr::select(cluster_id, chr, start, end, cluster_key) %>%
+              dplyr::filter(
+                !is.na(cluster_id), nzchar(cluster_id),
+                is.finite(chr), is.finite(start), is.finite(end)
+              ) %>%
+              dplyr::distinct()
+          } else {
+            append_log(paste0(ld_tag, "[CLUSTERS] cl2 missing required columns"))
+          }
+          
+        } else if (is.data.frame(bins_df) && nrow(bins_df) &&
+                   all(c("cluster_id", "chr") %in% names(bins_df)) &&
+                   (all(c("cluster_start", "cluster_end") %in% names(bins_df)) ||
+                    all(c("bin_start", "bin_end") %in% names(bins_df)))) {
+          
+          append_log(paste0(ld_tag, "[CLUSTERS] deriving clusters_master from bins_df"))
+          
+          if (!"cluster_start" %in% names(bins_df) && "bin_start" %in% names(bins_df)) bins_df$cluster_start <- bins_df$bin_start
+          if (!"cluster_end"   %in% names(bins_df) && "bin_end"   %in% names(bins_df)) bins_df$cluster_end   <- bins_df$bin_end
+          
+          clusters_master <- bins_df %>%
+            dplyr::transmute(
+              cluster_id = as.character(cluster_id),
+              chr        = suppressWarnings(as.integer(readr::parse_number(as.character(chr)))),
+              start_raw  = suppressWarnings(as.integer(readr::parse_number(as.character(cluster_start)))),
+              end_raw    = suppressWarnings(as.integer(readr::parse_number(as.character(cluster_end))))
+            ) %>%
+            dplyr::mutate(
+              cluster_id = trimws(cluster_id),
+              start = pmin(start_raw, end_raw),
+              end   = pmax(start_raw, end_raw),
+              cluster_key = paste0(cluster_id, "|chr", chr, ":", start, "-", end)
+            ) %>%
+            dplyr::select(cluster_id, chr, start, end, cluster_key) %>%
+            dplyr::filter(
+              !is.na(cluster_id), nzchar(cluster_id),
+              is.finite(chr), is.finite(start), is.finite(end)
+            ) %>%
+            dplyr::distinct()
+        } else {
+          append_log(paste0(ld_tag, "[CLUSTERS] no usable source found for clusters_master"))
+        }
+        
+        append_log(paste0(ld_tag, "[CLUSTERS] clusters_master nrow=", nrow(clusters_master)))
+        
+        if (nrow(clusters_master) > 0) {
+          saveRDS(clusters_master, clusters_master_path)
+          manifest$files[[paste0(app_slug, "_clusters_master")]] <- basename(clusters_master_path)
+          append_log(paste0(ld_tag, "[CLUSTERS] saved: ", clusters_master_path))
+          append_log(paste0(ld_tag, "[CLUSTERS] exists after save: ", file.exists(clusters_master_path)))
+        } else {
+          append_log(paste0(ld_tag, "[CLUSTERS] ", basename(clusters_master_path), " NOT saved (0 rows)"))
+        }
+        
+        # ============================================================
+        # D) CANDIDATES FOR LD = GWAS + EWASDIS HIT
+        # ============================================================
+        get_gwas_hits_for_ld <- function() {
+          if (exists("hits_df", mode = "function", inherits = TRUE)) {
+            x <- tryCatch(hits_df(), error = function(e) NULL)
+            if (is.data.frame(x) && nrow(x) > 0) {
+              return(list(name = "hits_df()", data = x))
+            }
+          }
+          
+          list(name = NULL, data = NULL)
+        }
+        
+        gwas_src   <- get_gwas_hits_for_ld()
+        gwas_df_ld <- gwas_src$data
+        
+        append_log(paste0(ld_tag, "[CANDIDATES][GWAS] filtered source picked: ", gwas_src$name %||% "NULL"))
+        
+        gwas_candidates <- tibble::tibble()
+        
+        if (is.data.frame(gwas_df_ld) && nrow(gwas_df_ld)) {
+          
+          # hits_df() té: CHR, BP, snp, p, logp
+          gwas_candidates0 <- gwas_df_ld %>%
+            dplyr::transmute(
+              cluster_id = NA_character_,
+              chr        = suppressWarnings(as.integer(readr::parse_number(as.character(CHR)))),
+              pos_ini    = suppressWarnings(as.integer(readr::parse_number(as.character(BP)))),
+              pos_end    = suppressWarnings(as.integer(readr::parse_number(as.character(BP)))),
+              id_hit     = as.character(snp),
+              classe     = "GWAS"
+            ) %>%
+            dplyr::mutate(
+              cluster_id = trimws(cluster_id),
+              id_hit     = trimws(id_hit)
+            ) %>%
+            dplyr::filter(
+              is.finite(chr), is.finite(pos_ini), is.finite(pos_end),
+              !is.na(id_hit), nzchar(id_hit)
+            ) %>%
+            dplyr::distinct()
+          
+          gwas_candidates <- gwas_candidates0 %>%
+            dplyr::left_join(
+              clusters_master %>%
+                dplyr::rename(
+                  cluster_chr   = chr,
+                  cluster_start = start,
+                  cluster_end   = end
+                ),
+              by = dplyr::join_by(
+                chr == cluster_chr,
+                pos_ini >= cluster_start,
+                pos_ini <= cluster_end
+              )
+            ) %>%
+            dplyr::mutate(
+              cluster_id = cluster_id.y
+            ) %>%
+            dplyr::select(cluster_id, chr, pos_ini, pos_end, id_hit, classe) %>%
+            dplyr::filter(!is.na(cluster_id), nzchar(cluster_id)) %>%
+            dplyr::distinct()
+        }
+        
+        append_log(paste0(ld_tag, "[CANDIDATES][GWAS] nrow=", nrow(gwas_candidates)))
+        if (nrow(gwas_candidates) > 0) {
+          append_log(
+            paste0(
+              ld_tag, "[CANDIDATES][GWAS] head:\n",
+              paste(capture.output(print(utils::head(gwas_candidates, 10))), collapse = "\n")
+            )
+          )
+        }
+        
+        ##########################
+        ewasdis_candidates <- tibble::tibble()
+        
+        if (is.data.frame(bins_df) && nrow(bins_df)) {
+          
+          # Normalitzar coordenades de bin
+          if (!"bin_start" %in% names(bins_df) && "start" %in% names(bins_df)) bins_df$bin_start <- bins_df$start
+          if (!"bin_end"   %in% names(bins_df) && "end"   %in% names(bins_df)) bins_df$bin_end   <- bins_df$end
+          
+          needed_hit_cols <- c("cluster_id", "chr", "bin_start", "bin_end")
+          
+          if (all(needed_hit_cols %in% names(bins_df))) {
+            
+            id_col_candidates <- c("probe", "probe_id", "cpg", "CpG", "bin_id", "id")
+            id_col <- intersect(id_col_candidates, names(bins_df))
+            id_col <- if (length(id_col)) id_col[1] else NULL
+            
+            ewasdis_candidates <- bins_df %>%
+              dplyr::transmute(
+                cluster_id = as.character(cluster_id),
+                chr        = suppressWarnings(as.integer(readr::parse_number(as.character(chr)))),
+                bin_start  = suppressWarnings(as.integer(readr::parse_number(as.character(bin_start)))),
+                bin_end    = suppressWarnings(as.integer(readr::parse_number(as.character(bin_end)))),
+                pos_ini    = suppressWarnings(as.integer(readr::parse_number(as.character(bin_start)))),
+                pos_end    = suppressWarnings(as.integer(readr::parse_number(as.character(bin_end)))),
+                id_hit_raw = if (!is.null(id_col)) as.character(.data[[id_col]]) else NA_character_
+              ) %>%
+              dplyr::mutate(
+                cluster_id = trimws(cluster_id),
+                id_hit_raw = trimws(id_hit_raw),
+                id_hit = dplyr::if_else(
+                  !is.na(id_hit_raw) & nzchar(id_hit_raw),
+                  id_hit_raw,
+                  paste0("bin_chr", chr, ":", bin_start, "-", bin_end)
+                ),
+                classe = app_hit_class
+              ) %>%
+              dplyr::filter(
+                !is.na(cluster_id), nzchar(cluster_id),
+                is.finite(chr),
+                is.finite(pos_ini), is.finite(pos_end),
+                pos_end >= pos_ini,
+                !is.na(id_hit), nzchar(id_hit)
+              ) %>%
+              dplyr::distinct(cluster_id, chr, pos_ini, pos_end, id_hit, .keep_all = TRUE) %>%
+              dplyr::select(cluster_id, chr, pos_ini, pos_end, id_hit, classe)
+            
+            append_log(paste0(ld_tag, "[CANDIDATES][APP] id_col=", id_col %||% "NULL"))
+            
+          } else {
+            append_log(paste0(
+              ld_tag, "[CANDIDATES][APP] skipped: missing columns -> ",
+              paste(setdiff(needed_hit_cols, names(bins_df)), collapse = ", ")
+            ))
+          }
+          
+        } else {
+          append_log(paste0(ld_tag, "[CANDIDATES][APP] skipped: bins_df missing or empty"))
+        }
+        
+        append_log(paste0(ld_tag, "[CANDIDATES][APP] nrow=", nrow(ewasdis_candidates)))
+        append_log(
+          paste0(
+            ld_tag, "[CANDIDATES][APP] cluster counts:\n",
+            paste(
+              capture.output(
+                print(
+                  ewasdis_candidates %>%
+                    dplyr::count(cluster_id, name = "n_candidates")
+                )
+              ),
+              collapse = "\n"
+            )
+          )
+        )
+        
+        if (nrow(ewasdis_candidates) > 0) {
+          append_log(
+            paste0(
+              ld_tag, "[CANDIDATES][APP] head:\n",
+              paste(capture.output(print(utils::head(ewasdis_candidates, 10))), collapse = "\n")
+            )
+          )
+        }
+        
+        candidates_ld <- dplyr::bind_rows(gwas_candidates, ewasdis_candidates) %>%
+          dplyr::mutate(
+            rsid     = id_hit,
+            position = pos_ini
+          ) %>%
+          dplyr::select(cluster_id, chr, pos_ini, pos_end, id_hit, rsid, position, classe) %>%
+          dplyr::filter(
+            !is.na(cluster_id), nzchar(cluster_id),
+            is.finite(chr), is.finite(pos_ini), is.finite(pos_end),
+            !is.na(id_hit), nzchar(id_hit)
+          ) %>%
+          dplyr::distinct() %>%
+          dplyr::arrange(chr, pos_ini, id_hit, classe)
+        
+        append_log(paste0(ld_tag, "[CANDIDATES] combined nrow=", nrow(candidates_ld), " ncol=", ncol(candidates_ld)))
+        append_log(paste0(ld_tag, "[CANDIDATES] combined cols: ", paste(names(candidates_ld), collapse = ", ")))
+        append_log(
+          paste0(
+            ld_tag, "[CANDIDATES] combined head:\n",
+            paste(capture.output(print(utils::head(candidates_ld, 10))), collapse = "\n")
+          )
+        )
+        
+        if (nrow(candidates_ld) > 0) {
+          append_log(paste0(
+            ld_tag, "[CANDIDATES] classe counts:\n",
+            paste(capture.output(print(table(candidates_ld$classe, useNA = "ifany"))), collapse = "\n")
+          ))
+        }
+        
+        if (nrow(candidates_ld) > 0) {
+          saveRDS(candidates_ld, candidates_path)
+          manifest$files[[paste0(app_slug, "_candidates")]] <- basename(candidates_path)
+          append_log(paste0(ld_tag, "[CANDIDATES] saved: ", candidates_path))
+          append_log(paste0(ld_tag, "[CANDIDATES] exists after save: ", file.exists(candidates_path)))
+        } else {
+          append_log(paste0(ld_tag, "[CANDIDATES] ", basename(candidates_path), " NOT saved (0 rows)"))
+        }
+        # ============================================================
+        # FINAL MANIFEST WRITE
+        # ============================================================
+        manifest$apps_present <- sort(unique(c(manifest$apps_present, app_slug)))
+        manifest$last_updated <- as.character(Sys.time())
+        
+        saveRDS(manifest, manifest_path)
+        
+        append_log(paste0(log_tag, " manifest saved: ", manifest_path))
+        append_log(
+          paste0(
+            log_tag, " manifest content:\n",
+            paste(capture.output(str(manifest, max.level = 2)), collapse = "\n")
+          )
+        )
+        
+      }, error = function(e) {
+        if (exists("append_log", mode = "function", inherits = TRUE)) {
+          append_log(paste0("[LD-INTEGRATOR][ERROR] ", conditionMessage(e)))
+        } else {
+          cat("[LD-INTEGRATOR][ERROR] ", conditionMessage(e), "\n", sep = "")
+        }
+      })     
+      ######################### END INTEGRATOR ######################################
+      
+      incProgress(0.05, detail = "Done")
+      append_log("[END] run_ewas_all finished OK")
+      
+      if (is.null(rv$ewas_bins_all) || !nrow(rv$ewas_bins_all)) {
+        showNotification("No EWAS bins found in clusters.", type = "warning", duration = 6)
       } else {
-        notify_info(paste0("EWAS ALL clusters computed: ", nb, " significant bins."))
+        showNotification("EWAS bins assigned to clusters (n_EWAS_bins updated).", type = "message", duration = 4)
       }
       
     }, error = function(e) {
-      notify_err(paste0("run_ewas_all failed: ", conditionMessage(e)))
+      
+      rv$ewas_bins_all   <- data.frame()
+      rv$ewas_detail_all <- data.frame()
+      
+      cl_now <- rv$clusters
+      if (!is.null(cl_now) && nrow(cl_now)) {
+        cl_now$n_EWAS_bins <- 0L
+        rv$clusters <- cl_now
+      }
+      
+      msg <- paste0("ERROR (run_ewas_all): ", conditionMessage(e))
+      output$ewas_summary <- renderText(msg)
+      
+      append_log("[ERROR] ", msg)
+      showNotification(conditionMessage(e), type = "error", duration = 12)
+      
+    }, finally = {
+      
+      if (requireNamespace("shinyjs", quietly = TRUE)) shinyjs::enable("run_ewas_all")
+      
     })
     
   }, ignoreInit = TRUE)
-  
+
   
   # -----------------------------
   # Build summary for selected cluster (frozen)
@@ -2095,6 +2991,33 @@ server <- function(input, output, session) {
     )
   })
   
+  
+  # --- JS formatter for exports: replace "View diseases" with the REAL list ---
+  
+  js_columns_all <- DT::JS("function ( idx, data, node ) { return true; }")
+  
+  # Export: si la cel·la conté <span class='diseaseOpen' data-diseases-enc='...'>,
+  # exportem el llistat real com "d1; d2; d3". Si no, traiem HTML -> text.
+  js_export_body_bin_diseases <- DT::JS("
+function(data, row, column, node){
+  // 'data' és el HTML/text de la cel·la
+  if(typeof data === 'string' && data.indexOf('diseaseOpen') !== -1){
+    var m = data.match(/data-diseases-enc='([^']*)'/);
+    var enc = (m && m[1]) ? m[1] : '';
+    var raw = '';
+    try { raw = decodeURIComponent(enc); } catch(e){ raw = enc; }
+
+    return raw.split('\\n')
+              .map(function(x){ return (x || '').trim(); })
+              .filter(function(x){ return x.length > 0; })
+              .join('; ');
+  }
+
+  // fallback: strip HTML
+  return $('<div>').html(data).text().trim();
+}
+")
+  
   output$tbl_bin_diseases <- renderDT({
     
     bins <- current_bins_for_summary()
@@ -2163,25 +3086,6 @@ server <- function(input, output, session) {
         diseases = diseases_click
       )
     
-    # --- JS formatter for exports: replace "View diseases" with the REAL list ---
-    js_export_body <- DT::JS("
-function(data, row, column, node){
-  var $sp = $(node).find('span.diseaseOpen');
-  if($sp.length){
-    var enc = $sp.attr('data-diseases-enc') || '';
-    var raw = '';
-    try { raw = decodeURIComponent(enc); } catch(e){ raw = enc; }
-
-    // export as a single cell: disease1; disease2; ...
-    return raw.split('\\n')
-              .map(function(x){ return x.trim(); })
-              .filter(function(x){ return x.length > 0; })
-              .join('; ');
-  }
-  return $(node).text().trim();
-}
-")
-    
     DT::datatable(
       show_df,
       escape = FALSE,
@@ -2192,11 +3096,31 @@ function(data, row, column, node){
         dom        = "Bfrtip",
         pageLength = 15,
         scrollX    = TRUE,
-        buttons    = list(
-          list(extend = "copy",  exportOptions = list(columns=":visible", format=list(body = js_export_body))),
-          list(extend = "csv",   exportOptions = list(columns=":visible", format=list(body = js_export_body))),
-          list(extend = "excel", exportOptions = list(columns=":visible", format=list(body = js_export_body))),
-          list(extend = "print", exportOptions = list(columns=":visible", format=list(body = js_export_body)))
+        buttons = list(
+          list(
+            extend = "copy",
+            exportOptions = list(
+              modifier = list(page = "all"),
+              columns = js_columns_all,
+              format   = list(body = js_export_body_bin_diseases)
+            )
+          ),
+          list(
+            extend = "csv",
+            exportOptions = list(
+              modifier = list(page = "all"),
+              columns = js_columns_all,
+              format   = list(body = js_export_body_bin_diseases)
+            )
+          ),
+          list(
+            extend = "excel",
+            exportOptions = list(
+              modifier = list(page = "all"),
+              columns = js_columns_all,
+              format   = list(body = js_export_body_bin_diseases)
+            )
+          )
         )
       ),
       callback = DT::JS("
@@ -2285,173 +3209,7 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
     ) %>%
       DT::formatStyle("n_diseases", fontWeight = "bold")
     
-  })
-  
-  output$tbl_bin_diseasesXXXX <- renderDT({
-    
-    bins <- current_bins_for_summary()
-    
-    if (is.null(bins) || !nrow(bins)) {
-      return(DT::datatable(
-        data.frame(Message = "No Summary yet. Run ALL clusters (➋) first."),
-        options = list(dom = "t"),
-        rownames = FALSE
-      ))
-    }
-    
-    # filtre per cluster (si n’hi ha)
-    cl_f <- as.character(input$bin_disease_cluster_filter %||% "")
-    if (nzchar(cl_f)) {
-      bins <- bins[as.character(bins$cluster_id) == cl_f, , drop = FALSE]
-    }
-    validate(need(nrow(bins) > 0, "No bins for the selected cluster filter."))
-    
-    # -----------------------------
-    # HTML cell builder
-    # - clickable element in the column
-    # - stores disease list URL-encoded (newline-separated)
-    # -----------------------------
-    mk_dis_html <- function(s, cluster_id) {
-      dd <- trimws(unlist(strsplit(as.character(s), ",")))
-      dd <- dd[nzchar(dd)]
-      if (!length(dd)) return("")
-      
-      cl2 <- htmltools::htmlEscape(as.character(cluster_id))
-      
-      diseases_raw <- paste(dd, collapse = "\n")
-      diseases_enc <- utils::URLencode(diseases_raw, reserved = TRUE)
-      
-      paste0(
-        "<span class='gi-openList diseaseOpen' ",
-        "data-cluster='", cl2, "' ",
-        "data-diseases-enc='", diseases_enc, "'>",
-        "View diseases (", length(dd), ")",
-        "</span>"
-      )
-    }
-    
-    show_df <- as.data.frame(bins, stringsAsFactors = FALSE)
-    
-    # HTML column
-    show_df$diseases_click <- mapply(
-      mk_dis_html,
-      show_df$diseases,
-      show_df$cluster_id,
-      SIMPLIFY = TRUE, USE.NAMES = FALSE
-    )
-    
-    # numeric formatting
-    show_df$best_padj <- suppressWarnings(as.numeric(show_df$best_padj))
-    show_df$best_log10FDR <- suppressWarnings(round(-log10(show_df$best_padj), 2))
-    
-    # keep structure; diseases column is HTML
-    show_df <- show_df %>%
-      dplyr::transmute(
-        cluster_id,
-        chr,
-        bin_start,
-        bin_end,
-        n_diseases,
-        best_disease,
-        best_log10FDR,
-        diseases = diseases_click
-      )
-    
-    DT::datatable(
-      show_df,
-      escape = FALSE,
-      rownames = FALSE,
-      selection = "none",
-      options = list(pageLength = 15, scrollX = TRUE),
-      callback = DT::JS("
-function giCloseDiseasePopup(){
-  $('#giDiseasePopup').remove();
-  $(document).off('mousedown.giDiseasePopup');
-  $(document).off('keydown.giDiseasePopup');
-}
-
-function giEscHtml(s){
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-table.off('click', 'span.diseaseOpen');
-table.on('click', 'span.diseaseOpen', function(e){
-  e.preventDefault(); e.stopPropagation();
-  giCloseDiseasePopup();
-
-  var disEnc = $(this).attr('data-diseases-enc') || '';
-  var cl = $(this).attr('data-cluster') || '';
-
-  // decode raw list (newline separated)
-  var disRaw = '';
-  try { disRaw = decodeURIComponent(disEnc); } catch(err){ disRaw = disEnc; }
-  var diseases = disRaw.split('\\n').map(function(x){ return x.trim(); }).filter(function(x){ return x.length > 0; });
-
-  var rect = this.getBoundingClientRect();
-  var left = rect.left + window.scrollX;
-  var top  = rect.bottom + window.scrollY + 6;
-
-  var html = \"<div id='giDiseasePopup'>\" +
-             \"<div class='gi-title'>Diseases in cluster \" + giEscHtml(cl) +
-             \"<span class='gi-close' id='giDiseasePopupClose'>✕</span></div>\";
-
-  if(diseases.length === 0){
-    html += \"<div style='color:#777;'>No diseases.</div>\";
-  } else {
-    for(var i=0;i<diseases.length;i++){
-      var ddRaw = diseases[i];                  // RAW
-      var ddLbl = giEscHtml(ddRaw);             // display
-      var ddEnc = encodeURIComponent(ddRaw);    // safe attribute
-      html += \"<div class='gi-item'>\" +
-              \"<span class='diseasePick' data-disease-enc='\" + ddEnc + \"' data-cluster='\" + giEscHtml(cl) + \"'>\" +
-              ddLbl +
-              \"</span></div>\";
-    }
-  }
-  html += \"</div>\";
-
-  $('body').append(html);
-
-  var $p = $('#giDiseasePopup');
-  $p.css({ left: left + 'px', top: top + 'px' });
-
-  $('#giDiseasePopupClose').on('click', function(){ giCloseDiseasePopup(); });
-
-  $(document).on('mousedown.giDiseasePopup', function(ev){
-    if($(ev.target).closest('#giDiseasePopup').length === 0){
-      giCloseDiseasePopup();
-    }
-  });
-
-  $(document).on('keydown.giDiseasePopup', function(ev){
-    if(ev.key === 'Escape'){ giCloseDiseasePopup(); }
-  });
-});
-
-$(document).off('click', '#giDiseasePopup .diseasePick');
-$(document).on('click', '#giDiseasePopup .diseasePick', function(e){
-  e.preventDefault(); e.stopPropagation();
-
-  var ddEnc = $(this).attr('data-disease-enc') || '';
-  var cl = $(this).attr('data-cluster') || '';
-
-  var ddRaw = '';
-  try { ddRaw = decodeURIComponent(ddEnc); } catch(err){ ddRaw = ddEnc; }
-
-  // close first, then notify Shiny (avoids redraw/DOM conflicts)
-  giCloseDiseasePopup();
-
-  setTimeout(function(){
-    Shiny.setInputValue('disease_pick', {disease: ddRaw, cluster_id: cl}, {priority: 'event'});
-  }, 0);
-});
-")
-    ) %>%
-      DT::formatStyle("n_diseases", fontWeight = "bold")
-    
-  })
-  
-  
+  }, server = FALSE)
   
   # -----------------------------
   # Ensure selected subset exists for frozen cluster
@@ -2478,26 +3236,6 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
     TRUE
   }
   
-  # read columns at ewasdis
-  read_subset_agnosticXXXXXXXXXXX <- function(path, sel_cols) {
-    stopifnot(file.exists(path))
-    # read only header to detect first column name
-    hdr <- data.table::fread(path, nrows = 0, check.names = FALSE)
-    idcol <- names(hdr)[1]
-    
-    cols_to_read <- unique(c(idcol, sel_cols))
-    
-    dt <- data.table::fread(
-      path,
-      select = cols_to_read,
-      na.strings = c("NA","<NA>","NaN",""),
-      check.names = FALSE
-    )
-    
-    # normalize first column to sample_id internally
-    if (idcol != "sample_id") data.table::setnames(dt, idcol, "sample_id")
-    dt
-  }
   # =========================
   # Helpers
   # =========================
@@ -2686,7 +3424,66 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
     
   }, ignoreInit = TRUE)
   
+  # =============================================================================
+  # helper Integrator
+  # =============================================================================
   
+  chr_map_integrator <- function(x) {
+    x <- toupper(trimws(as.character(x)))
+    x <- sub("^CHR", "", x)
+    x[x == "X"] <- "23"
+    x[x == "Y"] <- "24"
+    x[x %in% c("MT", "M", "MTDNA")] <- "26"
+    suppressWarnings(as.integer(x))
+  }
+  
+  norm_int <- function(x) {
+    suppressWarnings(as.integer(readr::parse_number(as.character(x))))
+  }
+  
+  sanitize_bridge <- function(df) {
+    if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+    
+    df[] <- lapply(df, function(x) {
+      if (is.factor(x)) as.character(x) else x
+    })
+    
+    if ("chr" %in% names(df))   df$chr   <- chr_map_integrator(df$chr)
+    if ("start" %in% names(df)) df$start <- norm_int(df$start)
+    if ("end" %in% names(df))   df$end   <- norm_int(df$end)
+    
+    if ("start" %in% names(df) && "end" %in% names(df)) {
+      s0 <- df$start
+      e0 <- df$end
+      df$start <- pmin(s0, e0, na.rm = FALSE)
+      df$end   <- pmax(s0, e0, na.rm = FALSE)
+    }
+    
+    df
+  }
+  
+  sanitize_bridge_genes <- function(df) {
+    if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
+    if (!"gene" %in% names(df)) return(df)
+    
+    df %>%
+      dplyr::mutate(
+        gene = as.character(gene),
+        gene = trimws(gene)
+      ) %>%
+      tidyr::separate_rows(gene, sep = "\\s*;\\s*|\\s+-\\s+") %>%
+      dplyr::mutate(
+        gene = trimws(gene)
+      ) %>%
+      dplyr::filter(
+        !is.na(gene),
+        nzchar(gene),
+        tolower(gene) != "numeric",
+        !grepl("^[0-9]+$", gene)
+      ) %>%
+      dplyr::distinct()
+  }
+  ##############################################
   
   # -----------------------------
   # CpG plots
@@ -3067,7 +3864,7 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
       ) %>%
       plotly::layout(
         yaxis = list(title = "Mean beta per sample (bin)")
-      )
+      ) 
     
     # -----------------------------
     # 7) CpG-level Δbeta within focused bin
@@ -3186,6 +3983,15 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
         xaxis2 = xax,
         yaxis  = list(title = "Mean beta per sample (bin)"),
         yaxis2 = list(title = "Δbeta (disease − control)")
+      ) %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "Violin_plot_of_selected_bim",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
       )
     
   })
@@ -3453,7 +4259,14 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
       plotly::config(
         displayModeBar = TRUE,
         displaylogo = FALSE,
-        modeBarButtonsToRemove = c("select2d","lasso2d","hoverCompareCartesian")
+        modeBarButtonsToRemove = c("select2d","lasso2d","hoverCompareCartesian"),
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "Combined_Manhattan_plot",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
       ) %>%
       plotly::layout(showlegend = FALSE)
     
@@ -4470,16 +5283,48 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
     col_hh_raw      <- which(names(show_df) == "hh_raw") - 1
     col_disease_raw <- which(names(show_df) == "disease_raw") - 1
     
+    js_columns_all <- DT::JS("function ( idx, data, node ) { return true; }")
+    
     DT::datatable(
       show_df,
       escape = FALSE,
       rownames = FALSE,
       selection = "none",
       options = list(
+        dom = "Bfrtip",
         pageLength = 15,
         scrollX = TRUE,
+        
+        # mantenim els raw ocults a la UI
         columnDefs = list(
           list(targets = c(col_probe_raw, col_hh_raw, col_disease_raw), visible = FALSE)
+        ),
+        
+        buttons = list(
+          list(
+            extend = "copy",
+            exportOptions = list(
+              modifier = list(page = "all"),
+              columns  = js_columns_all,
+              format   = list(body = js_export_body_bin_diseases)
+            )
+          ),
+          list(
+            extend = "csv",
+            exportOptions = list(
+              modifier = list(page = "all"),
+              columns  = js_columns_all,
+              format   = list(body = js_export_body_bin_diseases)
+            )
+          ),
+          list(
+            extend = "excel",
+            exportOptions = list(
+              modifier = list(page = "all"),
+              columns  = js_columns_all,
+              format   = list(body = js_export_body_bin_diseases)
+            )
+          )
         )
       ),
  callback = DT::JS(sprintf("
@@ -5557,24 +6402,19 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
     }
   )
   
+  #  ##############################################################################
+  #  ############################ LD Module   #####################################
+  #  ################# GWAS -> LD module canonical cluster input###################
+  
+  ld_module_server(
+    "ld",
+    app_tag = "ewasdis",
+    activate_r = reactive(TRUE)
+  )
   ##############################################################################
-  ############################ LD Module   #####################################
-  ################# EWAS -> LD module canonical cluster input###################
+  ##############################    RESET    ###################################
+  ##############################################################################
   
-  clusters_r <- reactive({
-    build_ld_clusters_from_ewas_app(rv)
-  })
-  
-  candidates_r <- reactive({
-    build_ld_candidates_from_ewas_app(rv)
-  })
-  
-  ld_module_server("ld", clusters_r = clusters_r, candidates_r = candidates_r)
-  
-  
-  # -----------------------------
-  # reset session
-  # -----------------------------
   observeEvent(input$reset_case, {
     # --- (A) Esborra fitxers temporals (subset) si existeixen ---
     if (!is.null(rv$ewas_sub_full) && nzchar(rv$ewas_sub_full) && file.exists(rv$ewas_sub_full)) {
@@ -5982,12 +6822,16 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
       extensions = "Buttons",
       options = list(
         dom = "Bfrtip",
-        buttons = c("copy","csv","excel","pdf","print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 20,
         scrollX = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   
   #-------------------------------------------------------------------------------
@@ -6214,12 +7058,16 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
       extensions = "Buttons",
       options    = list(
         dom        = "Bfrtip",
-        buttons    = c("copy","csv","excel","pdf","print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 10,
         scrollX    = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   output$go_bar <- plotly::renderPlotly({
     
@@ -6328,7 +7176,16 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
       ) +
       ggplot2::scale_fill_manual(values = c(BP = "darkgreen", CC = "orange", MF = "darkblue"), guide = "none")
     
-    plotly::ggplotly(p, tooltip = "text")
+    plotly::ggplotly(p, tooltip = "text") %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "GO_enrich_plot",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
+      )
   })
   
   
@@ -6479,12 +7336,16 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
       extensions = "Buttons",
       options    = list(
         dom        = "Bfrtip",
-        buttons    = c("copy","csv","excel","pdf","print"),
+        buttons = list(
+          list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+          list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+        ),
         pageLength = 15,
         scrollX    = TRUE
       )
     )
-  })
+  }, server = FALSE)
   
   output$kegg_bar <- plotly::renderPlotly({
     
@@ -6557,31 +7418,19 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
         plot.margin = grid::unit(c(28,10,35,10), "pt")
       )
     
-    plotly::ggplotly(p, tooltip = "text")
+    plotly::ggplotly(p, tooltip = "text") %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "Kegg_enrich_plot",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
+      )
   })
   
-  # ----------------------------
-  # GoSlim enrichment (FAST) — uses GO_SLIM_GENERIC + enricher()
-  # ----------------------------
-  goslim_t2g_cache <- reactiveVal(list())
-  
-  map_go_to_goslim_safe <- function(go_ids, ontology, slim_ids = NULL) {
-    validate(need(exists("map_go_to_goslim", inherits = TRUE),
-                  "map_go_to_goslim() not found. Source goslim_utils.R"))
-    f <- get("map_go_to_goslim", inherits = TRUE)
-    fnames <- names(formals(f))
-    args <- list(go_ids)
-    if ("ontology" %in% fnames) args$ontology <- ontology
-    if ("ont"      %in% fnames) args$ont      <- ontology
-    if (!is.null(slim_ids)) {
-      if ("goslim_ids" %in% fnames) args$goslim_ids <- slim_ids
-      if ("slim_ids"   %in% fnames) args$slim_ids   <- slim_ids
-      if ("slim"       %in% fnames) args$slim       <- slim_ids
-    }
-    do.call(f, args)
-  }
-  
-  
+ 
   # ------------------------------------------------------------
   # Resolve app root and R folder robustly
   # ------------------------------------------------------------
@@ -6618,6 +7467,150 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
     NA_character_
   }
   
+  
+  # ============================================================
+  # =============== GoSlim helpers =============================
+  # ============================================================
+  goslim_orgdb_cache <- reactiveVal(list())
+  
+  goslim_build_orgdb_sets_for_onto <- function(ontology = c("BP", "CC", "MF")) {
+    ontology <- match.arg(ontology)
+    
+    validate(need(requireNamespace("AnnotationDbi", quietly = TRUE), "AnnotationDbi package is required."))
+    validate(need(requireNamespace("org.Hs.eg.db", quietly = TRUE), "org.Hs.eg.db package is required."))
+    validate(need(requireNamespace("GO.db", quietly = TRUE), "GO.db package is required."))
+    validate(need(exists("GO_SLIM_GENERIC", inherits = TRUE), "GO_SLIM_GENERIC not loaded."))
+    
+    key <- paste0("orgdb_goslim_", ontology)
+    cache <- goslim_orgdb_cache()
+    if (!is.null(cache[[key]])) return(cache[[key]])
+    
+    slim_df <- GO_SLIM_GENERIC %>%
+      dplyr::filter(ONTOLOGY == ontology) %>%
+      dplyr::distinct(GOID, slim_term)
+    
+    slim_ids <- unique(as.character(slim_df$GOID))
+    slim_ids <- slim_ids[!is.na(slim_ids) & nzchar(slim_ids)]
+    validate(need(length(slim_ids) > 0, paste0("No GoSlim IDs loaded for ", ontology)))
+    
+    eg_keys <- tryCatch(
+      AnnotationDbi::keys(org.Hs.eg.db, keytype = "ENTREZID"),
+      error = function(e) NULL
+    )
+    eg_keys <- unique(as.character(eg_keys))
+    eg_keys <- eg_keys[!is.na(eg_keys) & nzchar(eg_keys)]
+    validate(need(length(eg_keys) > 0, "No ENTREZ keys found in org.Hs.eg.db"))
+    
+    org_map <- tryCatch({
+      AnnotationDbi::select(
+        org.Hs.eg.db,
+        keys    = eg_keys,
+        keytype = "ENTREZID",
+        columns = c("GO", "ONTOLOGY")
+      )
+    }, error = function(e) NULL)
+    
+    validate(need(is.data.frame(org_map) && nrow(org_map) > 0, "Could not retrieve GO mapping from org.Hs.eg.db"))
+    validate(need(all(c("ENTREZID", "GO", "ONTOLOGY") %in% names(org_map)),
+                  "OrgDb GO mapping did not return ENTREZID/GO/ONTOLOGY columns"))
+    
+    org_map <- org_map %>%
+      dplyr::transmute(
+        ENTREZID = as.character(ENTREZID),
+        GOID     = as.character(GO),
+        ONTOLOGY = as.character(ONTOLOGY)
+      ) %>%
+      dplyr::filter(!is.na(ENTREZID), nzchar(ENTREZID)) %>%
+      dplyr::filter(!is.na(GOID), nzchar(GOID)) %>%
+      dplyr::filter(ONTOLOGY == ontology) %>%
+      dplyr::distinct(ENTREZID, GOID)
+    
+    validate(need(nrow(org_map) > 0, paste0("No OrgDb GO mapping found for ontology ", ontology)))
+    
+    anc_obj <- switch(
+      ontology,
+      BP = GO.db::GOBPANCESTOR,
+      CC = GO.db::GOCCANCESTOR,
+      MF = GO.db::GOMFANCESTOR
+    )
+    
+    goids <- unique(org_map$GOID)
+    
+    go2slim <- lapply(goids, function(goid) {
+      anc <- tryCatch(anc_obj[[goid]], error = function(e) NULL)
+      anc <- unique(c(goid, as.character(anc %||% character(0))))
+      intersect(anc, slim_ids)
+    })
+    names(go2slim) <- goids
+    
+    go2slim_df <- tibble::tibble(
+      GOID = goids,
+      slim_goid = I(go2slim)
+    ) %>%
+      tidyr::unnest(cols = c(slim_goid)) %>%
+      dplyr::filter(!is.na(slim_goid), nzchar(slim_goid)) %>%
+      dplyr::left_join(
+        slim_df,
+        by = c("slim_goid" = "GOID")
+      ) %>%
+      dplyr::filter(!is.na(slim_term), nzchar(slim_term)) %>%
+      dplyr::distinct(GOID, slim_goid, slim_term)
+    
+    validate(need(nrow(go2slim_df) > 0, paste0("No GoSlim mapping produced for ", ontology)))
+    
+    term2gene <- org_map %>%
+      dplyr::inner_join(
+        go2slim_df,
+        by = "GOID",
+        relationship = "many-to-many"
+      ) %>%
+      dplyr::transmute(
+        term = as.character(slim_goid),
+        gene = as.character(ENTREZID)
+      ) %>%
+      dplyr::filter(!is.na(term), nzchar(term), !is.na(gene), nzchar(gene)) %>%
+      dplyr::distinct()
+    
+    validate(need(nrow(term2gene) > 0, paste0("TERM2GENE empty for ", ontology)))
+    
+    term2name <- go2slim_df %>%
+      dplyr::transmute(
+        term = as.character(slim_goid),
+        name = as.character(slim_term)
+      ) %>%
+      dplyr::filter(!is.na(term), nzchar(term), !is.na(name), nzchar(name)) %>%
+      dplyr::distinct()
+    
+    universe <- unique(term2gene$gene)
+    universe <- universe[!is.na(universe) & nzchar(universe)]
+    validate(need(length(universe) > 0, paste0("Universe empty for ", ontology)))
+    
+    out <- list(
+      term2gene = term2gene,
+      term2name = term2name,
+      universe  = universe
+    )
+    
+    cache[[key]] <- out
+    goslim_orgdb_cache(cache)
+    out
+  }
+  
+  goslim_orgdb_sets <- reactive({
+    withProgress(message = "Preparing GO slim reference…", value = 0, {
+      onts <- c("BP", "CC", "MF")
+      out <- vector("list", length(onts))
+      names(out) <- onts
+      
+      for (i in seq_along(onts)) {
+        ont <- onts[i]
+        incProgress(1 / length(onts), detail = paste("Reference:", ont))
+        out[[ont]] <- goslim_build_orgdb_sets_for_onto(ont)
+      }
+      
+      out
+    })
+  })
   # ============================================================
   # GoSlim load (FROM APP/R) — robust, no-crash
   # Files expected in: <app_root>/R/
@@ -6686,175 +7679,152 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
     
   })
   
-  exists("GO_SLIM_GENERIC", inherits = TRUE)
-  if (exists("GO_SLIM_GENERIC", inherits = TRUE)) nrow(GO_SLIM_GENERIC)
-  if (exists("GOSLIM_OBO_PATH_USED", inherits = TRUE)) GOSLIM_OBO_PATH_USED
-  
-  
-  goslim_term2gene_for_onto <- function(ont, universe_ids) {
-    ont <- match.arg(ont, c("BP","CC","MF"))
-    validate(need(exists("GO_SLIM_GENERIC", inherits = TRUE), "GO_SLIM_GENERIC not loaded."))
-    
-    u <- unique(as.character(universe_ids))
-    u <- u[!is.na(u) & nzchar(u)]
-    validate(need(length(u) > 0, "Universe is empty for GoSlim mapping."))
-    
-    slim_ids <- GO_SLIM_GENERIC |>
-      dplyr::filter(ONTOLOGY == ont) |>
-      dplyr::pull(GOID) |>
-      unique()
-    validate(need(length(slim_ids) > 0, paste0("No GoSlim IDs available for ", ont, ".")))
-    
-    key <- paste0("ont=", ont, "|n=", length(u), "|slim=", length(slim_ids))
-    cache <- goslim_t2g_cache()
-    if (!is.null(cache[[key]])) return(cache[[key]])
-    
-    ann <- suppressMessages(AnnotationDbi::select(
-      org.Hs.eg.db::org.Hs.eg.db,
-      keys    = u,
-      keytype = "ENTREZID",
-      columns = c("GO","ONTOLOGY")
-    )) |>
-      dplyr::filter(!is.na(GO), nzchar(GO), ONTOLOGY == ont) |>
-      dplyr::transmute(gene = as.character(ENTREZID), GOID = as.character(GO)) |>
-      dplyr::distinct(gene, GOID)
-    
-    validate(need(nrow(ann) > 0, paste0("No GO annotations found for ontology ", ont, ".")))
-    
-    go2slim <- map_go_to_goslim_safe(unique(ann$GOID), ontology = ont, slim_ids = slim_ids)
-    
-    go2slim_df <- purrr::imap_dfr(go2slim, function(v, k) {
-      v <- unique(as.character(v))
-      v <- v[!is.na(v) & nzchar(v)]
-      if (!length(v)) return(NULL)
-      tibble::tibble(GOID = as.character(k), slim_id = v)
-    }) |>
-      dplyr::distinct(GOID, slim_id)
-    
-    validate(need(nrow(go2slim_df) > 0, paste0("GO→GoSlim mapping produced 0 pairs for ", ont, ".")))
-    
-    term2gene <- ann |>
-      dplyr::inner_join(go2slim_df, by = "GOID", relationship = "many-to-many") |>
-      dplyr::transmute(term = slim_id, gene = gene) |>
-      dplyr::distinct(term, gene)
-    
-    cache[[key]] <- term2gene
-    goslim_t2g_cache(cache)
-    term2gene
-  }
-  
-  goslim_term2name_for_onto <- function(ont) {
-    ont <- match.arg(ont, c("BP","CC","MF"))
-    GO_SLIM_GENERIC |>
-      dplyr::filter(ONTOLOGY == ont) |>
-      dplyr::transmute(term = as.character(GOID), name = as.character(slim_term)) |>
-      dplyr::distinct(term, name)
-  }
-  
+
   goslim_enrich_raw <- eventReactive(goslim_trigger(), {
-    validate(need(exists("GO_SLIM_GENERIC", inherits = TRUE), "GO_SLIM_GENERIC not loaded."))
-    validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler required."))
+    validate(need(requireNamespace("clusterProfiler", quietly = TRUE), "clusterProfiler package is required."))
+    validate(need(requireNamespace("dplyr", quietly = TRUE), "dplyr package is required."))
+    validate(need(requireNamespace("org.Hs.eg.db", quietly = TRUE), "org.Hs.eg.db package is required."))
+    validate(need(requireNamespace("GO.db", quietly = TRUE), "GO.db package is required."))
     
     withProgress(message = "Running GO slim enrichment…", value = 0, {
       
-      gene <- as.character(entrez_scope_safe())
-      validate(need(length(gene) > 0,
-                    "No genes for GoSlim yet. Compute nearby genes first (EWAS bins → genes)."))
-      incProgress(0.15, detail = paste("Genes:", length(gene)))
+      gene <- entrez_scope_safe()
+      gene <- unique(as.character(gene))
+      gene <- gene[!is.na(gene) & nzchar(gene)]
+      validate(need(length(gene) > 0, "No valid genes for the selected scope."))
+      incProgress(0.20, detail = paste("Genes:", length(gene)))
       
-      uni <- universe_entrez()
-      if (!length(uni)) {
-        uni <- AnnotationDbi::keys(org.Hs.eg.db::org.Hs.eg.db, keytype = "ENTREZID")
-      }
-      validate(need(length(uni) > 0, "Universe is empty (after fallback)."))
-      incProgress(0.05, detail = paste("Universe:", length(uni)))
+      ontos <- input$go_ontos %||% c("BP", "CC", "MF")
+      ontos <- intersect(c("BP", "CC", "MF"), ontos)
+      validate(need(length(ontos) > 0, "Select at least one ontology (BP/CC/MF)."))
       
-      ontos <- input$go_ontos
-      if (is.null(ontos) || !length(ontos)) ontos <- c("BP","CC","MF")
-      ontos <- intersect(c("BP","CC","MF"), ontos)
-      validate(need(length(ontos) > 0, "Select at least one GO ontology (BP/CC/MF)."))
+      minGS_in <- input$enrich_min_gs %||% 10
+      maxGS    <- input$enrich_max_gs %||% 500
       
-      minGS <- input$enrich_min_gs %||% 10
-      maxGS <- input$enrich_max_gs %||% 500
+      gs_all <- goslim_orgdb_sets()
+      incProgress(0.10, detail = "Reference ready")
       
       res <- purrr::map_dfr(ontos, function(ont) {
-        incProgress(0.75/length(ontos), detail = paste("Ontology:", ont))
+        incProgress(0.60 / length(ontos), detail = paste("Ontology:", ont))
         
-        t2g <- goslim_term2gene_for_onto(ont, universe_ids = uni)
-        t2n <- goslim_term2name_for_onto(ont)
+        gs <- gs_all[[ont]]
+        universe <- unique(gs$universe)
+        gene_use <- intersect(unique(gene), universe)
         
-        eg <- suppressMessages(clusterProfiler::enricher(
-          gene          = gene,
-          universe      = uni,
-          TERM2GENE     = t2g,
-          TERM2NAME     = t2n,
-          pAdjustMethod = "BH",
-          pvalueCutoff  = 1,
-          qvalueCutoff  = 1,
-          minGSSize     = minGS,
-          maxGSSize     = maxGS
-        ))
+        message(
+          "[GoSlim][", ont, "] ",
+          "selected_genes=", length(gene),
+          " | universe=", length(universe),
+          " | gene_use=", length(gene_use),
+          " | term2gene_rows=", nrow(gs$term2gene),
+          " | n_terms=", dplyr::n_distinct(gs$term2gene$term)
+        )
+        
+        if (!length(gene_use)) return(NULL)
+        
+        minGS <- max(1L, min(as.integer(minGS_in), length(gene_use)))
+        
+        eg <- tryCatch({
+          suppressMessages(
+            clusterProfiler::enricher(
+              gene          = gene_use,
+              universe      = universe,
+              TERM2GENE     = gs$term2gene,
+              TERM2NAME     = gs$term2name,
+              pAdjustMethod = "BH",
+              pvalueCutoff  = 1,
+              qvalueCutoff  = 1,
+              minGSSize     = minGS,
+              maxGSSize     = maxGS
+            )
+          )
+        }, error = function(e) NULL)
         
         if (is.null(eg) || is.null(eg@result) || !nrow(eg@result)) return(NULL)
+        
         df <- as.data.frame(eg@result, stringsAsFactors = FALSE)
+        if (!nrow(df)) return(NULL)
         df$Ontology <- ont
         df
       })
       
-      if (!is.data.frame(res) || !nrow(res)) return(tibble::tibble())
+      if (is.null(res) || !nrow(res)) return(tibble::tibble())
       res
     })
   }, ignoreInit = TRUE)
   
-  goslim_top_df <- reactive({
+  
+  goslim_enrich_tbl <- reactive({
     df <- goslim_enrich_raw()
     if (!is.data.frame(df) || !nrow(df)) return(tibble::tibble())
     
     pcut <- input$enrich_pcut %||% 0.05
-    topn <- input$go_topn %||% 12
+    topn <- input$go_topn %||% 10
     
-    df0 <- df |>
-      dplyr::mutate(p.adjust = suppressWarnings(as.numeric(p.adjust))) |>
-      dplyr::filter(is.finite(p.adjust)) |>
-      dplyr::arrange(p.adjust)
+    df2 <- df %>%
+      dplyr::mutate(
+        Ontology = as.character(Ontology),
+        pvalue   = suppressWarnings(as.numeric(pvalue)),
+        p.adjust = suppressWarnings(as.numeric(p.adjust))
+      ) %>%
+      dplyr::filter(is.finite(p.adjust), is.finite(pvalue)) %>%
+      dplyr::filter(p.adjust <= pcut) %>%
+      dplyr::group_by(Ontology) %>%
+      dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+      dplyr::slice_head(n = topn) %>%
+      dplyr::ungroup()
     
-    sig <- df0 |> dplyr::filter(p.adjust <= pcut)
-    if (nrow(sig)) {
-      sig |> dplyr::group_by(Ontology) |> dplyr::slice_head(n = topn) |> dplyr::ungroup()
-    } else {
-      df0 |> dplyr::group_by(Ontology) |> dplyr::slice_head(n = topn) |> dplyr::ungroup()
+    if (!nrow(df2)) {
+      df2 <- df %>%
+        dplyr::mutate(
+          Ontology = as.character(Ontology),
+          pvalue   = suppressWarnings(as.numeric(pvalue)),
+          p.adjust = suppressWarnings(as.numeric(p.adjust))
+        ) %>%
+        dplyr::filter(is.finite(p.adjust), is.finite(pvalue)) %>%
+        dplyr::group_by(Ontology) %>%
+        dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+        dplyr::slice_head(n = topn) %>%
+        dplyr::ungroup()
     }
+    
+    df2
   })
   
   output$goslim_table <- DT::renderDT({
-    df <- goslim_top_df()
+    df <- goslim_enrich_tbl()
+    
     if (!is.data.frame(df) || !nrow(df)) {
       return(DT::datatable(
-        data.frame(Message="No GoSlim terms to display (or run enrichment first)."),
-        options=list(dom="t"), rownames=FALSE
+        data.frame(Message = "No GO slim terms passed the cutoff."),
+        options = list(dom = "t"),
+        rownames = FALSE
       ))
     }
     
-    out <- df |>
-      dplyr::transmute(
-        Ontology,
-        GoSlim_term = Description,
-        Count,
-        pvalue   = fmt_p(pvalue),
-        p.adjust = fmt_p(p.adjust)
+    out <- df %>%
+      dplyr::select(Ontology, ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+      dplyr::mutate(
+        pvalue   = sprintf("%.3g", as.numeric(pvalue)),
+        p.adjust = sprintf("%.3g", as.numeric(p.adjust))
       )
     
     DT::datatable(
-      out, rownames = FALSE,
+      out,
+      rownames = FALSE,
       extensions = "Buttons",
       options = list(
-        dom="Bfrtip",
-        buttons=c("copy","csv","excel","pdf","print"),
-        pageLength=12,
-        scrollX=TRUE
+        dom = "Bfrtip",
+        pageLength = 10,
+        scrollX = TRUE,
+        buttons = list(
+          list(extend = "copy",  exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE)),
+          list(extend = "csv",   exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE)),
+          list(extend = "excel", exportOptions = list(modifier = list(page = "all"), stripHtml = TRUE))
+        )
       )
     )
-  })
+  }, server = FALSE)
   
   # ------------------------------------------------------------
   # Scope label (used in GO/KEGG/GoSlim titles)
@@ -6871,62 +7841,61 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
   
   output$goslim_bar <- plotly::renderPlotly({
     
-    dat0 <- goslim_top_df()
+    dat <- goslim_enrich_tbl()
+    validate(need(is.data.frame(dat) && nrow(dat) > 0, "GoSlim: no enrichment data to plot yet. Run enrichment first."))
     
-    if (!is.data.frame(dat0) || !nrow(dat0)) {
-      return(plotly::plot_ly() %>% plotly::layout(title = "Run GoSlim enrichment to see barplot."))
-    }
-    
-    # --- Build Catalog-like input: slim_term + n_genes + Ontology ---
-    dat <- dat0 %>%
-      dplyr::transmute(
-        Ontology  = as.character(Ontology),
-        slim_term = as.character(Description),
-        n_genes   = suppressWarnings(as.integer(Count)),
-        p.adjust  = suppressWarnings(as.numeric(p.adjust))
-      ) %>%
-      dplyr::filter(!is.na(n_genes), n_genes > 0, !is.na(Ontology), nzchar(Ontology), nzchar(slim_term))
-    
-    validate(need(nrow(dat) > 0, "GO slim: no data to plot yet."))
-    
-    top_n <- input$go_class_top %||% 15
+    top_n <- input$go_topn %||% 15
     gap   <- 2
     
-    # Helper: shorten/wrap terms
-    if (!exists("shorten_term", mode = "function")) {
-      shorten_term <- function(x, max = 55) {
+    validate(need(all(c("Description","Count","Ontology","p.adjust","pvalue","GeneRatio","BgRatio") %in% names(dat)),
+                  "goslim_enrich_tbl() must return: Description, Count, Ontology, p.adjust, pvalue, GeneRatio, BgRatio"))
+    
+    if (!exists("shorten_go_label", mode = "function")) {
+      shorten_go_label <- function(x, max = 55) {
         x <- as.character(x)
         x <- stringr::str_squish(x)
-        x <- stringr::str_to_sentence(x)
         ifelse(nchar(x) > max, paste0(substr(x, 1, max - 1), "…"), x)
       }
     }
     
     dat <- dat %>%
       dplyr::mutate(
-        term_short = stringr::str_wrap(shorten_term(slim_term, 55), width = 28)
-      )
+        Ontology   = as.character(Ontology),
+        slim_term  = as.character(Description),
+        n_genes    = suppressWarnings(as.integer(Count)),
+        p.adjust   = suppressWarnings(as.numeric(p.adjust)),
+        pvalue     = suppressWarnings(as.numeric(pvalue)),
+        term_short = stringr::str_wrap(shorten_go_label(slim_term, 55), width = 28)
+      ) %>%
+      dplyr::filter(Ontology %in% c("BP","CC","MF")) %>%
+      dplyr::filter(is.finite(p.adjust), !is.na(n_genes), nzchar(slim_term))
+    
+    validate(need(nrow(dat) > 0, "GoSlim: no BP/CC/MF terms to plot."))
     
     ont_order <- c("BP","CC","MF")
     present   <- intersect(ont_order, unique(dat$Ontology))
-    validate(need(length(present) > 0, "No BP/CC/MF data to plot."))
+    validate(need(length(present) > 0, "GoSlim: no BP/CC/MF data to plot."))
     
     dat <- dat %>%
       dplyr::filter(Ontology %in% present) %>%
       dplyr::mutate(Ontology = factor(Ontology, levels = ont_order))
     
-    # Top-N per ontology
     dat <- dat %>%
       dplyr::group_by(Ontology) %>%
-      dplyr::slice_max(order_by = n_genes, n = top_n, with_ties = FALSE) %>%
-      dplyr::arrange(Ontology, dplyr::desc(n_genes)) %>%
+      dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+      dplyr::slice_head(n = top_n) %>%
       dplyr::mutate(rank = dplyr::row_number()) %>%
       dplyr::ungroup()
     
     n_bp <- if ("BP" %in% present) max(dat$rank[dat$Ontology == "BP"], 0) else 0
     n_cc <- if ("CC" %in% present) max(dat$rank[dat$Ontology == "CC"], 0) else 0
     
-    offsets <- c(BP = 0, CC = n_bp + gap, MF = n_bp + gap + n_cc + gap)
+    offsets <- c(
+      BP = 0,
+      CC = n_bp + gap,
+      MF = n_bp + gap + n_cc + gap
+    )
+    
     dat$x <- dat$rank + offsets[as.character(dat$Ontology)]
     
     vlines <- c()
@@ -6935,46 +7904,82 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
     
     centers <- dat %>%
       dplyr::group_by(Ontology) %>%
-      dplyr::summarise(xmin = min(x), xmax = max(x), xmid = (xmin + xmax)/2, .groups = "drop")
+      dplyr::summarise(
+        xmin = min(x), xmax = max(x),
+        xmid = (xmin + xmax) / 2,
+        .groups = "drop"
+      )
     
     ymax  <- max(dat$n_genes, na.rm = TRUE)
     ylab  <- -0.12 * ymax
     y_top <- ymax * 1.08
     
-    sel_label <- scope_label()  # ja la tens definida
+    ttl <- "GO slim enrichment by gene counts"
     
     dat$tooltip <- paste0(
       "<b>", dat$Ontology, "</b>",
-      "<br><b>GO slim:</b> ", htmltools::htmlEscape(dat$slim_term),
-      "<br><b>Genes:</b> ", dat$n_genes,
-      "<br><b>p.adj:</b> ", fmt_p(dat$p.adjust)
+      "<br><b>GO slim term:</b> ", htmltools::htmlEscape(dat$slim_term),
+      "<br><b>Count:</b> ", dat$n_genes,
+      "<br><b>GeneRatio:</b> ", dat$GeneRatio,
+      "<br><b>BgRatio:</b> ", dat$BgRatio,
+      "<br><b>p:</b> ", sprintf("%.3g", dat$pvalue),
+      "<br><b>FDR:</b> ", sprintf("%.3g", dat$p.adjust)
     )
     
-    p <- ggplot2::ggplot(dat, ggplot2::aes(x = x, y = n_genes, fill = Ontology, text = tooltip)) +
+    p <- ggplot2::ggplot(
+      dat,
+      ggplot2::aes(
+        x = x, y = n_genes,
+        fill = Ontology,
+        text = tooltip
+      )
+    ) +
       ggplot2::geom_col(width = 0.85, color = "black", linewidth = 0.25) +
       { if (length(vlines)) ggplot2::geom_vline(xintercept = vlines, linewidth = 0.4) } +
-      ggplot2::scale_x_continuous(breaks = dat$x, labels = dat$term_short, expand = c(0,0)) +
+      ggplot2::scale_x_continuous(
+        breaks = dat$x,
+        labels = dat$term_short,
+        expand = c(0, 0)
+      ) +
       ggplot2::coord_cartesian(ylim = c(ylab, ymax * 1.20), clip = "off") +
-      { if ("BP" %in% present) ggplot2::annotate("text", x = centers$xmid[centers$Ontology=="BP"], y = y_top,
-                                                 label = "Biological Process", fontface = "bold", size = 3.6) } +
-      { if ("CC" %in% present) ggplot2::annotate("text", x = centers$xmid[centers$Ontology=="CC"], y = y_top,
-                                                 label = "Cellular Component", fontface = "bold", size = 3.6) } +
-      { if ("MF" %in% present) ggplot2::annotate("text", x = centers$xmid[centers$Ontology=="MF"], y = y_top,
-                                                 label = "Molecular Function", fontface = "bold", size = 3.6) } +
+      { if ("BP" %in% present)
+        ggplot2::annotate("text", x = centers$xmid[centers$Ontology == "BP"], y = y_top,
+                          label = "Biological Process", fontface = "bold", size = 3.6) } +
+      { if ("CC" %in% present)
+        ggplot2::annotate("text", x = centers$xmid[centers$Ontology == "CC"], y = y_top,
+                          label = "Cellular Component", fontface = "bold", size = 3.6) } +
+      { if ("MF" %in% present)
+        ggplot2::annotate("text", x = centers$xmid[centers$Ontology == "MF"], y = y_top,
+                          label = "Molecular Function", fontface = "bold", size = 3.6) } +
       ggplot2::labs(
-        x = NULL, y = "Number of genes",
-        title = paste0("Gene Function Classification (GO slim generic) — ", sel_label)
+        x = NULL,
+        y = "Enriched genes per GO slim term",
+        title = ttl
       ) +
       ggplot2::theme_minimal(base_size = 10) +
       ggplot2::theme(
         plot.title   = ggplot2::element_text(size = 11, face = "bold"),
+        axis.title.y = ggplot2::element_text(size = 9),
         axis.text.x  = ggplot2::element_text(angle = 90, size = 7, vjust = 0.5, hjust = 1),
+        axis.text.y  = ggplot2::element_text(size = 8),
         legend.position = "none",
-        plot.margin  = grid::unit(c(28,10,35,10), "pt")
+        plot.margin = grid::unit(c(28, 10, 35, 10), "pt")
       ) +
-      ggplot2::scale_fill_manual(values = c(BP = "darkgreen", CC = "orange", MF = "darkblue"), guide = "none")
+      ggplot2::scale_fill_manual(
+        values = c(BP = "darkgreen", CC = "orange", MF = "darkblue"),
+        guide = "none"
+      )
     
-    plotly::ggplotly(p, tooltip = "text")
+    plotly::ggplotly(p, tooltip = "text") %>%
+      plotly::config(
+        toImageButtonOptions = list(
+          format = "png",
+          filename = "GOSlim_enrich_plot",
+          width = 1400,
+          height = 900,
+          scale = 2
+        )
+      )
   })
   
   output$enrich_bg_note <- renderUI({
@@ -7041,9 +8046,9 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
       msg <- paste0(
         "<b>Disease/Trait enrichment</b><br>",
         target_lbl, "<br>",
-        "<b>Foreground:</b> EWAS significant bins/regions for the selected target (and cluster if applicable).<br>",
-        "<b>Background (universe):</b> all tested bins/regions available in the EWAS dataset for the selected target.<br>",
-        "<b>Test unit:</b> EWAS bins/regions (not unique genes).<br>",
+        "<b>Foreground:</b> Disease/Traits in EWAS significant bins/regions for the selected target (and cluster if applicable).<br>",
+        "<b>Background (universe):</b> Disease/Traits in all tested bins/regions available in the EWAS dataset for the selected target.<br>",
+        "<b>Test unit:</b> EWAS bins/regions (not unique Disease/Traits).<br>",
         "<b>Method:</b> over-representation test within the Disease/Trait module (see module settings/results)."
       )
       
@@ -7083,16 +8088,14 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
         "<b>GoSlim enrichment</b><br>",
         target_lbl, "<br>",
         sc_txt, fg_cnt_txt, "<br>",
-        if (identical(bg, "dataset")) {
-          paste0("<b>Background (universe):</b> dataset-mapped genes",
-                 if (is.finite(n_uni_dataset)) paste0(" (N=", as.integer(n_uni_dataset), ").") else ".",
-                 " (recommended in cluster mode).")
+        if (is.finite(n_uni_orgdb)) {
+          paste0("<b>Background (universe):</b> OrgDb-based GoSlim universe (N≈", as.integer(n_uni_orgdb), ").")
         } else {
-          "<b>Background (universe):</b> default OrgDb-based universe unless a dataset universe is provided.<br>GoSlim categories come from GO→GoSlim mapping (<i>goslim_generic</i>; TERM2GENE)."
+          "<b>Background (universe):</b> OrgDb-based GoSlim universe."
         },
         "<br><b>Test unit:</b> genes (ENTREZID).<br>",
         gs_txt, "<br>",
-        "<b>Method:</b> clusterProfiler::enricher with GoSlim TERM2GENE.",
+        "<b>Method:</b> clusterProfiler::enricher with OrgDb-derived GoSlim TERM2GENE/TERM2NAME (BH-adjusted).",
         tip_goslim
       )
     } else {
@@ -7104,7 +8107,77 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
       msg, "</div>"
     ))
   })
-  #-------------------------------------------------------------------------------  
+  ##≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠
+  ################ INTEGRATOR 
+  ##≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠
+  
+  integrator_dir <- file.path(gi_shared_root, "integrator_exports")
+  dir.create(integrator_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  bridge_gene_ewasdis <- reactive({
+    df <- ewasdis_gene_table()
+    validate(need(is.data.frame(df) && nrow(df) > 0, "No EWAS disease gene evidence available."))
+    
+    gene_col <- pick_col(df, c("gene", "symbol", "UCSC_RefGene_Name"))
+    chr_col  <- pick_col(df, c("chr", "CHR"))
+    st_col   <- pick_col(df, c("start", "pos", "MAPINFO", "BP"))
+    en_col   <- pick_col(df, c("end", "pos", "MAPINFO", "BP"))
+    cid_col  <- pick_col(df, c("cluster_id"))
+    
+    out <- df %>%
+      dplyr::transmute(
+        gene = .data[[gene_col]],
+        cluster_id = if (!is.null(cid_col)) .data[[cid_col]] else NA_character_,
+        chr = if (!is.null(chr_col)) .data[[chr_col]] else NA,
+        start = if (!is.null(st_col)) .data[[st_col]] else NA,
+        end = if (!is.null(en_col)) .data[[en_col]] else .data[[st_col]]
+      )
+    
+    as_gene_bridge(out, source_app = "ewasdis", evidence_type = "ewas_gene")
+  })
+  
+  bridge_term_ewasdis <- reactive({
+    df <- ewasdis_trait_table()
+    validate(need(is.data.frame(df) && nrow(df) > 0, "No EWAS disease term evidence available."))
+    
+    disease_col <- pick_col(df, c("disease", "trait", "phenotype"))
+    chr_col     <- pick_col(df, c("chr", "CHR"))
+    st_col      <- pick_col(df, c("start", "pos", "MAPINFO", "BP"))
+    en_col      <- pick_col(df, c("end", "pos", "MAPINFO", "BP"))
+    cid_col     <- pick_col(df, c("cluster_id"))
+    
+    out <- df %>%
+      dplyr::transmute(
+        disease = .data[[disease_col]],
+        cluster_id = if (!is.null(cid_col)) .data[[cid_col]] else NA_character_,
+        chr = if (!is.null(chr_col)) .data[[chr_col]] else NA,
+        start = if (!is.null(st_col)) .data[[st_col]] else NA,
+        end = if (!is.null(en_col)) .data[[en_col]] else .data[[st_col]]
+      )
+    
+    as_term_bridge(out, term_col = "disease", source_app = "ewasdis", evidence_type = "ewas_disease")
+  })
+  
+  integrator_export_ewasdis <- reactive({
+    list(
+      gene_bridge = bridge_gene_ewasdis(),
+      term_bridge = bridge_term_ewasdis()
+    )
+  })
+  
+  observe({
+    ge <- tryCatch(bridge_gene_ewasdis(), error = function(e) NULL)
+    te <- tryCatch(bridge_term_ewasdis(), error = function(e) NULL)
+    
+    if (is.data.frame(ge)) {
+      saveRDS(ge, file.path(integrator_dir, "ewasdis_gene_bridge.rds"))
+    }
+    if (is.data.frame(te)) {
+      saveRDS(te, file.path(integrator_dir, "ewasdis_term_bridge.rds"))
+    }
+  })
+  
+  ##≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠≠
   
 }
 

@@ -12,10 +12,10 @@ All tools follow a shared **canonical, cluster-centric workflow**: starting from
 ## Architecture overview
 
 <p align="center">
-  <img src="docs/gi_tools_ideogram_readme.png" width="90%">
+  <img src="docs/gi_tools_ideogram_readme.png" width="70%">
 </p>
 
-> **One genomic cluster — multiple biological layers**
+> **One genomic cluster — multiple biological layers — one integrative view**
 
 GItools is built around the concept of **canonical genomic clusters**.  
 A cluster is defined once (chromosome, start, end) and propagated across specialized inspector applications, enabling consistent and reproducible interpretation of the same genomic signal across multiple biological contexts.
@@ -48,30 +48,34 @@ Across all GItools applications, the workflow is intentionally consistent.
   - `chr`
   - `start_bp`
   - `end_bp`
-  - summary metrics (counts, scores)
 
 ### 5. Assign evidence per cluster
-Intersect and map items falling inside each cluster:
+Each inspector contributes a **layer of biological evidence**:
 - GWAS Catalog associations
-- GTEx eQTLs and tissues
-- EWAS CpGs or bins
-- NonSyn variants and functional annotations
-- LD structure and haplotype blocks
+- GTEx eQTLs
+- EWAS signals
+- NonSyn functional variants
 
-### 6. Visualization and export
+### 6. Integrate and prioritize (Integrator Inspector)
+All evidence layers are combined into a unified prioritization framework:
+- Cluster-level prioritization
+- Block-level (LD-aware) context
+- Gene-level scoring based on multi-source support
+
+### 7. Visualization and export
 - Interactive plots (Plotly) and tables (DT)
 - Structured exports (CSV / TSV / RDS / ZIP)
-- Filenames encode **mode + threshold + timestamp**
 
 > **Design principle**  
-> Changing a threshold does *not* silently create or modify clusters.  
-> Interval building and clustering are explicit steps, preserving traceability and reproducibility.
+> Clusters are built once and reused across all inspectors and the Integrator.  
+> No hidden recomputation — full traceability and reproducibility.
 
 ---
 
 ## Included tools
 
 ### GItools Hub
+<<<<<<< HEAD
 The Hub is the entry point to orchestrate and synchronize all inspectors.
 
 **Features**
@@ -84,30 +88,53 @@ The Hub is the entry point to orchestrate and synchronize all inspectors.
 ### Catalog Inspector
 Connects GWAS hits with evidence from the GWAS Catalog.
 
+=======
+The Hub orchestrates the full workflow.
+
+**Recommended usage flow**
+1. Build clusters in **Catalog Inspector**
+2. Enrich clusters with additional evidence using other inspectors
+3. Perform final prioritization in **Integrator Inspector**
+
+**Features**
+- Launch and monitor inspectors
+- Deep links between apps
+- Shared canonical cluster state
+
+---
+
+### Catalog Inspector
+Defines the **canonical clusters** from GWAS hits.
+
+>>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 **Pipeline**  
 threshold → intervals → clusters → map GWAS Catalog entries
 
 **Outputs**
-- Cluster summary (`n_catalog`)
-- Detailed Catalog tables (traits, rsIDs, studies)
-- Structured exports
+- Cluster definitions (canonical)
+- GWAS evidence per cluster
+- Exportable cluster master tables
 
 ---
 
 ### GTEx eQTL Inspector
+<<<<<<< HEAD
 Links GWAS hits to GTEx eQTLs for tissue-aware functional interpretation.
 
 **Pipeline**  
 threshold → intervals → clusters → map eQTLs per cluster
+=======
+Adds **functional (expression-based) evidence**.
+>>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 **Outputs**
-- Cluster summary (`n_gtex`)
-- eQTL / gene tables (tissue, gene, variant, statistics)
-- Aggregated and per-cluster exports
+- eQTL–gene associations per cluster
+- Tissue-aware interpretation
 
 ---
 
 ### EWAS Tumor Inspector
+<<<<<<< HEAD
 Tumor vs control (or adjacent normal) methylation analysis.
 
 **Pipeline**  
@@ -117,10 +144,14 @@ group definition → statistical testing → FDR → regional exploration
 - Genome-wide and regional summaries
 - Tables and plots by chromosome, window, or cluster
 - Validation-ready exports
+=======
+Epigenetic alterations in tumor contexts.
+>>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 ---
 
 ### EWAS Disease Inspector
+<<<<<<< HEAD
 Disease-focused EWAS exploration using the same region-centric logic.
 
 **Pipeline**  
@@ -129,10 +160,14 @@ filter by disease → threshold → map hits to regions/windows
 **Outputs**
 - Disease-specific tables and plots
 - Reproducible exports
+=======
+Disease-associated epigenetic signals.
+>>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 ---
 
 ### NonSyn Inspector
+<<<<<<< HEAD
 Prioritization of nonsynonymous and functionally relevant variants.
 
 **Pipeline**  
@@ -152,11 +187,51 @@ Exploration of linkage disequilibrium and haplotype structure aligned to cluster
 - LD matrices and blocks
 - Regional LD visualization aligned to clusters
 - Cluster-aware regional LD context for follow-up interpretation
+=======
+Functional prioritization of variants.
+
+---
+
+### ⭐ Integrator Inspector
+**Central component of GItools**
+
+The Integrator combines all evidence layers into a unified framework.
+
+**Key roles**
+- Aggregate evidence from all inspectors
+- Compute **GWAS-hit priority scores**
+- Derive:
+  - prioritized clusters
+  - prioritized genes
+  - prioritized LD blocks
+- Provide full **audit and traceability**
+
+**LD functionality**
+- LD is computed internally using PLINK
+- Available as:
+  - Global LD (all clusters)
+  - Cluster-specific LD
+- Used directly in prioritization (no standalone LD inspector)
+
+---
+
+## LD resources
+
+LD calculations are performed locally using **PLINK** with a configurable reference panel (e.g., 1000 Genomes + HGDP-style merged dataset).
+
+LD is:
+- Integrated into the **Integrator Inspector**
+- Available at both global and cluster levels
+- Used to:
+  - define LD blocks
+  - connect variants, genes, and evidence sources
+>>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 ---
 
 ## Enrichment (GO / KEGG / GO Slim)
 
+<<<<<<< HEAD
 GItools includes enrichment modules to summarize biological meaning from genes mapped to hits, intervals, or clusters.  
 Depending on the inspector and the selected scope, enrichment can be computed on:
 
@@ -177,22 +252,46 @@ Typical outputs:
 > Notes  
 > - If no terms pass the selected FDR cutoff, inspectors may show a **fallback view** (e.g., top terms ranked by FDR/p-value) to avoid empty plots/tables.  
 > - Enrichment depends on the organism/background configured in the inspector resources.
+=======
+Enrichment can be computed on:
+- Per-cluster gene sets
+- Union of clusters
+
+Supported:
+- GO (BP / CC / MF)
+- KEGG
+- GO Slim
+
+Outputs:
+- Ranked tables
+- Interactive plots
+- Exportable results
+>>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 ---
 
 ## Shared UI / UX patterns
 
+<<<<<<< HEAD
 - **Interactive tables (DT)**: filtering, selection, cross-highlighting  
 - **Interactive plots (Plotly)**: Manhattan-style views, regional zoom, cluster tracks  
 - **Cross-app continuity**: the same cluster coordinates drive multiple inspectors  
 - **Traceability**: on-screen logs for loading and heavy operations  
 - **Performance-aware**: per-chromosome resources, caching/preloading, configurable paths  
 - **Export-first mindset**: consistent file naming and ZIP bundles for sharing results  
+=======
+- Interactive tables (DT)
+- Plotly visualizations
+- Cross-app cluster continuity
+- Full export support (complete datasets)
+- Performance-aware design
+>>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 ---
 
-## Repository layout (typical)
+## Repository layout
 
+<<<<<<< HEAD
 config.R
 app/
  GItools_Hub/
@@ -203,15 +302,39 @@ app/
  EWAS_disease/
  LD_Inspector/
  _logs/
+=======
+
+config.R
+app/
+GItools_Hub/
+Catalog_inspector/
+GTEX_inspector/
+NonSyn_Inspector/
+EWAS_cancer/
+EWAS_disease/
+Integrator_Inspector/
+_logs/
+>>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 docs/
 scripts/
 example_files/
 
 
-(Exact structure may vary across inspectors.)
+---
+
+## Requirements
+
+- **R ≥ 4.2**
+- Recommended: **RStudio**
+
+Optional tools:
+- `lsof`
+- `curl`
+- `ngrok`
 
 ---
 
+<<<<<<< HEAD
 ## Requirements
 
 - **R ≥ 4.2**
@@ -437,3 +560,18 @@ app/_logs/start_all_console.log
 If something fails to start, the first file to open is:
 
 app/_logs/gitools_<PORT>.err.log
+=======
+## Quick start
+
+```bash
+Rscript --vanilla scripts/start_ALL_local.R
+
+Ports:
+
+Hub: 7101
+Inspectors: 7201+
+
+Stop:
+
+Rscript --vanilla scripts/STOP_ALL_local.R
+>>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)

@@ -1,9 +1,7 @@
 # Inspector_resources (local data, not in GitHub)
 
-The content of this folder is **NOT included in the GitHub repository**.  
+This folder is **NOT included in the GitHub repository**.  
 It is a local “resources” directory that each user must populate in order to run some GItools modules (LD, NonSyn, EWAS, etc.).
-
-You can downoad a compresed file containing all **Inspector_resources** folder at https://www.dropbox.com/scl/fi/mkmpc0x5vauopir9d32e1/Inspector_resources.tar.zst?rlkey=4j527yyn5vo3hvx9j322wwu6n&st=5ku1gr2f&dl=0
 
 GItools will look here by default:
 `<GItools_root>/Inspector_resources/`
@@ -41,11 +39,11 @@ Inspector_resources/
 
   EWAS_cancer/
     ewas_detail_tum_genome.rds
-    slim_tc_by_chr/      # large per-chromosome files
+    slim_tc_by_chr/      # large per-chromosome files (not in GitHub)
 
   EWAS_disease/
     ewas_detail_dis_genome.rds
-    slim_disease_by_chr/ # large per-chromosome files
+    slim_disease_by_chr/ # large per-chromosome files (not in GitHub)
 ```
 
 

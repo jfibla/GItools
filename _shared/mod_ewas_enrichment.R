@@ -577,12 +577,16 @@ mod_ewas_enrich_server <- function(id,
         extensions = "Buttons",
         options    = list(
           dom        = "Bfrtip",
-          buttons    = c("copy", "csv", "excel", "pdf", "print"),
+          buttons = list(
+            list( extend = "copy", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+            list( extend = "csv", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE)),
+            list( extend = "excel", exportOptions = list(modifier = list(page = "all"),stripHtml = TRUE))
+          ),
           pageLength = 15,
           scrollX    = TRUE
         )
       )
-    })
+    }, server = FALSE)
     
     output$plot <- renderPlotly({
       x <- cur_tbl()

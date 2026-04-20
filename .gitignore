@@ -38,5 +38,5 @@ app/_logs/
 **/_logs/
 *_runtime.log
 *.log
-.Rhistory
 .RData
+.Rproj.user

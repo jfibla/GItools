@@ -25,6 +25,7 @@ get_script_path <- function() {
   args <- commandArgs(trailingOnly = FALSE)
   file_arg <- grep("^--file=", args, value = TRUE)
   if (length(file_arg)) return(normalizePath(sub("^--file=", "", file_arg[1]), winslash="/", mustWork = TRUE))
+  # fallback: current working dir (less robust)
   NA_character_
 }
 
@@ -35,23 +36,20 @@ SCRIPT_DIR  <- if (is.na(SCRIPT_PATH)) normalizePath(getwd(), winslash="/", must
 # Auto-detect GItools repo root
 # -----------------------------
 detect_repo_root <- function(seed_dir) {
-  seed_dir <- normalizePath(seed_dir, winslash = "/", mustWork = FALSE)
+  # 1) Prefer GItools next to this script (ngroc layout)
+  local1 <- file.path(seed_dir, "GItools")
+  local2 <- file.path(dirname(seed_dir), "GItools")
+  local3 <- file.path(dirname(dirname(seed_dir)), "GItools")
   
-  # Walk up (seed -> parents) and test for repo signature
-  up <- seed_dir
-  cand <- character(0)
-  for (i in 0:6) {
-    if (nzchar(up)) cand <- c(cand, up)
-    parent <- dirname(up)
-    if (identical(parent, up)) break
-    up <- parent
-  }
+  cand <- unique(c(
+    local1, local2, local3,
+    # 2) Fallback to env var only AFTER local candidates
+    Sys.getenv("GITOOLS_REPO", unset = "")
+  ))
   
-  # Also accept explicit env var (highest priority if set)
-  env <- Sys.getenv("GITOOLS_REPO", unset = "")
-  if (nzchar(env)) cand <- c(normalizePath(env, winslash="/", mustWork=FALSE), cand)
+  cand <- cand[nzchar(cand)]
+  cand <- normalizePath(cand, winslash = "/", mustWork = FALSE)
   
-  cand <- unique(cand)
   ok <- vapply(cand, function(p) {
     file.exists(file.path(p, "config.R")) &&
       dir.exists(file.path(p, "app", "GItools_Hub"))
@@ -61,15 +59,16 @@ detect_repo_root <- function(seed_dir) {
   cand[which(ok)[1]]
 }
 
+
 REPO_ROOT <- detect_repo_root(SCRIPT_DIR)
 if (is.na(REPO_ROOT)) {
   stop(paste0(
     "Could not detect GItools repo root.\n",
     "Expected: <repo>/config.R and <repo>/app/GItools_Hub\n",
-    "Tip: set env var GITOOLS_REPO=/path/to/GItools\n",
-    "Current seed: ", SCRIPT_DIR
+    "Tip: set env var GITOOLS_REPO=/path/to/GItools"
   ))
 }
+
 
 APPS_DIR <- normalizePath(file.path(REPO_ROOT, "app"), winslash="/", mustWork=TRUE)
 HUB_DIR  <- normalizePath(file.path(APPS_DIR, "GItools_Hub"), winslash="/", mustWork=TRUE)
@@ -110,7 +109,11 @@ hub_log <- function(...) {
 # Console tee -> file (portable)
 # -----------------------------
 START_LOG <- file.path(LOG_DIR, "start_all_console.log")
+dir.create(LOG_DIR, showWarnings = FALSE, recursive = TRUE)
+
 zz_out <- file(START_LOG, open = "at")
+
+# split=TRUE només és segur per type="output"
 sink(zz_out, type="output", split=TRUE)
 
 on.exit({
@@ -118,11 +121,14 @@ on.exit({
   try(close(zz_out), silent = TRUE)
 }, add = TRUE)
 
+# helper: escriu a consola (via message/cat) i al fitxer
 logi <- function(...) {
   txt <- paste0(..., collapse = "")
-  cat(txt, "\n")
+  cat(txt, "\n")  # va a consola + (perquè output està sankeat) també al fitxer
 }
 logi("[start] console tee -> ", START_LOG)
+
+
 
 # -----------------------------
 # Rscript binary
@@ -132,7 +138,7 @@ if (!file.exists(RSCRIPT)) RSCRIPT <- Sys.which("Rscript")
 if (!nzchar(RSCRIPT) || !file.exists(RSCRIPT)) stop("Rscript not found.")
 
 # -----------------------------
-# Ports (match Hub)
+# Ports: match Hub code
 # -----------------------------
 HUB_PORT      <- 7101L
 APP_PORT_BASE <- 7200L
@@ -143,11 +149,12 @@ apps <- list(
   nonsyn  = list(dir=file.path(APPS_DIR, "NonSyn_Inspector"),  port=APP_PORT_BASE + 3L),
   ewastum = list(dir=file.path(APPS_DIR, "EWAS_cancer"),       port=APP_PORT_BASE + 4L),
   ewasdis = list(dir=file.path(APPS_DIR, "EWAS_disease"),      port=APP_PORT_BASE + 5L),
-  ld      = list(dir=file.path(APPS_DIR, "LD_Inspector"),      port=APP_PORT_BASE + 6L),
+  integrator      = list(dir=file.path(APPS_DIR, "Integrator_inspector"),      port=APP_PORT_BASE + 6L),
   hub     = list(dir=HUB_DIR,                                 port=HUB_PORT)
 )
 
-start_order <- c("catalog","gtex","nonsyn","ewasdis","ewastum","ld","hub")
+# Recommendation: start apps first, hub last
+start_order <- c("catalog","gtex","nonsyn","ewasdis","ewastum","integrator","hub")
 
 # -----------------------------
 # Port / HTTP helpers
@@ -164,7 +171,13 @@ is_port_listening <- function(port) is.finite(find_listen_pid(port))
 
 http_status_fast <- function(url) {
   if (!has_cmd("curl")) return(NA_integer_)
-  args <- c("-s","-o","/dev/null","-w","%{http_code}","--connect-timeout","0.25","--max-time","0.8", url)
+  args <- c(
+    "-s", "-o", "/dev/null",
+    "-w", "%{http_code}",
+    "--connect-timeout", "0.25",
+    "--max-time", "0.8",
+    url
+  )
   out <- suppressWarnings(tryCatch(system2("curl", args, stdout = TRUE, stderr = TRUE),
                                    error = function(e) ""))
   code <- suppressWarnings(as.integer(out[1] %||% ""))
@@ -194,12 +207,13 @@ wait_for_http <- function(url, timeout_sec = 60) {
 }
 
 # -----------------------------
-# Runner-based background start
+# Runner-based background start (aligned with Hub start_app_bg)
 # -----------------------------
 start_app_bg <- function(key, app_dir, port, log_dir = LOG_DIR, extra_env = list()) {
   stopifnot(dir.exists(app_dir))
   port <- as.integer(port)
   
+  if (is.null(log_dir) || !nzchar(log_dir)) log_dir <- LOG_DIR
   dir.create(log_dir, showWarnings = FALSE, recursive = TRUE)
   
   out_log <- file.path(log_dir, sprintf("gitools_%d.out.log", port))
@@ -215,8 +229,7 @@ start_app_bg <- function(key, app_dir, port, log_dir = LOG_DIR, extra_env = list
   env_lines <- c(
     sprintf('Sys.setenv(GITOOLS_LOG_DIR = "%s")', log_dir_s),
     sprintf('Sys.setenv(SHINY_PORT = "%d")', port),
-    'Sys.setenv(SHINY_HOST = "127.0.0.1")',
-    sprintf('Sys.setenv(GITOOLS_REPO = "%s")', gsub('"', '\\"', normalizePath(REPO_ROOT, winslash="/", mustWork=TRUE)))
+    'Sys.setenv(SHINY_HOST = "127.0.0.1")'
   )
   
   if (length(extra_env)) {
@@ -248,6 +261,8 @@ start_app_bg <- function(key, app_dir, port, log_dir = LOG_DIR, extra_env = list
   list(pid = pid, out_log = out_log, err_log = err_log, runner = runner)
 }
 
+
+
 # -----------------------------
 # Optional NGROK
 # -----------------------------
@@ -262,8 +277,10 @@ start_ngrok_tunnels <- function(ports, log_dir = LOG_DIR) {
   ngrok_log <- file.path(log_dir, "ngrok.log")
   if (!file.exists(ngrok_log)) file.create(ngrok_log)
   
+  # Try to stop any existing ngrok (best-effort)
   if (has_cmd("pkill")) suppressWarnings(system2("pkill", c("-f", "ngrok http"), stdout=NULL, stderr=NULL))
   
+  # Start each tunnel as separate process (simple + robust)
   urls <- list()
   for (p in ports) {
     p <- as.integer(p)
@@ -276,17 +293,23 @@ start_ngrok_tunnels <- function(ports, log_dir = LOG_DIR) {
     Sys.sleep(0.25)
   }
   
+  # Query local ngrok API (if available) to collect public URLs
+  # (ngrok agent exposes http://127.0.0.1:4040/api/tunnels)
   if (!has_cmd("curl")) return(list(ok = TRUE, urls = list()))
+  
   api <- "http://127.0.0.1:4040/api/tunnels"
   j <- suppressWarnings(tryCatch(system2("curl", c("-s", api), stdout=TRUE, stderr=TRUE), error=function(e) ""))
   txt <- paste(j, collapse = "")
   if (!nzchar(txt)) return(list(ok = TRUE, urls = list()))
   
+  # Parse JSON without jsonlite dependency (lightweight heuristics)
+  # Extract pairs: "addr":"http://localhost:PORT" and "public_url":"https://...."
   addr  <- regmatches(txt, gregexpr('"addr":"[^"]+"', txt))[[1]]
   pub   <- regmatches(txt, gregexpr('"public_url":"[^"]+"', txt))[[1]]
   addr  <- sub('^"addr":"', "", sub('"$', "", addr))
   pub   <- sub('^"public_url":"', "", sub('"$', "", pub))
   
+  # Build map port -> public_url (best-effort)
   for (i in seq_along(addr)) {
     a <- addr[i]
     prt <- suppressWarnings(as.integer(sub(".*:(\\d+)$", "\\1", a)))
@@ -297,6 +320,7 @@ start_ngrok_tunnels <- function(ports, log_dir = LOG_DIR) {
 }
 
 write_ngrok_urls_file <- function(urls_by_port, file) {
+  # Minimal JSON writer (no deps)
   ports <- names(urls_by_port)
   kv <- vapply(ports, function(p) {
     sprintf('  "%s": "%s"', p, gsub('"', '\\"', urls_by_port[[p]]))
@@ -310,9 +334,8 @@ write_ngrok_urls_file <- function(urls_by_port, file) {
 # Start sequence
 # -----------------------------
 message("=== GItools start (portable) ===")
-message("REPO_ROOT: ", REPO_ROOT)
-message("LOG_DIR  : ", LOG_DIR)
-message("Ports    : hub=", HUB_PORT, " | apps=", APP_PORT_BASE+1L, "..", APP_PORT_BASE+6L)
+message("LOG_DIR: ", LOG_DIR)
+message("Ports: hub=", HUB_PORT, " | apps=", APP_PORT_BASE+1L, "..", APP_PORT_BASE+6L)
 message("")
 
 ngrok_urls_file <- file.path(LOG_DIR, "ngrok_urls.json")
@@ -329,6 +352,7 @@ if (isTRUE(use_ngrok)) {
       GITOOLS_URL_MODE = "ngrok",
       GITOOLS_NGROK_URLS_FILE = ngrok_urls_file
     )
+    # Print quick mapping
     message("[ngrok] public URLs (by port):")
     for (p in names(ng$urls)) message("  ", p, " -> ", ng$urls[[p]])
   } else {
@@ -388,6 +412,7 @@ for (nm in start_order) {
                     err_log = logs$err_log)
 }
 
+# --- Summary table ---
 to_df <- function(res) {
   do.call(rbind, lapply(res, function(x) {
     data.frame(
@@ -407,6 +432,7 @@ df <- to_df(res)
 message("\n=== SUMMARY ===")
 print(df, row.names = FALSE)
 
+# Open hub in browser if available
 hub_url <- sprintf("http://127.0.0.1:%d/", apps$hub$port)
 cat_url <- sprintf("http://127.0.0.1:%d/", apps$catalog$port)
 
@@ -422,4 +448,5 @@ if (is.finite(hub_pid)) {
 
 if (isTRUE(use_ngrok)) {
   message("\n[ngrok] If your Hub supports ngrok URLs, it can read: ", ngrok_urls_file)
+  message("[ngrok] Otherwise, Hub links will still point to 127.0.0.1:* and won't work remotely.")
 }

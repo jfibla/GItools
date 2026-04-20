@@ -46,13 +46,13 @@ message("[hub] APPS_DIR contents: ", paste(list.files(APPS_DIR), collapse=", "))
 APP_PORT_BASE <- 7200 
 
 apps <- list(
-  hub     = list(name="🧭 GItools Hub",       dir=HUB_DIR,                           port=7101),
-  catalog = list(name="📚 Catalog Inspector", dir=file.path(APPS_DIR, "Catalog_inspector"), port=APP_PORT_BASE + 1),
-  gtex    = list(name="🧠 GTEx Inspector",    dir=file.path(APPS_DIR, "GTEX_inspector"),    port=APP_PORT_BASE + 2),
-  nonsyn  = list(name="🧬 NonSyn Inspector",  dir=file.path(APPS_DIR, "NonSyn_Inspector"),  port=APP_PORT_BASE + 3),
-  ewastum = list(name="🧪 EWAStum Inspector", dir=file.path(APPS_DIR, "EWAS_cancer"),       port=APP_PORT_BASE + 4),
-  ewasdis = list(name="🧫 EWASDis Inspector", dir=file.path(APPS_DIR, "EWAS_disease"),      port=APP_PORT_BASE + 5),
-  ld      = list(name="🔗 LD Inspector",      dir=file.path(APPS_DIR, "LD_Inspector"),      port=APP_PORT_BASE + 6)
+  hub        = list(name="🧭 GItools Hub",            dir=HUB_DIR,                                  port=7101),
+  catalog    = list(name="📚 Catalog Inspector",      dir=file.path(APPS_DIR, "Catalog_inspector"), port=APP_PORT_BASE + 1),
+  gtex       = list(name="🧠 GTEx Inspector",         dir=file.path(APPS_DIR, "GTEX_inspector"),    port=APP_PORT_BASE + 2),
+  nonsyn     = list(name="🧬 NonSyn Inspector",       dir=file.path(APPS_DIR, "NonSyn_Inspector"),  port=APP_PORT_BASE + 3),
+  ewastum    = list(name="🧪 EWAStum Inspector",      dir=file.path(APPS_DIR, "EWAS_cancer"),       port=APP_PORT_BASE + 4),
+  ewasdis    = list(name="🧫 EWASDis Inspector",      dir=file.path(APPS_DIR, "EWAS_disease"),      port=APP_PORT_BASE + 5),
+  integrator = list(name="🧩 Integrator Inspector",   dir=file.path(APPS_DIR, "Integrator_Inspector"), port=APP_PORT_BASE + 6)
 )
 
 
@@ -379,12 +379,12 @@ server <- function(input, output, session) {
     s <- sid()
     
     list(
-      catalog = paste0(base_url_for_port(apps$catalog$port), "/?sid=", s),
-      gtex    = paste0(base_url_for_port(apps$gtex$port),    "/?sid=", s),
-      nonsyn  = paste0(base_url_for_port(apps$nonsyn$port),  "/?sid=", s),
-      ewastum = paste0(base_url_for_port(apps$ewastum$port), "/?sid=", s),
-      ewasdis = paste0(base_url_for_port(apps$ewasdis$port), "/?sid=", s),
-      ld      = paste0(base_url_for_port(apps$ld$port),      "/?sid=", s)
+      catalog    = paste0(base_url_for_port(apps$catalog$port),    "/?sid=", s),
+      gtex       = paste0(base_url_for_port(apps$gtex$port),       "/?sid=", s),
+      nonsyn     = paste0(base_url_for_port(apps$nonsyn$port),     "/?sid=", s),
+      ewastum    = paste0(base_url_for_port(apps$ewastum$port),    "/?sid=", s),
+      ewasdis    = paste0(base_url_for_port(apps$ewasdis$port),    "/?sid=", s),
+      integrator = paste0(base_url_for_port(apps$integrator$port), "/?sid=", s)
     )
   })
   
@@ -416,16 +416,15 @@ server <- function(input, output, session) {
   output$open_buttons_ui <- renderUI({
     u <- urls_ui()
     
-    # mark ready, but DO NOT hide banner here
     if (!isTRUE(buttons_ready())) buttons_ready(TRUE)
     
     tagList(
-      tags$a("📚 Catalog (MASTER)", href=u$catalog, target="_blank", class="btn btn-primary", style=btn_style),
-      tags$a("🧠 GTEx (SLAVE)",     href=u$gtex,    target="_blank", class="btn btn-success", style=btn_style),
-      tags$a("🧬 NonSyn (SLAVE)",   href=u$nonsyn,  target="_blank", class="btn btn-success", style=btn_style),
-      tags$a("🧪 EWASDis (SLAVE)",  href=u$ewasdis, target="_blank", class="btn btn-success", style=btn_style),
-      tags$a("🧫 EWAStum (SLAVE)",  href=u$ewastum, target="_blank", class="btn btn-success", style=btn_style),
-      tags$a("🔗 LD",              href=u$ld,      target="_blank", class="btn btn-warning", style=btn_style)
+      tags$a("📚 Catalog (MASTER)",        href=u$catalog,    target="_blank", class="btn btn-primary", style=btn_style),
+      tags$a("🧠 GTEx (SLAVE)",            href=u$gtex,       target="_blank", class="btn btn-success", style=btn_style),
+      tags$a("🧬 NonSyn (SLAVE)",          href=u$nonsyn,     target="_blank", class="btn btn-success", style=btn_style),
+      tags$a("🧫 EWASDis (SLAVE)",         href=u$ewasdis,    target="_blank", class="btn btn-success", style=btn_style),
+      tags$a("🧪 EWAStum (SLAVE)",         href=u$ewastum,    target="_blank", class="btn btn-success", style=btn_style),
+      tags$a("🧩 Integrator",    href=u$integrator, target="_blank", class="btn btn-warning", style=btn_style)
     )
   })
   
@@ -557,9 +556,9 @@ server <- function(input, output, session) {
     insertUI(selector="body", where="beforeEnd", ui=HTML(open_many_js(c(u$gtex, u$nonsyn))), immediate=TRUE)
   }, ignoreInit = TRUE)
   
-  observeEvent(input$open_catalog_ld, {
+  observeEvent(input$open_catalog_integrator, {
     u <- urls_ui()
-    insertUI(selector="body", where="beforeEnd", ui=HTML(open_many_js(c(u$catalog, u$ld))), immediate=TRUE)
+    insertUI(selector="body", where="beforeEnd", ui=HTML(open_many_js(c(u$catalog, u$integrator))), immediate=TRUE)
   }, ignoreInit = TRUE)
   
   observeEvent(input$open_ewas_both, {
@@ -714,7 +713,7 @@ server <- function(input, output, session) {
   
   # =============================================================================
   # Hub info modal (input$info_00) — GItools Quick Guide (EN)
-  # Includes: per-app LD module + standalone LD Inspector using candidates.zip
+  # 
   # =============================================================================
   
   observeEvent(input$info_00, {
@@ -722,48 +721,85 @@ server <- function(input, output, session) {
     info_ui <- tags$div(
       style = "max-height:70vh; overflow-y:auto; padding-right:8px; line-height:1.35;",
       
-      tags$h3("GItools Hub — Quick Guide", style="margin-top:0;"),
+      tags$h3("GItools Hub — Quick Guide", style = "margin-top:0;"),
       
       tags$p(
         tags$b("Goal:"),
-        "Build clusters once in ", tags$b("Catalog Inspector"),
-        " (master) and reuse them across the other GItools apps (slaves)."
+        " Build clusters once in ", tags$b("Catalog Inspector"),
+        " (master) and reuse them across the other GItools apps. ",
+        tags$b("Integrator Inspector"),
+        " acts as the cross-app integration layer, including LD evidence, once the complementary inspectors have generated their exports."
       ),
       
       tags$div(
         style = "text-align:center; margin:10px 0 14px 0;",
         tags$img(
-          src = "gi_tools_ideogram.png",   # fitxer dins www/
-          style = "max-width:100%; width:900px; height:auto; border:1px solid #e5e5e5; border-radius:10px;"
+          src = "gi_tools_ideogram.png",
+          style = "max-width:100%; width:700px; height:auto; border:1px solid #e5e5e5; border-radius:10px;"
         )
       ),
       tags$hr(),
-      
       
       tags$h4("1) Start with Catalog Inspector (Master)"),
       tags$ol(
         tags$li("Open ", tags$b("Catalog Inspector"), " from the Hub."),
         tags$li(tags$b("Load Catalog/GWAS data"), " (your selected dataset)."),
-        tags$li("Explore hits (Manhattan plot / tables)."),
-        tags$li("Set parameters (thresholds, method, etc.)."),
+        tags$li("Explore hits using the Manhattan plot and summary tables."),
+        tags$li("Adjust thresholds or clustering parameters as needed."),
         tags$li("Click ", tags$b("Build clusters"), "."),
-        tags$li("Confirm clusters appear in the cluster table and plots.")
+        tags$li("Confirm that clusters appear in the cluster table and plots.")
       ),
-      tags$p(tags$i(
-        "Once clusters are built, the rest of the apps can import the same cluster IDs and genomic intervals."
-      )),
+      tags$p(
+        tags$i(
+          "Once clusters are built, the rest of the apps can inspect the same canonical cluster IDs and genomic intervals."
+        )
+      ),
       
       tags$hr(),
       
-      tags$h4("2) Open the other apps (Slaves)"),
+      tags$h4("2) Open the complementary inspectors"),
       tags$ul(
         tags$li(
-          "When you open another app from the Hub, it loads its own reference dataset and ",
-          tags$b("imports the clusters built in Catalog Inspector"), "."
+          "After building clusters in ", tags$b("Catalog Inspector"),
+          ", open the other inspectors from the Hub."
         ),
         tags$li(
-          "You usually do not need to rebuild clusters in each app — the idea is that all apps inspect ",
-          tags$b("the same regions"), "."
+          "Each inspector loads its own reference dataset and ",
+          tags$b("reuses the same canonical cluster framework"), "."
+        ),
+        tags$li(
+          "The goal is to inspect ", tags$b("the same loci across complementary biological evidence layers"),
+          " rather than rebuilding each analysis independently."
+        ),
+        tags$li(
+          "These inspectors generate the harmonized evidence exports that will later be consolidated by ",
+          tags$b("Integrator Inspector"), "."
+        )
+      ),
+      
+      tags$hr(),
+      
+      tags$h4("3) Integrate with Integrator Inspector"),
+      tags$ul(
+        tags$li(
+          "Once the complementary inspectors have been opened and their evidence has been generated, open ",
+          tags$b("Integrator Inspector"), "."
+        ),
+        tags$li(
+          tags$b("Integrator Inspector"),
+          " is the central cross-app layer that consolidates evidence from the other inspectors."
+        ),
+        tags$li(
+          "It reads the harmonized exports generated across apps and combines them into shared summaries for the ",
+          tags$b("same canonical clusters"), "."
+        ),
+        tags$li(
+          "This includes integrated interpretation of ",
+          tags$b("Catalog, GTEx, NonSyn, EWAS, and LD evidence"),
+          "."
+        ),
+        tags$li(
+          "Use it to review shared genes, shared traits/diseases, consensus loci, prioritized candidates, and LD support in one place."
         )
       ),
       
@@ -776,27 +812,27 @@ server <- function(input, output, session) {
         tags$ul(
           tags$li("Explore GWAS/Catalog associations."),
           tags$li("Create canonical clusters shared across GItools."),
-          tags$li("Export clusters/candidates for downstream steps.")
+          tags$li("Define the genomic backbone for downstream inspection.")
         ),
         
         tags$h5("• GTEx Inspector"),
         tags$ul(
           tags$li("Inspect GTEx eQTL signals within the same clusters."),
           tags$li("Compare tissue-specific regulatory evidence."),
-          tags$li("Prioritize candidate genes based on eQTL support.")
+          tags$li("Highlight genes with expression-based support.")
         ),
         
-        tags$h5("• NonSyn Inspector (dbNSFP)"),
+        tags$h5("• NonSyn Inspector"),
         tags$ul(
-          tags$li("Annotate clusters with coding / non-synonymous variants."),
+          tags$li("Annotate clusters with coding and non-synonymous variants."),
           tags$li("Review functional impact predictions and gene context."),
-          tags$li("Generate candidate variant lists per cluster.")
+          tags$li("Generate candidate gene/variant evidence for integration.")
         ),
         
         tags$h5("• EWAS Disease Inspector"),
         tags$ul(
           tags$li("Evaluate disease vs control methylation patterns per cluster."),
-          tags$li("Build EWAS hits per cluster and disease."),
+          tags$li("Summarize EWAS hits by disease and genomic region."),
           tags$li(
             tags$b("Click actions:"),
             " disease → CpG violins for that disease; ",
@@ -808,44 +844,36 @@ server <- function(input, output, session) {
         tags$h5("• EWAS Tumor Inspector"),
         tags$ul(
           tags$li("Evaluate tumor vs normal methylation patterns per cluster."),
-          tags$li("Build EWAS hits per cluster and cancer."),
-          tags$li("Same click-to-plot workflow as Disease, using cancer labels.")
+          tags$li("Summarize EWAS hits by cancer and genomic region."),
+          tags$li("Use the same cluster framework to compare cancer-related methylation evidence.")
+        ),
+        
+        tags$h5("• Integrator Inspector"),
+        tags$ul(
+          tags$li("Collect harmonized evidence exported by the other apps."),
+          tags$li("Combine gene-level and trait/disease-level bridge tables across inspectors."),
+          tags$li("Provide a unified view of shared genes, shared traits, consensus loci, and prioritized candidates."),
+          tags$li("Include ", tags$b("LD evidence"), " as one component of the broader integration workflow.")
         )
       ),
       
       tags$hr(),
       
-      tags$h4("LD (Linkage Disequilibrium) options"),
-      
-      tags$h5("A) Built-in LD module inside each app"),
+      tags$h4("Integrator Inspector and LD evidence"),
       tags$ul(
         tags$li(
-          "Each GItools app includes an embedded ", tags$b("LD module"),
-          " to visualize LD structure within a selected cluster region (e.g., r² or D')."
+          tags$b("Integrator Inspector"),
+          " is the central destination for combined interpretation."
         ),
         tags$li(
-          "Typical flow: select a ", tags$b("cluster"), " → choose a ", tags$b("population"),
-          " and reference genotype panel (PLINK) → run LD → view LD triangle and (optionally) LD blocks."
+          "Instead of using a standalone LD destination, LD is now handled inside ",
+          tags$b("Integrator Inspector"), " as the ", tags$b("LD evidence"), " section."
         ),
         tags$li(
-          "Use it to refine candidate regions, identify LD blocks, and interpret whether multiple hits may reflect the same signal."
-        )
-      ),
-      
-      tags$h5("B) Standalone LD Inspector (candidates.zip)"),
-      tags$ul(
-        tags$li(
-          "There is also an ", tags$b("independent LD Inspector"),
-          " that runs outside the individual apps."
+          "This makes it possible to interpret LD support together with Catalog, GTEx, NonSyn, and EWAS evidence."
         ),
         tags$li(
-          "From any app, download the ", tags$b("candidates.zip"),
-          " export (clusters + candidate hits) and load it into the LD Inspector."
-        ),
-        tags$li(
-          "This standalone tool can visualize LD structure within the selected cluster region ",
-          tags$b("for all candidate hits together"),
-          " (useful for cross-app candidate consolidation)."
+          "Each inspector exports harmonized bridge tables to a shared location, and Integrator Inspector reads those exports to build the integrated summaries."
         )
       ),
       
@@ -853,11 +881,12 @@ server <- function(input, output, session) {
       
       tags$h4("Recommended fast workflow"),
       tags$ol(
-        tags$li(tags$b("Hub → Catalog Inspector:"), " load data → build clusters."),
-        tags$li(tags$b("Hub → open any other app:"), " it loads its dataset + imports clusters."),
+        tags$li(tags$b("Hub → Catalog Inspector:"), " load data and build clusters."),
+        tags$li(tags$b("Hub → open the other inspectors:"), " review complementary evidence for the same canonical regions."),
         tags$li(
-          "Inspect each cluster across evidence layers: GWAS → eQTL → coding impact → EWAS → ",
-          tags$b("LD (built-in or standalone)"), "."
+          tags$b("Hub → Integrator Inspector:"),
+          " consolidate all available evidence, including ", tags$b("LD evidence"),
+          ", shared genes, shared traits/diseases, consensus loci, and prioritized candidates."
         )
       ),
       
@@ -867,16 +896,19 @@ server <- function(input, output, session) {
       tags$ul(
         tags$li(
           tags$b("Clusters are the common language."),
-          " If a slave app looks empty, confirm you built clusters in Catalog and the slave app has loaded them."
+          " If an inspector looks empty, first confirm that clusters were built in Catalog Inspector."
         ),
         tags$li(
-          "If you rebuild clusters in Catalog, reload the other apps so they use the updated cluster set."
+          "If you rebuild clusters in Catalog, reload the other apps so they work with the updated cluster set."
         ),
         tags$li(
-          "Cluster IDs (cluster_id) should remain canonical/consistent across all apps."
+          "Cluster IDs (cluster_id) should remain canonical and consistent across all apps."
         ),
         tags$li(
-          "For LD: if results are empty, verify PLINK paths, chromosome naming, population selection, and that the region contains enough variants."
+          "Integrator summaries depend on the bridge export files written by each app. If integrated tables are empty, check that the corresponding bridge files are being generated correctly."
+        ),
+        tags$li(
+          "For LD evidence, if results are empty, verify PLINK paths, chromosome naming, population selection, and that the region contains enough variants."
         )
       )
     )
@@ -890,6 +922,7 @@ server <- function(input, output, session) {
     ))
     
   }, ignoreInit = TRUE)
+  
   
   output$dl_example_zip <- downloadHandler(
     filename = function() {
