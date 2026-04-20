@@ -254,7 +254,6 @@ Outputs:
 - Ranked tables
 - Interactive plots
 - Exportable results
->>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 ---
 
@@ -271,7 +270,6 @@ Outputs:
 - Cross-app cluster continuity
 - Full export support (complete datasets)
 - Performance-aware design
->>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 ---
 
