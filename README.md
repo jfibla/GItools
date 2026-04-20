@@ -75,7 +75,6 @@ All evidence layers are combined into a unified prioritization framework:
 ## Included tools
 
 ### GItools Hub
-<<<<<<< HEAD
 The Hub is the entry point to orchestrate and synchronize all inspectors.
 
 **Features**
@@ -117,7 +116,6 @@ threshold → intervals → clusters → map GWAS Catalog entries
 ---
 
 ### GTEx eQTL Inspector
-<<<<<<< HEAD
 Links GWAS hits to GTEx eQTLs for tissue-aware functional interpretation.
 
 **Pipeline**  
@@ -132,7 +130,6 @@ Adds **functional (expression-based) evidence**.
 ---
 
 ### EWAS Tumor Inspector
-<<<<<<< HEAD
 Tumor vs control (or adjacent normal) methylation analysis.
 
 **Pipeline**  
@@ -148,7 +145,6 @@ Epigenetic alterations in tumor contexts.
 ---
 
 ### EWAS Disease Inspector
-<<<<<<< HEAD
 Disease-focused EWAS exploration using the same region-centric logic.
 
 **Pipeline**  
@@ -163,7 +159,6 @@ Disease-associated epigenetic signals.
 ---
 
 ### NonSyn Inspector
-<<<<<<< HEAD
 Prioritization of nonsynonymous and functionally relevant variants.
 
 **Pipeline**  
@@ -225,8 +220,6 @@ LD is:
 ---
 
 ## Enrichment (GO / KEGG / GO Slim)
-
-<<<<<<< HEAD
 GItools includes enrichment modules to summarize biological meaning from genes mapped to hits, intervals, or clusters.  
 Depending on the inspector and the selected scope, enrichment can be computed on:
 
@@ -266,8 +259,6 @@ Outputs:
 ---
 
 ## Shared UI / UX patterns
-
-<<<<<<< HEAD
 - **Interactive tables (DT)**: filtering, selection, cross-highlighting  
 - **Interactive plots (Plotly)**: Manhattan-style views, regional zoom, cluster tracks  
 - **Cross-app continuity**: the same cluster coordinates drive multiple inspectors  
@@ -285,8 +276,6 @@ Outputs:
 ---
 
 ## Repository layout
-
-<<<<<<< HEAD
 config.R
 app/
  GItools_Hub/
@@ -328,7 +317,6 @@ Optional tools:
 
 ---
 
-<<<<<<< HEAD
 ## Requirements
 
 - **R ≥ 4.2**
