@@ -106,7 +106,6 @@ The Hub orchestrates the full workflow.
 ### Catalog Inspector
 Defines the **canonical clusters** from GWAS hits.
 
->>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 **Pipeline**  
 threshold → intervals → clusters → map GWAS Catalog entries
 
@@ -125,7 +124,6 @@ Links GWAS hits to GTEx eQTLs for tissue-aware functional interpretation.
 threshold → intervals → clusters → map eQTLs per cluster
 =======
 Adds **functional (expression-based) evidence**.
->>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 **Outputs**
 - eQTL–gene associations per cluster
@@ -146,7 +144,6 @@ group definition → statistical testing → FDR → regional exploration
 - Validation-ready exports
 =======
 Epigenetic alterations in tumor contexts.
->>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 ---
 
@@ -162,7 +159,6 @@ filter by disease → threshold → map hits to regions/windows
 - Reproducible exports
 =======
 Disease-associated epigenetic signals.
->>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 ---
 
@@ -225,7 +221,6 @@ LD is:
 - Used to:
   - define LD blocks
   - connect variants, genes, and evidence sources
->>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 
 ---
 
@@ -314,7 +309,6 @@ EWAS_cancer/
 EWAS_disease/
 Integrator_Inspector/
 _logs/
->>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
 docs/
 scripts/
 example_files/
@@ -574,4 +568,3 @@ Inspectors: 7201+
 Stop:
 
 Rscript --vanilla scripts/STOP_ALL_local.R
->>>>>>> 45f9bfd (Replace standalone LD Inspector with Integrator Inspector workflow)
