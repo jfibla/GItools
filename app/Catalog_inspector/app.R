@@ -1287,8 +1287,20 @@ server <- function(input, output, session) {
   # Step 1: GWAS reader
   # ---------------------------------------------------------------------------
   
+  rv <- reactiveValues(
+    gwas = NULL,
+    gwas_header_df = NULL,
+    p_col_resolved = NULL,
+    p_col_needs_user = FALSE
+  )
+  
+  # ---------------------------------------------------------------------------
+  # Lightweight preview/header read
+  # ---------------------------------------------------------------------------
+  
   gwas_preview <- reactive({
     req(input$gwas_file)
+    
     tryCatch({
       readr::read_delim(
         input$gwas_file$datapath,
@@ -1298,159 +1310,317 @@ server <- function(input, output, session) {
         progress = FALSE,
         n_max = 200
       )
-    }, error = function(e) NULL)
+    }, error = function(e) {
+      NULL
+    })
   })
+  
+  observeEvent(
+    list(input$gwas_file, input$gwas_sep, input$gwas_header),
+    {
+      req(input$gwas_file)
+      
+      rv$gwas <- NULL
+      rv$gwas_header_df <- NULL
+      rv$p_col_resolved <- NULL
+      rv$p_col_needs_user <- FALSE
+      
+      f   <- input$gwas_file$datapath
+      sep <- input$gwas_sep %||% "\t"
+      hdr <- isTRUE(input$gwas_header)
+      
+      df0 <- tryCatch(
+        data.table::fread(
+          f,
+          sep = sep,
+          header = hdr,
+          nrows = 0L,
+          showProgress = FALSE,
+          data.table = FALSE
+        ),
+        error = function(e) NULL
+      )
+      
+      if (is.null(df0) || !is.data.frame(df0)) {
+        showNotification("GWAS: cannot read file header.", type = "error")
+        return()
+      }
+      
+      rv$gwas_header_df <- df0
+      
+      auto_p <- pick_col(
+        df0,
+        c("P", "p", "PVAL", "pval", "P_VALUE", "p_value", "PVALUE", "pvalue")
+      )
+      
+      if (!is.null(auto_p)) {
+        rv$p_col_resolved <- auto_p
+        rv$p_col_needs_user <- FALSE
+      } else {
+        rv$p_col_resolved <- NULL
+        rv$p_col_needs_user <- TRUE
+      }
+    },
+    ignoreInit = TRUE
+  )
+  
+  # ---------------------------------------------------------------------------
+  # Show selector only when auto-detection failed
+  # ---------------------------------------------------------------------------
   
   output$gwas_p_selector <- renderUI({
     p <- gwas_preview()
-    if (is.null(p) || !nrow(p)) return(helpText("Could not read GWAS (preview)."))
+    
+    if (is.null(p) || !nrow(p)) {
+      return(helpText("Could not read GWAS preview."))
+    }
+    
+    if (!isTRUE(rv$p_col_needs_user)) {
+      return(NULL)
+    }
+    
     cols <- names(p)
-    selectInput(
-      "gwas_p_col",
-      "Select p-value column",
-      choices = cols,
-      selected = if ("P" %in% cols) "P" else cols[1]
+    
+    tagList(
+      div(
+        style = paste(
+          "margin-bottom:10px; padding:10px 12px; border-radius:8px;",
+          "background:#fff3cd; color:#856404; border:1px solid #ffe69c;"
+        ),
+        HTML(
+          "<b>P-value column not detected automatically.</b><br/>
+         Please select the column containing raw p-values before continuing."
+        )
+      ),
+      selectInput(
+        "gwas_p_col",
+        "Select p-value column",
+        choices = cols,
+        selected = cols[1]
+      )
     )
   })
   
-  #------------------
-  ############## LOAD GWAS BIG FILES ################################################
-  rv <- reactiveValues(gwas = NULL)   # <-- IMPORTANT (abans de l'observeEvent)
+  # ---------------------------------------------------------------------------
+  # Reactive that decides when the p column is truly resolved
+  # ---------------------------------------------------------------------------
   
-  observeEvent(input$gwas_file, {
-    req(input$gwas_file)
+  gwas_p_col_final <- reactive({
+    req(rv$gwas_header_df)
     
-    # 1) demana overlay ON, i garanteix OFF al final (sempre)
-    session$sendCustomMessage("gwas_loading", TRUE)
-    on.exit(session$sendCustomMessage("gwas_loading", FALSE), add = TRUE)
+    hdr_names <- names(rv$gwas_header_df)
     
-    rv$gwas <- NULL  # opcional: neteja abans
-    
-    f   <- input$gwas_file$datapath
-    sep <- input$gwas_sep %||% "\t"
-    hdr <- isTRUE(input$gwas_header)
-    
-    df0 <- data.table::fread(
-      f, sep = sep, header = hdr,
-      nrows = if (hdr) 0L else 1L,
-      showProgress = FALSE
-    )
-    
-    validate(need(is.data.frame(df0), "GWAS: cannot read file header."))
-    
-    chr_col <- pick_col(df0, c("CHR","chr","chrom","CHROM","chromosome"))
-    bp_col  <- pick_col(df0, c("BP","bp","POS","pos","position","POSITION"))
-    snp_col <- pick_col(df0, c("SNP","snp","rsid","RSID","marker","ID","id"))
-    p_col   <- input$gwas_p_col %||% pick_col(df0, c("P","p","PVAL","pval","P_VALUE","p_value"))
-    
-    validate(
-      need(!is.null(chr_col), "GWAS: missing chromosome column."),
-      need(!is.null(bp_col),  "GWAS: missing position column."),
-      need(!is.null(p_col),   "GWAS: missing p-value column.")
-    )
-    
-    sel <- unique(c(chr_col, bp_col, p_col, snp_col))
-    sel <- sel[!is.na(sel) & nzchar(sel)]
-    
-    dt <- data.table::fread(
-      f, sep = sep, header = hdr,
-      select = sel,
-      showProgress = TRUE
-    )
-    dt <- data.table::as.data.table(dt)
-    validate(need(nrow(dt) > 0, "Empty GWAS file."))
-    
-    rawP <- dt[[p_col]]
-    BP   <- if (is.numeric(dt[[bp_col]])) dt[[bp_col]] else suppressWarnings(readr::parse_number(as.character(dt[[bp_col]])))
-    Pval <- parse_p_robust(rawP)
-    CHR  <- chr_map_plink19(dt[[chr_col]])
-    
-    snp <- if (!is.null(snp_col) && snp_col %in% names(dt)) {
-      as.character(dt[[snp_col]])
-    } else {
-      paste0("chr", norm_chr_generic(dt[[chr_col]]), ":", BP)
+    if (isTRUE(rv$p_col_needs_user)) {
+      req(input$gwas_p_col)
+      validate(need(input$gwas_p_col %in% hdr_names, "Selected p-value column is not in file header."))
+      return(input$gwas_p_col)
     }
     
-    out <- data.table::data.table(
-      CHR  = as.integer(CHR),
-      BP   = as.integer(BP),
-      snp  = snp,
-      Pval = as.numeric(Pval)
-    )
-    
-    rm(dt, rawP, CHR, BP, Pval, snp); gc(FALSE)
-    
-    out <- out[is.finite(CHR) & is.finite(BP) & is.finite(Pval) & Pval > 0]
-    
-    # ---- p<0.05 + 50k downsample ----
-    pcut         <- 0.05
-    target_n     <- 50000L
-    peaks_keep_p <- 1e-6
-    bin_bp       <- 1e7
-    seed         <- 123L
-    
-    out <- out[Pval < pcut]
-    
-    if (nrow(out) > target_n) {
-      set.seed(seed)
-      peaks <- out[Pval <= peaks_keep_p]
+    req(rv$p_col_resolved)
+    rv$p_col_resolved
+  })
+  
+  # ---------------------------------------------------------------------------
+  # Full big-file read ONLY after p-value column is resolved
+  # ---------------------------------------------------------------------------
+  
+  observeEvent(
+    gwas_p_col_final(),
+    {
+      req(input$gwas_file)
+      req(rv$gwas_header_df)
       
-      if (nrow(peaks) >= target_n) {
-        data.table::setorder(peaks, Pval)
-        out <- peaks[seq_len(target_n)]
-      } else {
-        rest <- out[Pval > peaks_keep_p]
-        rest[, bin := paste0(CHR, "_", floor(BP / bin_bp))]
-        
-        remaining_n <- target_n - nrow(peaks)
-        bin_sizes <- rest[, .N, by = bin]
-        bin_sizes[, alloc := floor(remaining_n * (N / sum(N)))]
-        if (remaining_n >= nrow(bin_sizes)) bin_sizes[alloc == 0, alloc := 1L]
-        
-        tot <- sum(bin_sizes$alloc)
-        if (tot > remaining_n) {
-          over <- tot - remaining_n
-          data.table::setorder(bin_sizes, -alloc)
-          i <- 1L
-          while (over > 0L) {
-            if (bin_sizes$alloc[i] > 0L) { bin_sizes$alloc[i] <- bin_sizes$alloc[i] - 1L; over <- over - 1L }
-            i <- i + 1L; if (i > nrow(bin_sizes)) i <- 1L
-          }
-        } else if (tot < remaining_n) {
-          under <- remaining_n - tot
-          data.table::setorder(bin_sizes, -alloc)
-          i <- 1L
-          while (under > 0L) {
-            bin_sizes$alloc[i] <- bin_sizes$alloc[i] + 1L
-            under <- under - 1L
-            i <- i + 1L; if (i > nrow(bin_sizes)) i <- 1L
-          }
-        }
-        
-        picked <- rest[, {
-          k <- bin_sizes[bin == .BY$bin, alloc][1]
-          if (is.na(k) || k <= 0L) .SD[0]
-          else if (.N <= k) .SD
-          else .SD[sample.int(.N, k)]
-        }, by = bin]
-        
-        picked[, bin := NULL]
-        out <- data.table::rbindlist(list(peaks, picked), use.names = TRUE, fill = TRUE)
+      p_col <- gwas_p_col_final()
+      
+      # Modal/loading starts ONLY here
+      session$sendCustomMessage("gwas_loading", TRUE)
+      on.exit(session$sendCustomMessage("gwas_loading", FALSE), add = TRUE)
+      
+      rv$gwas <- NULL
+      
+      f   <- input$gwas_file$datapath
+      sep <- input$gwas_sep %||% "\t"
+      hdr <- isTRUE(input$gwas_header)
+      df0 <- rv$gwas_header_df
+      
+      chr_col <- pick_col(df0, c("CHR", "chr", "chrom", "CHROM", "chromosome"))
+      bp_col  <- pick_col(df0, c("BP", "bp", "POS", "pos", "position", "POSITION"))
+      snp_col <- pick_col(df0, c("SNP", "snp", "rsid", "RSID", "marker", "ID", "id"))
+      
+      if (is.null(chr_col)) {
+        showNotification("GWAS: missing chromosome column.", type = "error")
+        return()
       }
-    }
-    
-    out[, logp := -log10(pmax(Pval, .Machine$double.xmin))]
-    
-    on.exit(session$sendCustomMessage("gwas_loading", FALSE), add = TRUE)
-    rv$gwas <- out
-  }, ignoreInit = TRUE)
+      
+      if (is.null(bp_col)) {
+        showNotification("GWAS: missing position column.", type = "error")
+        return()
+      }
+      
+      if (is.null(p_col)) {
+        showNotification("GWAS: missing p-value column.", type = "error")
+        return()
+      }
+      
+      sel <- unique(c(chr_col, bp_col, p_col, snp_col))
+      sel <- sel[!is.na(sel) & nzchar(sel)]
+      
+      dt <- tryCatch(
+        data.table::fread(
+          f,
+          sep = sep,
+          header = hdr,
+          select = sel,
+          showProgress = TRUE
+        ),
+        error = function(e) NULL
+      )
+      
+      if (is.null(dt) || !nrow(dt)) {
+        showNotification("GWAS: empty file or failed reading selected columns.", type = "error")
+        return()
+      }
+      
+      dt <- data.table::as.data.table(dt)
+      
+      rawP <- dt[[p_col]]
+      BP   <- if (is.numeric(dt[[bp_col]])) {
+        dt[[bp_col]]
+      } else {
+        suppressWarnings(readr::parse_number(as.character(dt[[bp_col]])))
+      }
+      
+      Pval <- parse_p_robust(rawP)
+      CHR  <- chr_map_plink19(dt[[chr_col]])
+      
+      snp <- if (!is.null(snp_col) && snp_col %in% names(dt)) {
+        as.character(dt[[snp_col]])
+      } else {
+        paste0("chr", norm_chr_generic(dt[[chr_col]]), ":", BP)
+      }
+      
+      out <- data.table::data.table(
+        CHR  = as.integer(CHR),
+        BP   = as.integer(BP),
+        snp  = snp,
+        Pval = as.numeric(Pval)
+      )
+      
+      rm(dt, rawP, CHR, BP, Pval, snp)
+      gc(FALSE)
+      
+      out <- out[
+        is.finite(CHR) &
+          is.finite(BP) &
+          is.finite(Pval) &
+          Pval > 0 &
+          Pval <= 1
+      ]
+      
+      if (!nrow(out)) {
+        showNotification(
+          "GWAS: after parsing, no valid rows remained. Check the selected p-value column.",
+          type = "error",
+          duration = 8
+        )
+        return()
+      }
+      
+      # Initial filter + smart downsampling
+      pcut         <- 0.05
+      target_n     <- 50000L
+      peaks_keep_p <- 1e-6
+      bin_bp       <- 1e7
+      seed         <- 123L
+      
+      out <- out[Pval < pcut]
+      
+      if (!nrow(out)) {
+        showNotification(
+          "GWAS: no variants passed the initial filter P < 0.05.",
+          type = "warning",
+          duration = 8
+        )
+        rv$gwas <- data.table::data.table(
+          CHR = integer(),
+          BP = integer(),
+          snp = character(),
+          Pval = numeric(),
+          logp = numeric()
+        )
+        return()
+      }
+      
+      if (nrow(out) > target_n) {
+        set.seed(seed)
+        
+        peaks <- out[Pval <= peaks_keep_p]
+        
+        if (nrow(peaks) >= target_n) {
+          data.table::setorder(peaks, Pval)
+          out <- peaks[seq_len(target_n)]
+        } else {
+          rest <- out[Pval > peaks_keep_p]
+          rest[, bin := paste0(CHR, "_", floor(BP / bin_bp))]
+          
+          remaining_n <- target_n - nrow(peaks)
+          bin_sizes <- rest[, .N, by = bin]
+          bin_sizes[, alloc := floor(remaining_n * (N / sum(N)))]
+          
+          if (remaining_n >= nrow(bin_sizes)) {
+            bin_sizes[alloc == 0, alloc := 1L]
+          }
+          
+          tot <- sum(bin_sizes$alloc)
+          
+          if (tot > remaining_n) {
+            over <- tot - remaining_n
+            data.table::setorder(bin_sizes, -alloc)
+            i <- 1L
+            while (over > 0L) {
+              if (bin_sizes$alloc[i] > 0L) {
+                bin_sizes$alloc[i] <- bin_sizes$alloc[i] - 1L
+                over <- over - 1L
+              }
+              i <- i + 1L
+              if (i > nrow(bin_sizes)) i <- 1L
+            }
+          } else if (tot < remaining_n) {
+            under <- remaining_n - tot
+            data.table::setorder(bin_sizes, -alloc)
+            i <- 1L
+            while (under > 0L) {
+              bin_sizes$alloc[i] <- bin_sizes$alloc[i] + 1L
+              under <- under - 1L
+              i <- i + 1L
+              if (i > nrow(bin_sizes)) i <- 1L
+            }
+          }
+          
+          picked <- rest[, {
+            k <- bin_sizes[bin == .BY$bin, alloc][1]
+            if (is.na(k) || k <= 0L) .SD[0]
+            else if (.N <= k) .SD
+            else .SD[sample.int(.N, k)]
+          }, by = bin]
+          
+          picked[, bin := NULL]
+          out <- data.table::rbindlist(list(peaks, picked), use.names = TRUE, fill = TRUE)
+        }
+      }
+      
+      out[, logp := -log10(pmax(Pval, .Machine$double.xmin))]
+      
+      rv$gwas <- out
+    },
+    ignoreInit = TRUE
+  )
   
   gwas_df <- reactive({
     req(rv$gwas)
     rv$gwas
   })
-  
-  #------------------
+  #==========================================================================
   
   # --- IMPORTANT: only allow build_clusters in NEW mode (so canonical observer doesn't run in OLD) ---
   gwas_df_for_clustering <- reactive({
