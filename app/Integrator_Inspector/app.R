@@ -147,6 +147,7 @@ read_multi_files <- function(files, header = TRUE, user_delim = NULL, label = "f
 # -----------------------------
 # Helpers
 # -----------------------------
+
 pick_col <- function(df, candidates) {
   nm <- intersect(candidates, names(df))
   if (length(nm)) nm[1] else NULL
@@ -1888,7 +1889,7 @@ ui <- navbarPage(
                         checkboxInput(
                           "shared_genes_bubble_shared_only",
                           "Show only shared genes (n_apps > 1)",
-                          value = TRUE
+                          value = FALSE
                         )
                       ),
                       column(
@@ -1995,7 +1996,7 @@ ui <- navbarPage(
                         checkboxInput(
                           "shared_terms_bubble_shared_only",
                           "Show only shared terms (n_apps > 1)",
-                          value = TRUE
+                          value = FALSE
                         )
                       ),
                       column(
@@ -4232,6 +4233,33 @@ server <- function(input, output, session) {
   
   #########################################################################
   ####################### BRIDGES #########################################
+  # ------------------------------------------------------------------
+  # Helper
+  # ------------------------------------------------------------------
+  make_collapsible_text <- function(x, max_chars = 120) {
+    x <- as.character(x)
+    x[is.na(x)] <- ""
+    
+    vapply(x, function(txt) {
+      txt <- trimws(txt)
+      
+      if (!nzchar(txt)) return("")
+      if (nchar(txt) <= max_chars) return(txt)
+      
+      short <- paste0(substr(txt, 1, max_chars), "...")
+      
+      as.character(
+        htmltools::tags$details(
+          htmltools::tags$summary(short),
+          htmltools::HTML(htmltools::htmlEscape(txt))
+        )
+      )
+    }, character(1))
+  }
+  
+  # ------------------------------------------------------------------
+  # All gene bridges
+  # ------------------------------------------------------------------
   output$all_gene_bridges_dt <- DT::renderDT({
     dt <- gene_bridges_combined()
     
@@ -4239,7 +4267,8 @@ server <- function(input, output, session) {
       return(
         DT::datatable(
           data.frame(Message = "No shared gene bridges found yet."),
-          rownames = FALSE
+          rownames = FALSE,
+          options = list(dom = "t")
         )
       )
     }
@@ -4299,13 +4328,17 @@ server <- function(input, output, session) {
         gtex_gene_ids = make_collapsible_text(gtex_gene_ids, max_chars = 120)
       )
     
-    gene_col <- which(names(dt_sum) == "gene_bridges") - 1L
-    gtex_name_col <- which(names(dt_sum) == "gtex_gene_names") - 1L
-    gtex_id_col <- which(names(dt_sum) == "gtex_gene_ids") - 1L
+    gene_col_r <- which(names(dt_sum) == "gene_bridges")
+    gtex_name_col_r <- which(names(dt_sum) == "gtex_gene_names")
+    gtex_id_col_r <- which(names(dt_sum) == "gtex_gene_ids")
+    
+    gene_col_js <- gene_col_r - 1L
+    gtex_name_col_js <- gtex_name_col_r - 1L
+    gtex_id_col_js <- gtex_id_col_r - 1L
     
     escape_cols <- setdiff(
-      seq_along(dt_sum) - 1L,
-      c(gene_col, gtex_name_col, gtex_id_col)
+      seq_along(dt_sum),
+      c(gene_col_r, gtex_name_col_r, gtex_id_col_r)
     )
     
     DT::datatable(
@@ -4317,24 +4350,56 @@ server <- function(input, output, session) {
       options = list(
         dom = "Bfrtip",
         buttons = list(
-          list(extend = "copy",  exportOptions = list(modifier = list(page = "all"))),
-          list(extend = "csv",   exportOptions = list(modifier = list(page = "all"))),
-          list(extend = "excel", exportOptions = list(modifier = list(page = "all")))
+          list(
+            extend = "copy",
+            exportOptions = list(
+              columns = ":visible",
+              modifier = list(
+                page = "all",
+                search = "none",
+                order = "index"
+              )
+            )
+          ),
+          list(
+            extend = "csv",
+            exportOptions = list(
+              columns = ":visible",
+              modifier = list(
+                page = "all",
+                search = "none",
+                order = "index"
+              )
+            )
+          ),
+          list(
+            extend = "excel",
+            exportOptions = list(
+              columns = ":visible",
+              modifier = list(
+                page = "all",
+                search = "none",
+                order = "index"
+              )
+            )
+          )
         ),
         scrollX = TRUE,
         pageLength = 10,
         autoWidth = FALSE,
         columnDefs = list(
-          list(width = "320px", targets = gene_col),
-          list(width = "220px", targets = gtex_name_col),
-          list(width = "220px", targets = gtex_id_col)
+          list(width = "320px", targets = gene_col_js),
+          list(width = "220px", targets = gtex_name_col_js),
+          list(width = "220px", targets = gtex_id_col_js)
         )
       )
     )
-  }, server = TRUE)
+  }, server = FALSE)
   
+  # ------------------------------------------------------------------
+  # All term bridges
+  # ------------------------------------------------------------------
   output$all_term_bridges_dt <- DT::renderDT({
-    
     dt <- term_bridges_combined()
     
     if (!is.data.frame(dt) || !nrow(dt)) {
@@ -4367,8 +4432,6 @@ server <- function(input, output, session) {
     
     # ------------------------------------------------------------
     # 2) Un sol label representatiu per terme normalitzat dins cluster
-    #    Això elimina duplicacions tipus:
-    #    "Smoking initiation" vs "smoking initiation"
     # ------------------------------------------------------------
     dt_display <- dt_clean %>%
       dplyr::group_by(cluster_id, chr, start, end, term_key) %>%
@@ -4425,13 +4488,21 @@ server <- function(input, output, session) {
         shared_terms, shared_terms_omim
       )
     
-    shared_terms_col <- which(names(dt_sum) == "shared_terms") - 1L
-    omim_col <- which(names(dt_sum) == "shared_terms_omim") - 1L
+    shared_terms_col_r <- which(names(dt_sum) == "shared_terms")
+    omim_col_r <- which(names(dt_sum) == "shared_terms_omim")
+    
+    shared_terms_col_js <- shared_terms_col_r - 1L
+    omim_col_js <- omim_col_r - 1L
+    
+    escape_cols <- setdiff(
+      seq_along(dt_sum),
+      c(shared_terms_col_r, omim_col_r)
+    )
     
     DT::datatable(
       sanitize_dt_types(dt_sum),
       rownames = FALSE,
-      escape = setdiff(seq_along(dt_sum) - 1L, c(shared_terms_col, omim_col)),
+      escape = escape_cols,
       extensions = "Buttons",
       width = "100%",
       options = list(
@@ -4440,6 +4511,7 @@ server <- function(input, output, session) {
           list(
             extend = "copy",
             exportOptions = list(
+              columns = ":visible",
               modifier = list(
                 page = "all",
                 search = "none",
@@ -4450,6 +4522,7 @@ server <- function(input, output, session) {
           list(
             extend = "csv",
             exportOptions = list(
+              columns = ":visible",
               modifier = list(
                 page = "all",
                 search = "none",
@@ -4460,6 +4533,7 @@ server <- function(input, output, session) {
           list(
             extend = "excel",
             exportOptions = list(
+              columns = ":visible",
               modifier = list(
                 page = "all",
                 search = "none",
@@ -4472,12 +4546,14 @@ server <- function(input, output, session) {
         pageLength = 10,
         autoWidth = FALSE,
         columnDefs = list(
-          list(width = "420px", targets = shared_terms_col),
-          list(width = "420px", targets = omim_col)
+          list(width = "420px", targets = shared_terms_col_js),
+          list(width = "420px", targets = omim_col_js)
         )
       )
     )
-  }, server = TRUE)
+  }, server = FALSE)
+  
+  
   
   all_gene_bridges <- reactive({
     idir <- selected_session_dir()
@@ -6135,7 +6211,8 @@ function(data, row, column, node){
     if (!is.data.frame(dt) || !nrow(dt)) {
       return(DT::datatable(
         data.frame(Message = "No LD summary available yet. Run 'Compute global LD / blocks'."),
-        rownames = FALSE
+        rownames = FALSE,
+        options = list(dom = "t")
       ))
     }
     
@@ -6202,7 +6279,6 @@ function(data, row, column, node){
     }
     
     dt2 <- sanitize_dt_types(dt)
-    
     
     # ------------------------------------------------------------
     # Columnes amb links
@@ -6289,7 +6365,7 @@ function(data, row, column, node){
       }
     }
     
-    DT::datatable(
+    out <- DT::datatable(
       dt2,
       rownames = FALSE,
       escape = FALSE,
@@ -6300,15 +6376,36 @@ function(data, row, column, node){
         buttons = list(
           list(
             extend = "copy",
-            exportOptions = list(modifier = list(page = "all"))
+            exportOptions = list(
+              columns = ":visible",
+              modifier = list(
+                page = "all",
+                search = "none",
+                order = "index"
+              )
+            )
           ),
           list(
             extend = "csv",
-            exportOptions = list(modifier = list(page = "all"))
+            exportOptions = list(
+              columns = ":visible",
+              modifier = list(
+                page = "all",
+                search = "none",
+                order = "index"
+              )
+            )
           ),
           list(
             extend = "excel",
-            exportOptions = list(modifier = list(page = "all"))
+            exportOptions = list(
+              columns = ":visible",
+              modifier = list(
+                page = "all",
+                search = "none",
+                order = "index"
+              )
+            )
           )
         ),
         scrollX = TRUE,
@@ -6330,9 +6427,14 @@ function(data, row, column, node){
         }
       });
     ")
-    ) %>%
-      DT::formatRound("mean_ld_value", 2)
-  })
+    )
+    
+    if ("mean_ld_value" %in% names(dt2)) {
+      out <- out %>% DT::formatRound("mean_ld_value", 2)
+    }
+    
+    out
+  }, server = FALSE)
   
   block_gene_overlap_summary_global <- reactive({
     dd <- ld_details_rds()
@@ -11199,7 +11301,7 @@ function(data, row, column, node){
     string_db <- STRINGdb::STRINGdb$new(
       version = "12",
       species = 9606,
-      score_threshold = 400,
+      score_threshold = 150,
       input_directory = ""
     )
     
@@ -11692,6 +11794,525 @@ function(data, row, column, node){
       )
   })
   
+  ############################# END GENE NETWORKS ##############################
+  ##############################################################################
+  ############################## GENE NETWORKS TABLES ##########################
+  # ============================================================
+  # GENE–PATHWAY TABLES
+  # ============================================================
+  
+  gene_pathway_nodes_df <- reactive({
+    nw <- gene_pathway_network_obj()
+    
+    validate(
+      need(is.list(nw), "Pathway network object not available."),
+      need(is.data.frame(nw$nodes) && nrow(nw$nodes) > 0, "No pathway nodes available.")
+    )
+    
+    nw$nodes %>%
+      dplyr::mutate(
+        score = round(as.numeric(score), 3),
+        node_class = dplyr::case_when(
+          node_type == "pathway" ~ "pathway",
+          grepl("physical", gene_link_mode) & grepl("effect", gene_link_mode) ~ "position+effect",
+          grepl("physical", gene_link_mode) ~ "position",
+          grepl("effect", gene_link_mode) ~ "effect",
+          TRUE ~ "gene"
+        )
+      ) %>%
+      dplyr::arrange(node_type, dplyr::desc(score), label) %>%
+      dplyr::rename(
+        node_id = id,
+        node_label = label,
+        node_score = score
+      )
+  })
+  
+  gene_pathway_edges_df <- reactive({
+    nw <- gene_pathway_network_obj()
+    
+    validate(
+      need(is.list(nw), "Pathway network object not available."),
+      need(is.data.frame(nw$edges) && nrow(nw$edges) > 0, "No pathway edges available.")
+    )
+    
+    nw$edges %>%
+      dplyr::mutate(
+        p_adjust = round(as.numeric(p_adjust), 6),
+        pathway_count = as.integer(pathway_count)
+      ) %>%
+      dplyr::arrange(p_adjust, dplyr::desc(pathway_count), from, to)
+  })
+  
+  # ============================================================
+  # PPI TABLES
+  # ============================================================
+  
+  gene_ppi_nodes_df <- reactive({
+    nw <- gene_ppi_network_obj()
+    
+    validate(
+      need(is.list(nw), "PPI network object not available."),
+      need(is.data.frame(nw$nodes) && nrow(nw$nodes) > 0, "No PPI nodes available."),
+      need(is.data.frame(nw$edges) && nrow(nw$edges) > 0, "No PPI edges available.")
+    )
+    
+    g <- igraph::graph_from_data_frame(
+      d = nw$edges,
+      vertices = nw$nodes,
+      directed = FALSE
+    )
+    
+    tibble::tibble(
+      gene = igraph::V(g)$name,
+      degree = as.integer(igraph::degree(g)),
+      gene_score = round(as.numeric(igraph::V(g)$score), 3),
+      gene_link_mode = dplyr::coalesce(as.character(igraph::V(g)$gene_link_mode), ""),
+      gene_evidence_types = dplyr::coalesce(as.character(igraph::V(g)$gene_evidence_types), ""),
+      gene_source_apps = dplyr::coalesce(as.character(igraph::V(g)$gene_source_apps), ""),
+      apps_supported = dplyr::coalesce(as.character(igraph::V(g)$apps_supported), "")
+    ) %>%
+      dplyr::mutate(
+        node_class = dplyr::case_when(
+          grepl("physical", gene_link_mode) & grepl("effect", gene_link_mode) ~ "position+effect",
+          grepl("physical", gene_link_mode) ~ "position",
+          grepl("effect", gene_link_mode) ~ "effect",
+          TRUE ~ "gene"
+        )
+      ) %>%
+      dplyr::arrange(dplyr::desc(degree), dplyr::desc(gene_score), gene)
+  })
+  
+  gene_ppi_edges_df <- reactive({
+    nw <- gene_ppi_network_obj()
+    
+    validate(
+      need(is.list(nw), "PPI network object not available."),
+      need(is.data.frame(nw$edges) && nrow(nw$edges) > 0, "No PPI edges available.")
+    )
+    
+    nw$edges %>%
+      dplyr::arrange(from, to) %>%
+      dplyr::mutate(
+        edge_type = "ppi"
+      ) %>%
+      dplyr::select(from, to, edge_type)
+  })
+  
+  # ============================================================
+  # DT HELPERS
+  # ============================================================
+  
+  dt_buttons_all <- function() {
+    list(
+      dom = "Bfrtip",
+      buttons = list(
+        list(
+          extend = "copy",
+          exportOptions = list(
+            columns = ":visible",
+            modifier = list(page = "all", search = "none", order = "index")
+          )
+        ),
+        list(
+          extend = "csv",
+          exportOptions = list(
+            columns = ":visible",
+            modifier = list(page = "all", search = "none", order = "index")
+          )
+        ),
+        list(
+          extend = "excel",
+          exportOptions = list(
+            columns = ":visible",
+            modifier = list(page = "all", search = "none", order = "index")
+          )
+        )
+      ),
+      scrollX = TRUE,
+      pageLength = 10,
+      autoWidth = FALSE
+    )
+  }
+  
+  empty_dt_msg <- function(msg) {
+    DT::datatable(
+      data.frame(Message = msg),
+      rownames = FALSE,
+      options = list(dom = "t")
+    )
+  }
+  
+  # ============================================================
+  # GENE–PATHWAY TABLES
+  # ============================================================
+  
+  gene_pathway_nodes_df <- reactive({
+    nw <- tryCatch(gene_pathway_network_obj(), error = function(e) NULL)
+    
+    if (!is.list(nw) || !is.data.frame(nw$nodes) || !nrow(nw$nodes)) {
+      return(data.frame())
+    }
+    
+    nw$nodes %>%
+      dplyr::mutate(
+        score = round(as.numeric(score), 3),
+        gene_link_mode = dplyr::coalesce(as.character(gene_link_mode), ""),
+        gene_evidence_types = dplyr::coalesce(as.character(gene_evidence_types), ""),
+        gene_source_apps = dplyr::coalesce(as.character(gene_source_apps), ""),
+        apps_supported = dplyr::coalesce(as.character(apps_supported), ""),
+        node_class = dplyr::case_when(
+          node_type == "pathway" ~ "pathway",
+          grepl("physical", gene_link_mode) & grepl("effect", gene_link_mode) ~ "position+effect",
+          grepl("physical", gene_link_mode) ~ "position",
+          grepl("effect", gene_link_mode) ~ "effect",
+          TRUE ~ "gene"
+        )
+      ) %>%
+      dplyr::arrange(node_type, dplyr::desc(score), label) %>%
+      dplyr::rename(
+        node_id = id,
+        node_label = label,
+        node_score = score
+      )
+  })
+  
+  gene_pathway_edges_df <- reactive({
+    nw <- tryCatch(gene_pathway_network_obj(), error = function(e) NULL)
+    
+    if (!is.list(nw) || !is.data.frame(nw$edges) || !nrow(nw$edges)) {
+      return(data.frame())
+    }
+    
+    nw$edges %>%
+      dplyr::mutate(
+        p_adjust = round(as.numeric(p_adjust), 6),
+        pathway_count = as.integer(pathway_count)
+      ) %>%
+      dplyr::arrange(p_adjust, dplyr::desc(pathway_count), from, to)
+  })
+  
+  # ============================================================
+  # PPI TABLES
+  # ============================================================
+  
+  gene_ppi_nodes_df <- reactive({
+    nw <- tryCatch(gene_ppi_network_obj(), error = function(e) NULL)
+    
+    if (!is.list(nw) ||
+        !is.data.frame(nw$nodes) || !nrow(nw$nodes) ||
+        !is.data.frame(nw$edges) || !nrow(nw$edges)) {
+      return(data.frame())
+    }
+    
+    g <- igraph::graph_from_data_frame(
+      d = nw$edges,
+      vertices = nw$nodes,
+      directed = FALSE
+    )
+    
+    tibble::tibble(
+      gene = igraph::V(g)$name,
+      degree = as.integer(igraph::degree(g)),
+      gene_score = round(as.numeric(igraph::V(g)$score), 3),
+      gene_link_mode = dplyr::coalesce(as.character(igraph::V(g)$gene_link_mode), ""),
+      gene_evidence_types = dplyr::coalesce(as.character(igraph::V(g)$gene_evidence_types), ""),
+      gene_source_apps = dplyr::coalesce(as.character(igraph::V(g)$gene_source_apps), ""),
+      apps_supported = dplyr::coalesce(as.character(igraph::V(g)$apps_supported), "")
+    ) %>%
+      dplyr::mutate(
+        node_class = dplyr::case_when(
+          grepl("physical", gene_link_mode) & grepl("effect", gene_link_mode) ~ "position+effect",
+          grepl("physical", gene_link_mode) ~ "position",
+          grepl("effect", gene_link_mode) ~ "effect",
+          TRUE ~ "gene"
+        )
+      ) %>%
+      dplyr::arrange(dplyr::desc(degree), dplyr::desc(gene_score), gene)
+  })
+  
+  gene_ppi_edges_df <- reactive({
+    nw <- tryCatch(gene_ppi_network_obj(), error = function(e) NULL)
+    
+    if (!is.list(nw) || !is.data.frame(nw$edges) || !nrow(nw$edges)) {
+      return(data.frame())
+    }
+    
+    nw$edges %>%
+      dplyr::arrange(from, to) %>%
+      dplyr::mutate(
+        edge_type = "ppi"
+      ) %>%
+      dplyr::select(from, to, edge_type)
+  })
+  
+  # ============================================================
+  # GENE NETWORK SUMMARY PER GENE
+  # ============================================================
+  
+  gene_network_gene_summary_df <- reactive({
+    tg <- tryCatch(top_genes_for_network(), error = function(e) NULL)
+    
+    if (!is.data.frame(tg) || !nrow(tg)) {
+      return(data.frame())
+    }
+    
+    base_genes <- tg %>%
+      dplyr::transmute(
+        gene = trimws(as.character(gene)),
+        gene_score = round(dplyr::coalesce(as.numeric(gene_score), 0), 3),
+        gene_link_mode = dplyr::coalesce(as.character(gene_link_mode), ""),
+        gene_evidence_types = dplyr::coalesce(as.character(gene_evidence_types), ""),
+        gene_source_apps = dplyr::coalesce(as.character(gene_source_apps), ""),
+        apps_supported = dplyr::coalesce(as.character(apps_supported), "")
+      ) %>%
+      dplyr::filter(!is.na(gene), nzchar(gene)) %>%
+      dplyr::distinct(gene, .keep_all = TRUE)
+    
+    collapse_top_items <- function(x, top_n = 5) {
+      x <- as.character(x)
+      x <- trimws(x)
+      x <- x[!is.na(x) & nzchar(x)]
+      x <- unique(x)
+      if (!length(x)) return("")
+      paste(utils::head(sort(x), top_n), collapse = "; ")
+    }
+    
+    pathway_sum <- tryCatch({
+      pe <- gene_pathway_edges_df()
+      
+      if (!is.data.frame(pe) || !nrow(pe)) {
+        stop("No pathway edges available.")
+      }
+      
+      pe %>%
+        dplyr::mutate(
+          from = trimws(as.character(from)),
+          to = trimws(as.character(to)),
+          p_adjust = suppressWarnings(as.numeric(p_adjust))
+        ) %>%
+        dplyr::filter(!is.na(from), nzchar(from), !is.na(to), nzchar(to)) %>%
+        dplyr::group_by(gene = from) %>%
+        dplyr::summarise(
+          n_pathways = dplyr::n_distinct(to),
+          top_pathways = {
+            ord <- dplyr::cur_data_all() %>%
+              dplyr::arrange(p_adjust, to)
+            collapse_top_items(ord$to, top_n = 5)
+          },
+          .groups = "drop"
+        )
+    }, error = function(e) {
+      base_genes %>%
+        dplyr::transmute(
+          gene,
+          n_pathways = 0L,
+          top_pathways = ""
+        )
+    })
+    
+    ppi_sum <- tryCatch({
+      pe <- gene_ppi_edges_df()
+      
+      if (!is.data.frame(pe) || !nrow(pe)) {
+        stop("No PPI edges available.")
+      }
+      
+      ppi_long <- dplyr::bind_rows(
+        pe %>% dplyr::transmute(gene = as.character(from), partner = as.character(to)),
+        pe %>% dplyr::transmute(gene = as.character(to), partner = as.character(from))
+      ) %>%
+        dplyr::mutate(
+          gene = trimws(gene),
+          partner = trimws(partner)
+        ) %>%
+        dplyr::filter(
+          !is.na(gene), nzchar(gene),
+          !is.na(partner), nzchar(partner),
+          gene != partner
+        ) %>%
+        dplyr::distinct()
+      
+      ppi_long %>%
+        dplyr::group_by(gene) %>%
+        dplyr::summarise(
+          n_ppi_neighbors = dplyr::n_distinct(partner),
+          top_ppi_partners = collapse_top_items(partner, top_n = 5),
+          .groups = "drop"
+        )
+    }, error = function(e) {
+      base_genes %>%
+        dplyr::transmute(
+          gene,
+          n_ppi_neighbors = 0L,
+          top_ppi_partners = ""
+        )
+    })
+    
+    base_genes %>%
+      dplyr::left_join(pathway_sum, by = "gene") %>%
+      dplyr::left_join(ppi_sum, by = "gene") %>%
+      dplyr::mutate(
+        n_pathways = dplyr::coalesce(as.integer(n_pathways), 0L),
+        n_ppi_neighbors = dplyr::coalesce(as.integer(n_ppi_neighbors), 0L),
+        top_pathways = dplyr::coalesce(as.character(top_pathways), ""),
+        top_ppi_partners = dplyr::coalesce(as.character(top_ppi_partners), ""),
+        network_summary = paste0(
+          "pathways=", n_pathways,
+          " | ppi_neighbors=", n_ppi_neighbors
+        )
+      ) %>%
+      dplyr::arrange(
+        dplyr::desc(n_ppi_neighbors),
+        dplyr::desc(n_pathways),
+        dplyr::desc(gene_score),
+        gene
+      )
+  })
+  
+  # ============================================================
+  # GENE–PATHWAY DTs
+  # ============================================================
+  
+  output$gene_pathway_nodes_dt <- DT::renderDT({
+    df <- tryCatch(gene_pathway_nodes_df(), error = function(e) NULL)
+    
+    if (!is.data.frame(df) || !nrow(df)) {
+      return(empty_dt_msg("No pathway nodes available."))
+    }
+    
+    DT::datatable(
+      sanitize_dt_types(df),
+      rownames = FALSE,
+      extensions = "Buttons",
+      options = dt_buttons_all()
+    )
+  }, server = FALSE)
+  
+  output$gene_pathway_edges_dt <- DT::renderDT({
+    df <- tryCatch(gene_pathway_edges_df(), error = function(e) NULL)
+    
+    if (!is.data.frame(df) || !nrow(df)) {
+      return(empty_dt_msg("No pathway edges available."))
+    }
+    
+    DT::datatable(
+      sanitize_dt_types(df),
+      rownames = FALSE,
+      extensions = "Buttons",
+      options = dt_buttons_all()
+    )
+  }, server = FALSE)
+  
+  # ============================================================
+  # PPI DTs
+  # ============================================================
+  
+  output$gene_ppi_nodes_dt <- DT::renderDT({
+    df <- tryCatch(gene_ppi_nodes_df(), error = function(e) NULL)
+    
+    if (!is.data.frame(df) || !nrow(df)) {
+      return(empty_dt_msg("No PPI nodes available."))
+    }
+    
+    if ("gene" %in% names(df)) {
+      df$gene <- make_genecards_links(as.character(df$gene))
+    }
+    
+    gene_col_r <- which(names(df) == "gene")
+    gene_col_js <- gene_col_r - 1L
+    escape_cols <- setdiff(seq_along(df), gene_col_r)
+    
+    DT::datatable(
+      sanitize_dt_types(df),
+      rownames = FALSE,
+      escape = escape_cols,
+      extensions = "Buttons",
+      width = "100%",
+      options = modifyList(
+        dt_buttons_all(),
+        list(
+          columnDefs = list(
+            list(width = "120px", targets = gene_col_js)
+          )
+        )
+      )
+    )
+  }, server = FALSE)
+  
+  output$gene_ppi_edges_dt <- DT::renderDT({
+    df <- tryCatch(gene_ppi_edges_df(), error = function(e) NULL)
+    
+    if (!is.data.frame(df) || !nrow(df)) {
+      return(empty_dt_msg("No PPI edges available."))
+    }
+    
+    gene_cols_r <- which(names(df) %in% c("from", "to"))
+    gene_cols_js <- gene_cols_r - 1L
+    escape_cols <- setdiff(seq_along(df), gene_cols_r)
+    
+    if ("from" %in% names(df)) {
+      df$from <- make_genecards_links(as.character(df$from))
+    }
+    if ("to" %in% names(df)) {
+      df$to <- make_genecards_links(as.character(df$to))
+    }
+    
+    DT::datatable(
+      sanitize_dt_types(df),
+      rownames = FALSE,
+      escape = escape_cols,
+      extensions = "Buttons",
+      width = "100%",
+      options = modifyList(
+        dt_buttons_all(),
+        list(
+          columnDefs = lapply(gene_cols_js, function(j) {
+            list(width = "120px", targets = j)
+          })
+        )
+      )
+    )
+  }, server = FALSE)
+  
+  # ============================================================
+  # SUMMARY DT
+  # ============================================================
+  
+  output$gene_network_gene_summary_dt <- DT::renderDT({
+    df <- tryCatch(gene_network_gene_summary_df(), error = function(e) NULL)
+    
+    if (!is.data.frame(df) || !nrow(df)) {
+      return(empty_dt_msg("No gene network summary available."))
+    }
+    
+    if ("gene" %in% names(df)) {
+      df$gene <- make_genecards_links(as.character(df$gene))
+    }
+    
+    gene_col_r <- which(names(df) == "gene")
+    gene_col_js <- gene_col_r - 1L
+    escape_cols <- setdiff(seq_along(df), gene_col_r)
+    
+    DT::datatable(
+      sanitize_dt_types(df),
+      rownames = FALSE,
+      escape = escape_cols,
+      extensions = "Buttons",
+      width = "100%",
+      options = modifyList(
+        dt_buttons_all(),
+        list(
+          columnDefs = list(
+            list(width = "120px", targets = gene_col_js)
+          )
+        )
+      )
+    )
+  }, server = FALSE)
+  
+  ############################## END GENE NETWORKS TABLES ######################
+  
   # ============================================================
   # MODAL NETWORK PLOT
   # ============================================================
@@ -11811,6 +12432,44 @@ function(data, row, column, node){
                   plotly::plotlyOutput("gene_ppi_network", height = "780px"),
                   type = 4
                 )
+              ),
+              
+              shiny::tabPanel(
+                "Tables",
+                br(),
+                shiny::tabsetPanel(
+                  id = "gene_network_tables_tabs",
+                  
+                  shiny::tabPanel(
+                    "Gene summary",
+                    br(),
+                    DT::DTOutput("gene_network_gene_summary_dt")
+                  ),
+                  
+                  shiny::tabPanel(
+                    "Pathway nodes",
+                    br(),
+                    DT::DTOutput("gene_pathway_nodes_dt")
+                  ),
+                  
+                  shiny::tabPanel(
+                    "Pathway edges",
+                    br(),
+                    DT::DTOutput("gene_pathway_edges_dt")
+                  ),
+                  
+                  shiny::tabPanel(
+                    "PPI nodes",
+                    br(),
+                    DT::DTOutput("gene_ppi_nodes_dt")
+                  ),
+                  
+                  shiny::tabPanel(
+                    "PPI edges",
+                    br(),
+                    DT::DTOutput("gene_ppi_edges_dt")
+                  )
+                )
               )
             )
           )
@@ -11818,9 +12477,6 @@ function(data, row, column, node){
       )
     )
   })
-  
-  ############################# END GENE NETWORKS ##############################
-  ##############################################################################
   
   # ============================================================
 
