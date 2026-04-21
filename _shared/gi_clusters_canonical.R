@@ -388,12 +388,31 @@ gi_clusters_canonical_init <- function(session, input, output,
   clusters_cur  <- shiny::reactiveVal(tibble::tibble())
   
   safe_num <- function(x, default = NA_real_) {
-    y <- suppressWarnings(as.numeric(x))
-    if (!is.finite(y)) default else y
+    if (is.null(x) || length(x) == 0) {
+      return(default)
+    }
+    
+    y <- suppressWarnings(as.numeric(x[[1]]))
+    
+    if (length(y) == 0 || is.na(y) || !is.finite(y)) {
+      return(default)
+    }
+    
+    y
   }
+  
   safe_int <- function(x, default = NA_integer_) {
-    y <- suppressWarnings(as.integer(x))
-    if (!is.finite(y)) default else y
+    if (is.null(x) || length(x) == 0) {
+      return(default)
+    }
+    
+    y <- suppressWarnings(as.integer(x[[1]]))
+    
+    if (length(y) == 0 || is.na(y) || !is.finite(y)) {
+      return(default)
+    }
+    
+    y
   }
   
   selected_cluster <- shiny::reactive({
@@ -415,12 +434,28 @@ gi_clusters_canonical_init <- function(session, input, output,
   # BUILD
   shiny::observeEvent(input[[build_btn_id]], {
     
-    df <- gwas_df()
-    shiny::validate(shiny::need(is.data.frame(df) && nrow(df) > 0, "GWAS is empty."))
-    shiny::validate(shiny::need(all(c("CHR","BP","snp","Pval","logp") %in% names(df)),
-                                "GWAS must have CHR,BP,snp,Pval,logp."))
+    cat("\n[GI canonical] build button clicked:", build_btn_id, "\n")
+    
+    df <- tryCatch(gwas_df(), error = function(e) {
+      cat("[GI canonical] gwas_df() failed:", conditionMessage(e), "\n")
+      NULL
+    })
+    
+    if (!is.data.frame(df) || nrow(df) == 0) {
+      cat("[GI canonical] GWAS is empty or invalid\n")
+      return(NULL)
+    }
+    
+    cat("[GI canonical] GWAS rows:", nrow(df), "\n")
+    cat("[GI canonical] GWAS cols:", paste(names(df), collapse = ", "), "\n")
+    
+    if (!all(c("CHR","BP","snp","Pval","logp") %in% names(df))) {
+      cat("[GI canonical] Missing required GWAS columns\n")
+      return(NULL)
+    }
     
     method <- input$cluster_method %||% "window"
+    cat("[GI canonical] method:", method, "\n")
     
     # reset current
     clusters_cur(tibble::tibble())
@@ -431,11 +466,21 @@ gi_clusters_canonical_init <- function(session, input, output,
     # -----------------------------
     if (identical(method, "window")) {
       
-      thr   <- safe_num(input$pthr, default = -Inf)
-      flank <- safe_int(input$flank, default = 0L)
+      thr      <- safe_num(input$pthr, default = -Inf)
+      flank    <- safe_int(input$flank, default = 0L)
+      min_hits <- safe_int(input$min_hits_window, default = 1L)
       
-      df_sig <- df %>% dplyr::filter(is.finite(.data$logp), .data$logp >= thr) %>% dplyr::arrange(.data$CHR, .data$BP)
-      shiny::validate(shiny::need(nrow(df_sig) > 0, "No GWAS hits above threshold."))
+      if (!is.finite(min_hits) || min_hits < 1L) {
+        min_hits <- 1L
+      }
+      
+      df_sig <- df %>%
+        dplyr::filter(is.finite(.data$logp), .data$logp >= thr) %>%
+        dplyr::arrange(.data$CHR, .data$BP)
+      
+      shiny::validate(
+        shiny::need(nrow(df_sig) > 0, "No GWAS hits above threshold.")
+      )
       
       # optional: keep only selected hit rows (if exists)
       sel <- NULL
@@ -446,53 +491,150 @@ gi_clusters_canonical_init <- function(session, input, output,
         chr   = as.integer(picks$CHR),
         start = pmax(1L, as.integer(picks$BP) - flank),
         end   = as.integer(picks$BP) + flank,
-        label = ifelse(!is.na(picks$snp) & nzchar(picks$snp), as.character(picks$snp),
-                       paste0("chr", chr_label_plink(as.integer(picks$CHR)), ":", picks$BP))
+        label = ifelse(
+          !is.na(picks$snp) & nzchar(picks$snp),
+          as.character(picks$snp),
+          paste0("chr", chr_label_plink(as.integer(picks$CHR)), ":", picks$BP)
+        )
       ) %>%
         dplyr::arrange(.data$chr, .data$start, .data$end) %>%
         dplyr::mutate(label = make.unique(.data$label, sep = "_"))
       
-      intervals_raw(raw_int)
-      
       merged <- merge_overlapping_intervals(raw_int)
-      cl <- summarize_clusters_from_hits(merged, df_sig)
+      cl <- summarize_clusters_from_hits(merged, df_sig) %>%
+        dplyr::filter(.data$n_snps >= min_hits) %>%
+        dplyr::arrange(.data$chr, .data$start, .data$end)
+      
+      if (!nrow(cl)) {
+        shiny::showNotification(
+          paste0(
+            "No clusters were generated. ",
+            "The current minimum hits per cluster (", min_hits, 
+            ") is too restrictive for the selected GWAS hits."
+          ),
+          type = "warning",
+          duration = 6
+        )
+      }
+      
+      cat("\n[GI canonical][window]")
+      cat("\n  thr:", thr)
+      cat("\n  flank:", flank)
+      cat("\n  min_hits_window:", min_hits)
+      cat("\n  raw_intervals:", nrow(raw_int))
+      cat("\n  merged_intervals:", nrow(merged))
+      cat("\n  final_clusters:", nrow(cl), "\n")
       
       if (nrow(cl)) {
         cl[[app_count_col]] <- 0L
         clusters_cur(cl)
-        intervals_raw(cl %>% dplyr::transmute(chr = .data$chr, start = .data$start, end = .data$end, label = .data$cluster_id))
+        intervals_raw(
+          cl %>%
+            dplyr::transmute(
+              chr = .data$chr,
+              start = .data$start,
+              end = .data$end,
+              label = .data$cluster_id
+            )
+        )
+      } else {
+        clusters_cur(tibble::tibble())
+        intervals_raw(tibble::tibble(chr=integer(), start=integer(), end=integer(), label=character()))
       }
       
       if ("ranges_preview" %in% names(output)) {
         output$ranges_preview <- shiny::renderText({
-          paste0("method=window | thr=", thr, " | flank=", flank, " bp\n",
-                 "raw intervals=", nrow(raw_int), " | clusters=", nrow(cl))
+          if (!nrow(cl)) {
+            paste0(
+              "method=window",
+              " | thr=", thr,
+              " | flank=", flank, " bp",
+              " | min_hits=", min_hits, "\n",
+              "raw intervals=", nrow(raw_int),
+              " | merged intervals=", nrow(merged),
+              " | final clusters=0\n\n",
+              "No clusters were generated with the current settings.\n",
+              "Try lowering min_hits_window or adjusting threshold/flank."
+            )
+          } else {
+            paste0(
+              "method=window",
+              " | thr=", thr,
+              " | flank=", flank, " bp",
+              " | min_hits=", min_hits, "\n",
+              "raw intervals=", nrow(raw_int),
+              " | merged intervals=", nrow(merged),
+              " | final clusters=", nrow(cl)
+            )
+          }
         })
       }
       
       return(invisible(TRUE))
     }
-    
     # -----------------------------
     # METHOD 2: hits (density-based)
     # hits_mode: span1mb / tiled / sliding
     # -----------------------------
-    if (method %in% c("hit","hits")) {
+    if (method %in% c("hit", "hits")) {
       
-      hits_mode <- input$hits_mode %||% "span1mb"
-      min_logp  <- safe_num(input$min_logp, default = NA_real_)
-      min_hits  <- safe_int(input$min_hits %||% input$min_snps, default = 3L)
-      win_bp    <- safe_int(input$win_bp,  default = 1e6L)
-      step_bp   <- safe_int(input$step_bp, default = floor(win_bp / 10))
+      hits_mode_raw <- input$hits_mode %||% "span1mb"
       
-      shiny::validate(shiny::need(is.finite(min_logp), "min_logp is missing."))
-      shiny::validate(shiny::need(is.finite(min_hits) && min_hits >= 1, "min_hits must be >= 1."))
-      shiny::validate(shiny::need(is.finite(win_bp) && win_bp > 0, "win_bp must be > 0."))
+      hits_mode <- dplyr::case_when(
+        hits_mode_raw %in% c("span1mb", "hits_span1mb") ~ "span1mb",
+        hits_mode_raw %in% c("tiled", "hits_tiled") ~ "tiled",
+        hits_mode_raw %in% c("sliding", "hits_sliding") ~ "sliding",
+        TRUE ~ as.character(hits_mode_raw)
+      )
       
-      df_sig <- df %>% dplyr::filter(is.finite(.data$logp), .data$logp >= min_logp) %>% dplyr::arrange(.data$CHR, .data$BP)
-      shiny::validate(shiny::need(nrow(df_sig) > 0, "No GWAS hits above min_logp."))
+      min_logp <- safe_num(input$min_logp, default = NA_real_)
+      min_hits <- safe_int(
+        input$min_hits_hits %||% input$min_hits %||% input$min_snps,
+        default = 1L
+      )
+      win_bp  <- safe_int(input$win_bp,  default = 1e6L)
+      step_bp <- safe_int(input$step_bp, default = floor(win_bp / 10))
       
-      # --- span1mb: cluster by distance (generalized to win_bp)
+      cat("\n[GI canonical][hits:precheck]")
+      cat("\n  hits_mode_raw:", as.character(hits_mode_raw))
+      cat("\n  hits_mode:", as.character(hits_mode))
+      cat("\n  input$min_logp:", paste(input$min_logp %||% "NULL"))
+      cat("\n  input$min_hits_hits:", paste(input$min_hits_hits %||% "NULL"))
+      cat("\n  input$min_hits:", paste(input$min_hits %||% "NULL"))
+      cat("\n  input$min_snps:", paste(input$min_snps %||% "NULL"))
+      cat("\n  input$win_bp:", paste(input$win_bp %||% "NULL"))
+      cat("\n  input$step_bp:", paste(input$step_bp %||% "NULL"))
+      cat("\n  min_logp:", min_logp)
+      cat("\n  min_hits:", min_hits)
+      cat("\n  win_bp:", win_bp)
+      cat("\n  step_bp:", step_bp, "\n")
+      
+      if (!is.finite(min_logp)) {
+        cat("[GI canonical][hits] STOP: min_logp is missing or invalid\n")
+        return(NULL)
+      }
+      
+      if (!is.finite(min_hits) || min_hits < 1) {
+        cat("[GI canonical][hits] STOP: min_hits is missing or invalid\n")
+        return(NULL)
+      }
+      
+      if (!is.finite(win_bp) || win_bp <= 0) {
+        cat("[GI canonical][hits] STOP: win_bp is missing or invalid\n")
+        return(NULL)
+      }
+      
+      df_sig <- df %>%
+        dplyr::filter(is.finite(.data$logp), .data$logp >= min_logp) %>%
+        dplyr::arrange(.data$CHR, .data$BP)
+      
+      cat("[GI canonical][hits] n_sig_hits:", nrow(df_sig), "\n")
+      
+      if (!is.data.frame(df_sig) || nrow(df_sig) == 0) {
+        cat("[GI canonical][hits] STOP: no GWAS hits above min_logp\n")
+        return(NULL)
+      }
+      
       if (identical(hits_mode, "span1mb")) {
         
         clustered <- df_sig %>%
@@ -501,16 +643,19 @@ gi_clusters_canonical_init <- function(session, input, output,
             x <- .x
             n <- nrow(x)
             if (n == 0) return(x)
+            
             cid <- integer(n)
-            start_idx <- 1
-            cur <- 1
+            start_idx <- 1L
+            cur <- 1L
+            
             for (i in seq_len(n)) {
-              if (x$BP[i] - x$BP[start_idx] > win_bp) {
-                cur <- cur + 1
+              if ((x$BP[i] - x$BP[start_idx]) > win_bp) {
+                cur <- cur + 1L
                 start_idx <- i
               }
               cid[i] <- cur
             }
+            
             x$cluster_chr <- cid
             x
           }) %>%
@@ -537,39 +682,109 @@ gi_clusters_canonical_init <- function(session, input, output,
           dplyr::ungroup() %>%
           dplyr::mutate(
             cluster_chr_n = paste0("chr", chr_label_plink(.data$chr), "_", .data$cluster_chr),
-            cluster_id    = .data$cluster_chr_n
+            cluster_id = .data$cluster_chr_n
           )
+        
+        cat("[GI canonical][span1mb] n_clusters:", nrow(cl), "\n")
+        
+        if (!nrow(cl)) {
+          shiny::showNotification(
+            paste0(
+              "No hit-density clusters were generated. ",
+              "The current minimum hits per cluster (", min_hits,
+              ") is too restrictive for the selected GWAS hits."
+            ),
+            type = "warning",
+            duration = 6
+          )
+        }
         
         if (nrow(cl)) {
           cl[[app_count_col]] <- 0L
           clusters_cur(cl)
-          intervals_raw(cl %>% dplyr::transmute(chr = .data$chr, start = .data$start, end = .data$end, label = .data$cluster_id))
+          intervals_raw(
+            cl %>%
+              dplyr::transmute(
+                chr = .data$chr,
+                start = .data$start,
+                end = .data$end,
+                label = .data$cluster_id
+              )
+          )
         }
         
         return(invisible(TRUE))
       }
       
-      # tiled: step = win
-      if (identical(hits_mode, "tiled")) step_bp <- win_bp
-      shiny::validate(shiny::need(is.finite(step_bp) && step_bp > 0, "step_bp must be > 0."))
+      if (identical(hits_mode, "tiled")) {
+        step_bp <- win_bp
+      }
       
-      # chr lengths (max BP from full GWAS)
+      if (!is.finite(step_bp) || step_bp <= 0) {
+        cat("[GI canonical][hits] STOP: step_bp is missing or invalid\n")
+        return(NULL)
+      }
+      
       chr_lengths <- df %>%
         dplyr::group_by(.data$CHR) %>%
         dplyr::summarise(chr_len = max(.data$BP, na.rm = TRUE), .groups = "drop") %>%
-        dplyr::transmute(chr = as.integer(.data$CHR), chr_len = as.integer(.data$chr_len))
+        dplyr::transmute(
+          chr = as.integer(.data$CHR),
+          chr_len = as.integer(.data$chr_len)
+        )
       
-      hits <- df_sig %>% dplyr::transmute(chr = as.integer(.data$CHR), pos = as.integer(.data$BP))
+      hits <- df_sig %>%
+        dplyr::transmute(
+          chr = as.integer(.data$CHR),
+          pos = as.integer(.data$BP)
+        )
       
       windows  <- make_windows_dt(chr_lengths, win_bp = win_bp, step_bp = step_bp)
       win_hits <- count_hits_in_windows(hits, windows)
       
       sig_win <- win_hits[win_hits$n_hits >= min_hits, , drop = FALSE]
-      shiny::validate(shiny::need(nrow(sig_win) > 0,
-                                  paste0("No windows pass min_hits=", min_hits,
-                                         " (mode=", hits_mode, ", win_bp=", win_bp, ", step_bp=", step_bp, ").")))
       
-      merged <- merge_significant_windows(sig_win[, c("chr","start","end")], gap_bp = 0L)
+      cat("[GI canonical][windowed hits] n_windows:", nrow(windows), "\n")
+      cat("[GI canonical][windowed hits] n_sig_windows:", nrow(sig_win), "\n")
+      
+      if (nrow(sig_win) == 0) {
+        cat("[GI canonical][hits] STOP: no windows pass min_hits\n")
+        
+        shiny::showNotification(
+          paste0(
+            "No ", hits_mode, " hit-density clusters were generated. ",
+            "No windows pass the current minimum hits setting (", min_hits, "). ",
+            "Try lowering min_hits_hits, lowering min_logp, or increasing win_bp."
+          ),
+          type = "warning",
+          duration = 7
+        )
+        
+        if ("ranges_preview" %in% names(output)) {
+          output$ranges_preview <- shiny::renderText({
+            paste0(
+              "method=hits",
+              " | hits_mode=", hits_mode,
+              " | min_logp=", min_logp,
+              " | min_hits=", min_hits,
+              " | win_bp=", win_bp,
+              " | step_bp=", step_bp, "\n",
+              "significant hits=", nrow(df_sig),
+              " | windows=", nrow(windows),
+              " | windows passing min_hits=0\n\n",
+              "No ", hits_mode, " hit-density clusters were generated with the current settings.\n",
+              "Try lowering min_hits_hits, lowering min_logp, or increasing win_bp."
+            )
+          })
+        }
+        
+        clusters_cur(tibble::tibble())
+        intervals_raw(tibble::tibble(chr=integer(), start=integer(), end=integer(), label=character()))
+        
+        return(NULL)
+      }
+      
+      merged <- merge_significant_windows(sig_win[, c("chr", "start", "end")], gap_bp = 0L)
       
       cl <- as.data.frame(merged) %>%
         dplyr::arrange(.data$chr, .data$start, .data$end) %>%
@@ -579,21 +794,63 @@ gi_clusters_canonical_init <- function(session, input, output,
         dplyr::mutate(cluster = dplyr::row_number()) %>%
         dplyr::mutate(
           cluster_chr_n = paste0("chr", chr_label_plink(.data$chr), "_", .data$cluster_chr),
-          cluster_id    = .data$cluster_chr_n
+          cluster_id = .data$cluster_chr_n
         )
       
       cl <- add_cluster_stats_from_hits(cl, df_sig)
       
+      cat("[GI canonical][", hits_mode, "] n_clusters:", nrow(cl), "\n", sep = "")
+      
+      if (!nrow(cl)) {
+        shiny::showNotification(
+          paste0(
+            "No ", hits_mode, " hit-density clusters remained after summarization. ",
+            "Try lowering min_hits_hits, lowering min_logp, or increasing win_bp."
+          ),
+          type = "warning",
+          duration = 7
+        )
+        
+        if ("ranges_preview" %in% names(output)) {
+          output$ranges_preview <- shiny::renderText({
+            paste0(
+              "method=hits",
+              " | hits_mode=", hits_mode,
+              " | min_logp=", min_logp,
+              " | min_hits=", min_hits,
+              " | win_bp=", win_bp,
+              " | step_bp=", step_bp, "\n",
+              "significant hits=", nrow(df_sig),
+              " | windows=", nrow(windows),
+              " | windows passing min_hits=", nrow(sig_win),
+              " | final clusters=0\n\n",
+              "No ", hits_mode, " hit-density clusters remained after summarization.\n",
+              "Try lowering min_hits_hits, lowering min_logp, or increasing win_bp."
+            )
+          })
+        }
+      }
+      
       if (nrow(cl)) {
         cl[[app_count_col]] <- 0L
         clusters_cur(cl)
-        intervals_raw(cl %>% dplyr::transmute(chr = .data$chr, start = .data$start, end = .data$end, label = .data$cluster_id))
+        intervals_raw(
+          cl %>%
+            dplyr::transmute(
+              chr = .data$chr,
+              start = .data$start,
+              end = .data$end,
+              label = .data$cluster_id
+            )
+        )
       }
       
       return(invisible(TRUE))
     }
     
   }, ignoreInit = TRUE)
+  
+  
   
   list(
     intervals_raw = intervals_raw,
