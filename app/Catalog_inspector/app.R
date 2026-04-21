@@ -1665,6 +1665,16 @@ server <- function(input, output, session) {
     app_count_col  = "n_catalog"
   )
   
+  # --- Canonical clusters bindings ---
+  clusters_val <- clusters_engine$clusters_cur
+  intervals_raw <- clusters_engine$intervals_raw
+  selected_cluster <- clusters_engine$selected_cluster
+  
+  observe({
+    cl_dbg <- tryCatch(clusters_val(), error = function(e) NULL)
+    cat("[DBG] bound clusters_val nrow =", if (is.data.frame(cl_dbg)) nrow(cl_dbg) else NA, "\n")
+  })
+  
   # ---------------------------------------------------------------------------
   # SAVE GWAS (Catalog as MASTER → expose to slaves)
   # ---------------------------------------------------------------------------
@@ -1747,44 +1757,328 @@ server <- function(input, output, session) {
   clusters_val <- clusters_engine$clusters_cur
   gitools_deeplink_catalog(session, clusters_val)
   
-  observeEvent(input$build_ranges, {
+  observeEvent(input$build_rangesXXXXXX, {
+    
+    cat("\n[CATALOG] build_ranges clicked\n")
+    
+    # ------------------------------------------------------------
+    # Reset downstream (Catalog outputs)
+    # ------------------------------------------------------------
+    catalog_final_path_csv(NULL)
+    catalog_final_path_rds(NULL)
+    
+    # ------------------------------------------------------------
+    # Read clusters computed by the canonical engine
+    # ------------------------------------------------------------
+    clusters <- clusters_val()
+    
+    if (!is.data.frame(clusters) || nrow(clusters) == 0) {
+      showNotification("No clusters generated.", type = "error", duration = 6)
+      cat("[CATALOG] No clusters available in clusters_val()\n")
+      return(NULL)
+    }
+    
+    cat("[CATALOG] clusters rows:", nrow(clusters), "\n")
+    cat("[CATALOG] clusters cols:", paste(names(clusters), collapse = ", "), "\n")
+    
+    # ------------------------------------------------------------
+    # Ensure workdir exists
+    # ------------------------------------------------------------
+    if (!exists("workdir") || is.null(workdir) || length(workdir) == 0 || !nzchar(workdir)) {
+      showNotification("workdir is not defined.", type = "error", duration = 6)
+      cat("[CATALOG] workdir is missing or empty\n")
+      return(NULL)
+    }
+    
+    if (!dir.exists(workdir)) {
+      dir.create(workdir, recursive = TRUE, showWarnings = FALSE)
+    }
+    
+    # ------------------------------------------------------------
+    # Helper: write PLINK-style range file
+    # ------------------------------------------------------------
+    write_range_file <- function(clusters_df) {
+      cl <- as.data.frame(clusters_df)
+      
+      # Harmonize possible column names
+      if (!"chr"        %in% names(cl) && "CHR"         %in% names(cl)) cl$chr   <- cl$CHR
+      if (!"start"      %in% names(cl) && "start_bp"    %in% names(cl)) cl$start <- cl$start_bp
+      if (!"end"        %in% names(cl) && "end_bp"      %in% names(cl)) cl$end   <- cl$end_bp
+      if (!"cluster_id" %in% names(cl) && "cluster"     %in% names(cl)) cl$cluster_id <- cl$cluster
+      if (!"cluster_id" %in% names(cl) && "id"          %in% names(cl)) cl$cluster_id <- cl$id
+      
+      missing_cols <- setdiff(c("chr", "start", "end", "cluster_id"), names(cl))
+      if (length(missing_cols) > 0) {
+        stop(
+          paste0(
+            "clusters must contain chr/start/end/cluster_id. Missing: ",
+            paste(missing_cols, collapse = ", ")
+          )
+        )
+      }
+      
+      # Normalize chr if it comes as "chr1", "chr2", ...
+      chr_num <- suppressWarnings(as.integer(gsub("^chr", "", as.character(cl$chr), ignore.case = TRUE)))
+      start_i <- suppressWarnings(as.integer(cl$start))
+      end_i   <- suppressWarnings(as.integer(cl$end))
+      cid     <- as.character(cl$cluster_id)
+      
+      bad_rows <- which(
+        is.na(chr_num) |
+          is.na(start_i) |
+          is.na(end_i) |
+          !nzchar(cid)
+      )
+      
+      if (length(bad_rows) > 0) {
+        stop(
+          paste0(
+            "Invalid cluster rows for range export: ",
+            paste(utils::head(bad_rows, 10), collapse = ", ")
+          )
+        )
+      }
+      
+      lines <- sprintf(
+        "%s %d %d %s",
+        chr_label_plink(chr_num),
+        start_i,
+        end_i,
+        cid
+      )
+      
+      rng_path <- file.path(workdir, "selected_intervals.range")
+      writeLines(lines, rng_path)
+      
+      list(lines = lines, path = rng_path)
+    }
+    
+    # ------------------------------------------------------------
+    # Save canonical state
+    # ------------------------------------------------------------
+    sid <- gi_sid(session)
+    p   <- gi_state_paths(sid)
+    
+    tryCatch({
+      write_params_rds(
+        sid = sid,
+        input = input,
+        min_hits_value = min_hits_active()
+      )
+    }, error = function(e) {
+      showNotification(
+        paste("Failed to write params RDS:", conditionMessage(e)),
+        type = "error", duration = 8
+      )
+      cat("[CATALOG] write_params_rds failed:", conditionMessage(e), "\n")
+      stop(e)
+    })
+    
+    ok_save <- TRUE
+    tryCatch({
+      saveRDS(clusters, p$clus)
+    }, error = function(e) {
+      ok_save <<- FALSE
+      cat("[GI][MASTER] could not save clusters rds:", conditionMessage(e), "\n")
+    })
+    
+    if (!ok_save || !file.exists(p$clus)) {
+      showNotification("Failed to save clusters RDS (sync cannot proceed).", type = "error", duration = 8)
+      cat("[CATALOG] Failed to save clusters RDS:", p$clus, "\n")
+      return(NULL)
+    }
+    
+    st0 <- gi_read_state(sid)
+    if (is.null(st0) || !is.list(st0)) st0 <- list()
+    
+    cluster_method_now <- as.character(input$cluster_method %||% "window")
+    hits_mode_now      <- as.character(input$hits_mode %||% NA_character_)
+    
+    thr_type_now <- if (identical(cluster_method_now, "window")) "pthr" else "min_logp"
+    thr_value_now <- if (identical(cluster_method_now, "window")) {
+      as.numeric(input$pthr %||% NA_real_)
+    } else {
+      as.numeric(input$min_logp %||% NA_real_)
+    }
+    
+    new_stamp <- gi_bump_stamp(st0$stamp %||% 0)
+    
+    st_new <- modifyList(st0, list(
+      stamp          = new_stamp,
+      sid            = sid,
+      updated_at     = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      has_gwas       = TRUE,
+      gwas_rds       = p$gwas,
+      has_clusters   = TRUE,
+      clusters_rds   = p$clus,
+      clus_rds       = p$clus,
+      params_rds     = p$params,
+      cluster_method = cluster_method_now,
+      hits_mode      = hits_mode_now,
+      thr_type       = thr_type_now,
+      thr_value      = thr_value_now,
+      pthr           = as.numeric(input$pthr %||% NA_real_),
+      min_logp       = as.numeric(input$min_logp %||% NA_real_),
+      flank_bp       = as.integer(input$flank %||% 0L),
+      flank          = as.integer(input$flank %||% 0L),
+      min_hits       = as.integer(min_hits_active() %||% NA_integer_),
+      win_bp         = as.integer(input$win_bp %||% NA_integer_),
+      step_bp        = as.integer(input$step_bp %||% NA_integer_)
+    ))
+    
+    tryCatch({
+      gi_write_state(sid, st_new)
+    }, error = function(e) {
+      showNotification(
+        paste("Failed to write GI state:", conditionMessage(e)),
+        type = "error", duration = 8
+      )
+      cat("[CATALOG] gi_write_state failed:", conditionMessage(e), "\n")
+      return(NULL)
+    })
+    
+    # ------------------------------------------------------------
+    # Build interval range file
+    # ------------------------------------------------------------
+    wf <- tryCatch({
+      write_range_file(clusters)
+    }, error = function(e) {
+      showNotification(
+        paste("Failed to build intervals:", conditionMessage(e)),
+        type = "error", duration = 8
+      )
+      cat("[CATALOG] write_range_file failed:", conditionMessage(e), "\n")
+      return(NULL)
+    })
+    
+    if (is.null(wf) || !is.list(wf) || !file.exists(wf$path)) {
+      cat("[CATALOG] range file was not created\n")
+      return(NULL)
+    }
+    
+    # ------------------------------------------------------------
+    # Preview text
+    # ------------------------------------------------------------
+    output$ranges_preview <- renderText({
+      thr_label <- if (identical(cluster_method_now, "window")) {
+        paste0("pthr=", input$pthr %||% NA)
+      } else {
+        paste0("min_logp=", input$min_logp %||% NA)
+      }
+      
+      paste0(
+        "method=", cluster_method_now,
+        if (!is.na(hits_mode_now) && nzchar(hits_mode_now)) paste0(" | hits_mode=", hits_mode_now) else "",
+        " | ", thr_label,
+        " | flank=", input$flank %||% NA, " bp\n",
+        "Clusters: ", nrow(clusters), "\n",
+        "Range file: ", wf$path, "\n\n",
+        paste(head(wf$lines, 10), collapse = "\n")
+      )
+    })
+    
+    cat("[CATALOG] range file created:", wf$path, "\n")
+    cat("[CATALOG] done\n")
+    
+    showNotification(
+      "Clusters generated (canonical). Run Step 4 to assign Catalog hits.",
+      type = "message",
+      duration = 4
+    )
+    
+  }, ignoreInit = TRUE, priority = -100)
+  
+  # reemplaca observeEvent(input$build_ranges
+  observeEvent(clusters_val(), {
+    
+    clusters <- tryCatch(clusters_val(), error = function(e) NULL)
+    
+    if (!is.data.frame(clusters) || nrow(clusters) == 0) {
+      return(NULL)
+    }
+    
+    cat("\n[CATALOG] clusters_val() changed\n")
+    cat("[CATALOG] clusters received:", nrow(clusters), "\n")
+    
+    if (!is.data.frame(clusters) || nrow(clusters) == 0) {
+      cat("[CATALOG] No clusters available in clusters_val()\n")
+      return(NULL)
+    }
+    
+    cat("[CATALOG] clusters received:", nrow(clusters), "\n")
+    cat("[CATALOG] cluster cols:", paste(names(clusters), collapse = ", "), "\n")
     
     # Reset downstream (Catalog outputs)
     catalog_final_path_csv(NULL)
     catalog_final_path_rds(NULL)
     
-    # Read clusters computed by the canonical engine
-    clusters <- clusters_val()
-    validate(need(is.data.frame(clusters) && nrow(clusters) > 0, "No clusters generated."))
+    if (!exists("workdir") || is.null(workdir) || length(workdir) == 0 || !nzchar(workdir)) {
+      showNotification("workdir is not defined.", type = "error", duration = 6)
+      cat("[CATALOG] workdir is missing or empty\n")
+      return(NULL)
+    }
     
-    # Ensure workdir exists
-    validate(need(exists("workdir") && nzchar(workdir), "workdir is not defined."))
-    if (!dir.exists(workdir)) dir.create(workdir, recursive = TRUE, showWarnings = FALSE)
+    if (!dir.exists(workdir)) {
+      dir.create(workdir, recursive = TRUE, showWarnings = FALSE)
+    }
     
     write_range_file <- function(clusters_df) {
       cl <- as.data.frame(clusters_df)
-      if (!"chr"   %in% names(cl) && "CHR"      %in% names(cl)) cl$chr   <- cl$CHR
-      if (!"start" %in% names(cl) && "start_bp" %in% names(cl)) cl$start <- cl$start_bp
-      if (!"end"   %in% names(cl) && "end_bp"   %in% names(cl)) cl$end   <- cl$end_bp
       
-      validate(need(all(c("chr","start","end","cluster_id") %in% names(cl)),
-                    "clusters must contain chr/start/end/cluster_id."))
+      if (!"chr"        %in% names(cl) && "CHR"         %in% names(cl)) cl$chr <- cl$CHR
+      if (!"start"      %in% names(cl) && "start_bp"    %in% names(cl)) cl$start <- cl$start_bp
+      if (!"end"        %in% names(cl) && "end_bp"      %in% names(cl)) cl$end <- cl$end_bp
+      if (!"cluster_id" %in% names(cl) && "cluster"     %in% names(cl)) cl$cluster_id <- cl$cluster
+      if (!"cluster_id" %in% names(cl) && "id"          %in% names(cl)) cl$cluster_id <- cl$id
+      
+      missing_cols <- setdiff(c("chr", "start", "end", "cluster_id"), names(cl))
+      if (length(missing_cols) > 0) {
+        stop(
+          paste0(
+            "clusters must contain chr/start/end/cluster_id. Missing: ",
+            paste(missing_cols, collapse = ", ")
+          )
+        )
+      }
+      
+      chr_num <- suppressWarnings(as.integer(gsub("^chr", "", as.character(cl$chr), ignore.case = TRUE)))
+      start_i <- suppressWarnings(as.integer(cl$start))
+      end_i   <- suppressWarnings(as.integer(cl$end))
+      cid     <- as.character(cl$cluster_id)
+      
+      bad_rows <- which(
+        is.na(chr_num) |
+          is.na(start_i) |
+          is.na(end_i) |
+          !nzchar(cid)
+      )
+      
+      if (length(bad_rows) > 0) {
+        stop(
+          paste0(
+            "Invalid cluster rows for range export: ",
+            paste(utils::head(bad_rows, 10), collapse = ", ")
+          )
+        )
+      }
       
       lines <- sprintf(
         "%s %d %d %s",
-        chr_label_plink(as.integer(cl$chr)),
-        as.integer(cl$start),
-        as.integer(cl$end),
-        as.character(cl$cluster_id)
+        chr_label_plink(chr_num),
+        start_i,
+        end_i,
+        cid
       )
       
       rng_path <- file.path(workdir, "selected_intervals.range")
       writeLines(lines, rng_path)
+      
       list(lines = lines, path = rng_path)
     }
     
     sid <- gi_sid(session)
     p   <- gi_state_paths(sid)
+    
     write_params_rds(
       sid = sid,
       input = input,
@@ -1798,59 +2092,92 @@ server <- function(input, output, session) {
       ok_save <<- FALSE
       cat("[GI][MASTER] could not save clusters rds:", conditionMessage(e), "\n")
     })
-    validate(need(ok_save && file.exists(p$clus), "Failed to save clusters RDS (sync cannot proceed)."))
+    
+    if (!ok_save || !file.exists(p$clus)) {
+      showNotification("Failed to save clusters RDS (sync cannot proceed).", type = "error", duration = 8)
+      cat("[CATALOG] Failed to save clusters RDS\n")
+      return(NULL)
+    }
     
     st0 <- gi_read_state(sid)
     if (is.null(st0) || !is.list(st0)) st0 <- list()
     
+    cluster_method_now <- as.character(input$cluster_method %||% "window")
+    hits_mode_now      <- as.character(input$hits_mode %||% NA_character_)
+    
+    thr_type_now <- if (identical(cluster_method_now, "window")) "pthr" else "min_logp"
+    thr_value_now <- if (identical(cluster_method_now, "window")) {
+      as.numeric(input$pthr %||% NA_real_)
+    } else {
+      as.numeric(input$min_logp %||% NA_real_)
+    }
+    
     new_stamp <- gi_bump_stamp(st0$stamp %||% 0)
     
     st_new <- modifyList(st0, list(
-      stamp        = new_stamp,
-      sid          = sid,
-      updated_at   = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-      has_gwas     = TRUE,
-      gwas_rds     = p$gwas,
-      has_clusters = TRUE,
-      clusters_rds = p$clus,
-      clus_rds     = p$clus,
-      params_rds   = p$params,
-      cluster_method = as.character(input$cluster_method %||% "window"),
-      hits_mode      = as.character(input$hits_mode %||% NA_character_),
-      thr_type  = if (identical(input$cluster_method %||% "window", "window")) "pthr" else "min_logp",
-      thr_value = if (identical(input$cluster_method %||% "window", "window")) {
-        as.numeric(input$pthr %||% NA_real_)
-      } else {
-        as.numeric(input$min_logp %||% NA_real_)
-      },
-      pthr     = as.numeric(input$pthr %||% NA_real_),
-      min_logp = as.numeric(input$min_logp %||% NA_real_),
-      flank_bp = as.integer(input$flank %||% 0L),
-      flank    = as.integer(input$flank %||% 0L),
-      min_hits = as.integer(min_hits_active() %||% NA_integer_),
-      win_bp   = as.integer(input$win_bp %||% NA_integer_),
-      step_bp  = as.integer(input$step_bp %||% NA_integer_)
+      stamp          = new_stamp,
+      sid            = sid,
+      updated_at     = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      has_gwas       = TRUE,
+      gwas_rds       = p$gwas,
+      has_clusters   = TRUE,
+      clusters_rds   = p$clus,
+      clus_rds       = p$clus,
+      params_rds     = p$params,
+      cluster_method = cluster_method_now,
+      hits_mode      = hits_mode_now,
+      thr_type       = thr_type_now,
+      thr_value      = thr_value_now,
+      pthr           = as.numeric(input$pthr %||% NA_real_),
+      min_logp       = as.numeric(input$min_logp %||% NA_real_),
+      flank_bp       = as.integer(input$flank %||% 0L),
+      flank          = as.integer(input$flank %||% 0L),
+      min_hits       = as.integer(min_hits_active() %||% NA_integer_),
+      win_bp         = as.integer(input$win_bp %||% NA_integer_),
+      step_bp        = as.integer(input$step_bp %||% NA_integer_)
     ))
     
     gi_write_state(sid, st_new)
     
-    wf <- write_range_file(clusters)
+    wf <- tryCatch({
+      write_range_file(clusters)
+    }, error = function(e) {
+      showNotification(
+        paste("Failed to build intervals:", conditionMessage(e)),
+        type = "error", duration = 8
+      )
+      cat("[CATALOG] write_range_file failed:", conditionMessage(e), "\n")
+      NULL
+    })
+    
+    if (is.null(wf) || !file.exists(wf$path)) {
+      cat("[CATALOG] range file was not created\n")
+      return(NULL)
+    }
     
     output$ranges_preview <- renderText({
+      thr_label <- if (identical(cluster_method_now, "window")) {
+        paste0("pthr=", input$pthr %||% NA)
+      } else {
+        paste0("min_logp=", input$min_logp %||% NA)
+      }
+      
       paste0(
-        "thr=", input$pthr, " | flank=", input$flank, " bp\n",
-        "Clusters: ", nrow(clusters), "\n\n",
+        "method=", cluster_method_now,
+        if (!is.na(hits_mode_now) && nzchar(hits_mode_now)) paste0(" | hits_mode=", hits_mode_now) else "",
+        " | ", thr_label,
+        " | clusters=", nrow(clusters), "\n\n",
         paste(head(wf$lines, 10), collapse = "\n")
       )
     })
     
     showNotification(
       "Clusters generated (canonical). Run Step 4 to assign Catalog hits.",
-      type = "message", duration = 4
+      type = "message",
+      duration = 4
     )
     
   }, ignoreInit = TRUE, priority = -100)
-  
   
   # ---------------------------------------------------------------------------
   # Manhattan helpers
