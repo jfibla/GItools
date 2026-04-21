@@ -92,21 +92,22 @@ stopifnot(file.exists(gi_state_file))
 source(gi_state_file, local = TRUE)
 
 # Catalog as MASTER: write parameters for slaves
-write_params_rds <- function(sid, input, extra = list()) {
+write_params_rds <- function(sid, input, min_hits_value = NULL, extra = list()) {
   stopifnot(nzchar(sid))
   p <- gi_state_paths(sid)$params
+  
   par <- c(list(
     stamp          = as.integer(Sys.time()),
     cluster_method = input$cluster_method %||% NULL,
     hits_mode      = input$hits_mode %||% NULL,
-    thr_type = if (identical(input$cluster_method, "window")) "pthr" else "min_logp",
+    thr_type       = if (identical(input$cluster_method, "window")) "pthr" else "min_logp",
     thr_value      = if (identical(input$cluster_method, "window")) (input$pthr %||% NULL) else (input$min_logp %||% NULL),
     pthr           = input$pthr %||% NULL,
     min_logp       = input$min_logp %||% NULL,
     flank_bp       = input$flank %||% NULL,
     win_bp         = input$win_bp %||% NULL,
     step_bp        = input$step_bp %||% NULL,
-    min_hits       = input$min_hits %||% NULL
+    min_hits       = as.integer(min_hits_value %||% 3L)
   ), extra)
   
   saveRDS(par, p)
@@ -677,8 +678,21 @@ ui <- navbarPage(
         # Method: window
         conditionalPanel(
           condition = "input.cluster_method == 'window'",
-          sliderInput("pthr", "-log10(P) threshold", min = 2, max = 20, value = 8, step = 0.5),
-          numericInput("flank", "Flank (+/- bp)", value = 10000, min = 0, max = 10000000, step = 1000)
+          sliderInput(
+            "pthr",
+            "-log10(P) threshold",
+            min = 2, max = 20, value = 8, step = 0.5
+          ),
+          numericInput(
+            "flank",
+            "Flank (+/- bp)",
+            value = 10000, min = 0, max = 10000000, step = 1000
+          ),
+          numericInput(
+            "min_hits_window",
+            "Minimum GWAS hits per cluster",
+            value = 3, min = 1, max = 1000, step = 1
+          )
         ),
         
         # Method: hits (3 submodes)
@@ -702,7 +716,7 @@ ui <- navbarPage(
           ),
           
           numericInput(
-            "min_hits",
+            "min_hits_hits",
             "Minimum GWAS hits per cluster/window",
             value = 3, min = 1, max = 1000, step = 1
           ),
@@ -715,7 +729,11 @@ ui <- navbarPage(
           
           conditionalPanel(
             condition = "input.hits_mode == 'sliding'",
-            numericInput("step_bp", "Step (bp)", value = 1e5, min = 1e3, max = 5e7, step = 1e3)
+            numericInput(
+              "step_bp",
+              "Step (bp)",
+              value = 1e5, min = 1e3, max = 5e7, step = 1e3
+            )
           ),
           
           conditionalPanel(
@@ -1622,6 +1640,16 @@ server <- function(input, output, session) {
   })
   #==========================================================================
   
+  min_hits_active <- reactive({
+    if (identical(input$cluster_method, "window")) {
+      input$min_hits_window %||% 3
+    } else {
+      input$min_hits_hits %||% 3
+    }
+  })
+  
+  #==========================================================================
+  
   # --- IMPORTANT: only allow build_clusters in NEW mode (so canonical observer doesn't run in OLD) ---
   gwas_df_for_clustering <- reactive({
     gwas_df()
@@ -1637,27 +1665,78 @@ server <- function(input, output, session) {
     app_count_col  = "n_catalog"
   )
   
+  # ---------------------------------------------------------------------------
+  # SAVE GWAS (Catalog as MASTER → expose to slaves)
+  # ---------------------------------------------------------------------------
+  
+  observeEvent(rv$gwas, {
+    req(rv$gwas)
+    
+    sid <- gi_sid(session)
+    if (is.null(sid) || !nzchar(sid)) return()
+    
+    gwas_df <- data.table::copy(rv$gwas)
+    
+    # --- compatibilitat: assegurar columna P ---
+    if (!"P" %in% names(gwas_df) && "Pval" %in% names(gwas_df)) {
+      gwas_df[, P := Pval]
+    }
+    
+    # --- path ---
+    p <- gi_state_paths(sid)
+    gwas_path <- file.path(dirname(p$params), paste0("gwas_", sid, ".rds"))
+    
+    # --- save ---
+    saveRDS(gwas_df, gwas_path)
+    
+    cat("[SAVE] GWAS saved:", gwas_path, "\n")
+    
+    # --- update state.json (CLAU!) ---
+    st0 <- gi_read_state(sid)
+    if (!is.list(st0)) st0 <- list()
+    
+    st_new <- modifyList(st0, list(
+      gwas_rds  = gwas_path,
+      stamp     = gi_bump_stamp(st0$stamp %||% 0),
+      updated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    ))
+    
+    gi_write_state(sid, st_new)
+    
+  }, ignoreInit = TRUE)
+  
   # Catalog as MASTER, read params for slaves
   observeEvent(
     list(input$cluster_method, input$hits_mode,
          input$pthr, input$min_logp,
-         input$flank, input$win_bp, input$step_bp, input$min_hits),
+         input$flank, input$win_bp, input$step_bp,
+         input$min_hits_window, input$min_hits_hits),
     {
       sid <- gi_sid(session)
       if (is.null(sid) || !nzchar(sid)) return()
       
-      # escriu params RDS
-      write_params_rds(sid, input)
+      min_hits_value <- if (identical(input$cluster_method, "window")) {
+        input$min_hits_window %||% 3
+      } else {
+        input$min_hits_hits %||% 3
+      }
       
-      # bump stamp al JSON perquè els slaves s’assabentin (CLAU)
+      write_params_rds(
+        sid = sid,
+        input = input,
+        min_hits_value = as.integer(min_hits_active() %||% 3L)
+      )
+      
       p   <- gi_state_paths(sid)
-      st0 <- gi_read_state(sid); if (!is.list(st0)) st0 <- list()
+      st0 <- gi_read_state(sid)
+      if (!is.list(st0)) st0 <- list()
       
       st_new <- modifyList(st0, list(
         params_rds = p$params,
         stamp      = gi_bump_stamp(st0$stamp %||% 0),
         updated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S")
       ))
+      
       gi_write_state(sid, st_new)
     },
     ignoreInit = TRUE
@@ -1706,7 +1785,11 @@ server <- function(input, output, session) {
     
     sid <- gi_sid(session)
     p   <- gi_state_paths(sid)
-    write_params_rds(sid, input)
+    write_params_rds(
+      sid = sid,
+      input = input,
+      min_hits_value = min_hits_active()
+    )
     
     ok_save <- TRUE
     tryCatch({
@@ -1744,7 +1827,7 @@ server <- function(input, output, session) {
       min_logp = as.numeric(input$min_logp %||% NA_real_),
       flank_bp = as.integer(input$flank %||% 0L),
       flank    = as.integer(input$flank %||% 0L),
-      min_hits = as.integer(input$min_hits %||% NA_integer_),
+      min_hits = as.integer(min_hits_active() %||% NA_integer_),
       win_bp   = as.integer(input$win_bp %||% NA_integer_),
       step_bp  = as.integer(input$step_bp %||% NA_integer_)
     ))
