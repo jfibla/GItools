@@ -257,8 +257,18 @@ read_manifest_safe <- function(session_dir) {
 manifest_to_display_df <- function(manifest) {
   if (is.null(manifest) || !is.list(manifest)) {
     return(tibble::tibble(
-      field = c("session_id", "gwas_session_file", "cluster_method", "threshold_used", "apps_present", "created_at", "last_updated"),
-      value = c(NA, NA, NA, NA, NA, NA, NA)
+      field = c(
+        "session_id",
+        "gwas_session_file",
+        "cluster_method",
+        "hits_mode",
+        "threshold_used",
+        "min_hits",
+        "apps_present",
+        "created_at",
+        "last_updated"
+      ),
+      value = c(NA, NA, NA, NA, NA, NA, NA, NA, NA)
     ))
   }
   
@@ -267,7 +277,9 @@ manifest_to_display_df <- function(manifest) {
       "session_id",
       "gwas_session_file",
       "cluster_method",
+      "hits_mode",
       "threshold_used",
+      "min_hits",
       "apps_present",
       "created_at",
       "last_updated"
@@ -276,7 +288,9 @@ manifest_to_display_df <- function(manifest) {
       paste(manifest$session_id %||% "", collapse = " | "),
       paste(as.character(manifest$gwas_session_file %||% ""), collapse = " | "),
       paste(as.character(manifest$cluster_method %||% ""), collapse = " | "),
+      paste(as.character(manifest$hits_mode %||% ""), collapse = " | "),
       paste(as.character(manifest$threshold_used %||% ""), collapse = " | "),
+      paste(as.character(manifest$min_hits %||% ""), collapse = " | "),
       paste(as.character(manifest$apps_present %||% ""), collapse = "; "),
       paste(as.character(manifest$created_at %||% ""), collapse = " | "),
       paste(as.character(manifest$last_updated %||% ""), collapse = " | ")
@@ -11796,108 +11810,9 @@ function(data, row, column, node){
   
   ############################# END GENE NETWORKS ##############################
   ##############################################################################
-  ############################## GENE NETWORKS TABLES ##########################
-  # ============================================================
-  # GENE–PATHWAY TABLES
-  # ============================================================
-  
-  gene_pathway_nodes_df <- reactive({
-    nw <- gene_pathway_network_obj()
-    
-    validate(
-      need(is.list(nw), "Pathway network object not available."),
-      need(is.data.frame(nw$nodes) && nrow(nw$nodes) > 0, "No pathway nodes available.")
-    )
-    
-    nw$nodes %>%
-      dplyr::mutate(
-        score = round(as.numeric(score), 3),
-        node_class = dplyr::case_when(
-          node_type == "pathway" ~ "pathway",
-          grepl("physical", gene_link_mode) & grepl("effect", gene_link_mode) ~ "position+effect",
-          grepl("physical", gene_link_mode) ~ "position",
-          grepl("effect", gene_link_mode) ~ "effect",
-          TRUE ~ "gene"
-        )
-      ) %>%
-      dplyr::arrange(node_type, dplyr::desc(score), label) %>%
-      dplyr::rename(
-        node_id = id,
-        node_label = label,
-        node_score = score
-      )
-  })
-  
-  gene_pathway_edges_df <- reactive({
-    nw <- gene_pathway_network_obj()
-    
-    validate(
-      need(is.list(nw), "Pathway network object not available."),
-      need(is.data.frame(nw$edges) && nrow(nw$edges) > 0, "No pathway edges available.")
-    )
-    
-    nw$edges %>%
-      dplyr::mutate(
-        p_adjust = round(as.numeric(p_adjust), 6),
-        pathway_count = as.integer(pathway_count)
-      ) %>%
-      dplyr::arrange(p_adjust, dplyr::desc(pathway_count), from, to)
-  })
-  
-  # ============================================================
-  # PPI TABLES
-  # ============================================================
-  
-  gene_ppi_nodes_df <- reactive({
-    nw <- gene_ppi_network_obj()
-    
-    validate(
-      need(is.list(nw), "PPI network object not available."),
-      need(is.data.frame(nw$nodes) && nrow(nw$nodes) > 0, "No PPI nodes available."),
-      need(is.data.frame(nw$edges) && nrow(nw$edges) > 0, "No PPI edges available.")
-    )
-    
-    g <- igraph::graph_from_data_frame(
-      d = nw$edges,
-      vertices = nw$nodes,
-      directed = FALSE
-    )
-    
-    tibble::tibble(
-      gene = igraph::V(g)$name,
-      degree = as.integer(igraph::degree(g)),
-      gene_score = round(as.numeric(igraph::V(g)$score), 3),
-      gene_link_mode = dplyr::coalesce(as.character(igraph::V(g)$gene_link_mode), ""),
-      gene_evidence_types = dplyr::coalesce(as.character(igraph::V(g)$gene_evidence_types), ""),
-      gene_source_apps = dplyr::coalesce(as.character(igraph::V(g)$gene_source_apps), ""),
-      apps_supported = dplyr::coalesce(as.character(igraph::V(g)$apps_supported), "")
-    ) %>%
-      dplyr::mutate(
-        node_class = dplyr::case_when(
-          grepl("physical", gene_link_mode) & grepl("effect", gene_link_mode) ~ "position+effect",
-          grepl("physical", gene_link_mode) ~ "position",
-          grepl("effect", gene_link_mode) ~ "effect",
-          TRUE ~ "gene"
-        )
-      ) %>%
-      dplyr::arrange(dplyr::desc(degree), dplyr::desc(gene_score), gene)
-  })
-  
-  gene_ppi_edges_df <- reactive({
-    nw <- gene_ppi_network_obj()
-    
-    validate(
-      need(is.list(nw), "PPI network object not available."),
-      need(is.data.frame(nw$edges) && nrow(nw$edges) > 0, "No PPI edges available.")
-    )
-    
-    nw$edges %>%
-      dplyr::arrange(from, to) %>%
-      dplyr::mutate(
-        edge_type = "ppi"
-      ) %>%
-      dplyr::select(from, to, edge_type)
-  })
+
+  ############################## GENE NETWORKS TABLES ###########################
+  ##############################################################################
   
   # ============================================================
   # DT HELPERS
@@ -11937,7 +11852,7 @@ function(data, row, column, node){
   
   empty_dt_msg <- function(msg) {
     DT::datatable(
-      data.frame(Message = msg),
+      data.frame(Message = msg, check.names = FALSE),
       rownames = FALSE,
       options = list(dom = "t")
     )
@@ -12040,9 +11955,7 @@ function(data, row, column, node){
     
     nw$edges %>%
       dplyr::arrange(from, to) %>%
-      dplyr::mutate(
-        edge_type = "ppi"
-      ) %>%
+      dplyr::mutate(edge_type = "ppi") %>%
       dplyr::select(from, to, edge_type)
   })
   
@@ -12311,8 +12224,9 @@ function(data, row, column, node){
     )
   }, server = FALSE)
   
-  ############################## END GENE NETWORKS TABLES ######################
-  
+  ############################ END GENE NETWORK TABLES ##########################
+  ##############################################################################
+
   # ============================================================
   # MODAL NETWORK PLOT
   # ============================================================
@@ -12406,6 +12320,21 @@ function(data, row, column, node){
                 shiny::tags$p(
                   "Gene scores are derived from prioritized GWAS hits linked to each gene (MATCH or MARKER). ",
                   "Only genes with non-zero gene score contribute to network ranking."
+                ),
+                shiny::tags$div(
+                  style = paste(
+                    "background:#fff8cc;",
+                    "border:1px solid #e6d97a;",
+                    "border-radius:8px;",
+                    "padding:10px 12px;",
+                    "margin:8px 0 12px 0;",
+                    "color:#5c4b00;"
+                  ),
+                  shiny::tags$b(
+                    "Gene and PPI network generation may take a few seconds depending on data size. Please wait…"
+                  ),
+                  shiny::tags$br(),
+                  "Tables will become available after the network plots finish rendering."
                 )
               )
             )
