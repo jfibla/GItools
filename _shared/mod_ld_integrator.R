@@ -7168,7 +7168,7 @@ ld_integrator_module_server <- function(
         
         rr_track <- tryCatch({
           recomb_path <- normalizePath(
-            file.path(getwd(), "www", "recomb_decode_avg.bedGraph"),
+            file.path(getwd(), "www", "recomb1000GAvg.hg38.processed.rds"),
             mustWork = FALSE
           )
           
@@ -7176,20 +7176,14 @@ ld_integrator_module_server <- function(
             append_log("[RECOMB] file not found: ", recomb_path)
             tibble::tibble()
           } else {
-            rr_lines <- readLines(recomb_path, warn = FALSE)
-            rr_lines <- rr_lines[grepl("^chr", rr_lines)]
             
-            rr <- readr::read_tsv(
-              paste(rr_lines, collapse = "\n"),
-              col_names = c("chr", "start", "end", "rate"),
-              col_types = readr::cols(
-                chr = readr::col_character(),
-                start = readr::col_double(),
-                end = readr::col_double(),
-                rate = readr::col_double()
-              ),
-              show_col_types = FALSE
-            ) %>%
+            rr <- readRDS(recomb_path) %>%
+              dplyr::transmute(
+                chr = as.character(.data$chr),
+                start = suppressWarnings(as.numeric(.data$start)),
+                end = suppressWarnings(as.numeric(.data$end)),
+                rate = suppressWarnings(as.numeric(.data$rec_rate_cM_Mb))
+              ) %>%
               dplyr::filter(
                 !is.na(.data$chr),
                 is.finite(.data$start),
