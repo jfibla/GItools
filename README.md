@@ -120,6 +120,7 @@ Links GWAS hits to GTEx eQTLs for tissue-aware functional interpretation.
 
 **Pipeline**  
 threshold → intervals → clusters → map eQTLs per cluster
+
 =======
 Adds **functional (expression-based) evidence**.
 
@@ -168,18 +169,6 @@ threshold → intervals → clusters → map NonSyn variants + annotations
 - Cluster summary (`n_nonsyn`)
 - Detailed variant annotations (HGVSc/HGVSp, MANE, canonical flags)
 - Reporting-ready exports
-
----
-
-### LD Inspector
-Exploration of linkage disequilibrium and haplotype structure aligned to clusters.
-
-**Outputs**
-- LD matrices and blocks
-- Regional LD visualization aligned to clusters
-- Cluster-aware regional LD context for follow-up interpretation
-=======
-Functional prioritization of variants.
 
 ---
 
