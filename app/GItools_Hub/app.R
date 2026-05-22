@@ -42,16 +42,37 @@ message("[hub] HUB_DIR  = ", HUB_DIR)
 message("[hub] APPS_DIR = ", APPS_DIR)
 message("[hub] APPS_DIR contents: ", paste(list.files(APPS_DIR), collapse=", "))
 
+#############################
+
+gi_public_base_url <- function() {
+  x <- Sys.getenv("GI_PUBLIC_BASE_URL", unset = "")
+  x <- trimws(x)
+  x <- sub("/+$", "", x)
+  x
+}
+
+gi_app_url <- function(app_slug, local_port) {
+  base <- gi_public_base_url()
+  
+  if (nzchar(base)) {
+    return(paste0(base, "/", app_slug))
+  }
+  
+  paste0("http://127.0.0.1:", local_port)
+}
+
+#############################
+
 # ---- Ports (portable) ----
 APP_PORT_BASE <- 7200 
 
 apps <- list(
-  hub        = list(name="🧭 GItools Hub",            dir=HUB_DIR,                                  port=7101),
+  hub        = list(name="🕸️ GItools Hub",            dir=HUB_DIR,                                  port=7101),
   catalog    = list(name="📚 Catalog Inspector",      dir=file.path(APPS_DIR, "Catalog_inspector"), port=APP_PORT_BASE + 1),
   gtex       = list(name="🧠 GTEx Inspector",         dir=file.path(APPS_DIR, "GTEX_inspector"),    port=APP_PORT_BASE + 2),
   nonsyn     = list(name="🧬 NonSyn Inspector",       dir=file.path(APPS_DIR, "NonSyn_Inspector"),  port=APP_PORT_BASE + 3),
+  ewasdis    = list(name="🧫 EWASdis Inspector",      dir=file.path(APPS_DIR, "EWAS_disease"),      port=APP_PORT_BASE + 5),
   ewastum    = list(name="🧪 EWAStum Inspector",      dir=file.path(APPS_DIR, "EWAS_cancer"),       port=APP_PORT_BASE + 4),
-  ewasdis    = list(name="🧫 EWASDis Inspector",      dir=file.path(APPS_DIR, "EWAS_disease"),      port=APP_PORT_BASE + 5),
   integrator = list(name="🧩 Integrator Inspector",   dir=file.path(APPS_DIR, "Integrator_Inspector"), port=APP_PORT_BASE + 6)
 )
 
@@ -85,7 +106,7 @@ hub_log("[hub] RSCRIPT = ", RSCRIPT, " exists=", file.exists(RSCRIPT))
 #}
 
 PID_FILE <- file.path(LOG_DIR, "_pids_gitools.rds")
-RSCRIPT  <- file.path(R.home("bin"), "Rscript")
+# RSCRIPT  <- file.path(R.home("bin"), "Rscript")
 
 busy_css <- "
 .gitools-spinner {
@@ -174,6 +195,9 @@ start_app_bg <- function(key, app_dir, port, log_dir = NULL) {
   app_dir_q <- paste0('"', gsub("\\\\", "/", app_dir), '"')
   
   runner_txt <- c(
+    "Sys.unsetenv('SHINY_PORT')",
+    "Sys.unsetenv('SHINY_HOST')",
+    "Sys.unsetenv('PORT')",
     "options(shiny.port = NULL)",
     "options(shiny.host = NULL)",
     sprintf('Sys.setenv(GITOOLS_LOG_DIR = "%s")', gsub("\\\\", "/", log_dir)),
@@ -209,10 +233,29 @@ start_app_bg <- function(key, app_dir, port, log_dir = NULL) {
 
 
 kill_by_port <- function(port) {
-  pid <- find_listen_pid(port)
-  if (!is.finite(pid)) return(FALSE)
-  suppressWarnings(system2("kill", c("-15", as.character(pid)), stdout = NULL, stderr = NULL))
-  TRUE
+  port <- as.integer(port)
+  
+  pids <- suppressWarnings(tryCatch(
+    system2(
+      "lsof",
+      c("-tiTCP", paste0(":", port), "-sTCP:LISTEN"),
+      stdout = TRUE,
+      stderr = FALSE
+    ),
+    error = function(e) character(0)
+  ))
+  
+  pids <- unique(trimws(pids))
+  pids <- pids[nzchar(pids)]
+  
+  if (!length(pids)) return(FALSE)
+  
+  for (pid in pids) {
+    suppressWarnings(system2("kill", c("-9", pid), stdout = NULL, stderr = NULL))
+  }
+  
+  Sys.sleep(0.5)
+  !is_port_listening(port)
 }
 
 open_many_js <- function(url_vec) {
@@ -224,6 +267,7 @@ open_many_js <- function(url_vec) {
 
 
 ui <- fluidPage(
+  title =   HTML("🕸️ GItools Hub"),
   tags$head(
     tags$style(HTML(busy_css)),
     tags$script(HTML("
@@ -321,6 +365,24 @@ server <- function(input, output, session) {
   
   BANNER_MIN_SECS <- 2.5   # <- ajusta: 2.0 / 3.0 segons el que vulguis
   
+  observe({
+    req(isTRUE(buttons_ready()))
+    req(isTRUE(status_ready()))
+    
+    elapsed <- as.numeric(difftime(Sys.time(), banner_started, units = "secs"))
+    wait_left <- max(0, BANNER_MIN_SECS - elapsed)
+    
+    if (wait_left > 0) {
+      invalidateLater(ceiling(wait_left * 1000), session)
+      return()
+    }
+    
+    if (!isTRUE(banner_hidden())) {
+      session$sendCustomMessage("hub_banner", list(show = FALSE))
+      banner_hidden(TRUE)
+    }
+  })
+  
   # --- SID builder ---
   sid <- reactiveVal(NULL)
   observeEvent(TRUE, {
@@ -363,33 +425,108 @@ server <- function(input, output, session) {
   }
   
   base_url_for_port <- function(port) {
-    port <- as.integer(port)
-    mode <- Sys.getenv("GITOOLS_URL_MODE", unset = "")
-    ng   <- read_ngrok_urls()
-    
-    # Use ngrok if mode says so OR if mapping exists
-    if ((identical(tolower(mode), "ngrok") || length(ng)) && length(ng)) {
-      u <- ng[[as.character(port)]] %||% ""
-      if (nzchar(u)) return(u)
-    }
-    sprintf("http://127.0.0.1:%d", port)
+    sprintf("http://127.0.0.1:%d", as.integer(port))
   }
- 
+  
+  url_for_app_key <- function(key) {
+    local_port <- apps[[key]]$port
+    
+    route <- switch(
+      key,
+      catalog    = "catalog",
+      gtex       = "gtex",
+      nonsyn     = "nonsyn",
+      ewasdis    = "ewasdis",
+      ewastum    = "ewastum",
+      integrator = "integrator",
+      hub        = "",
+      key
+    )
+    
+    base <- gi_public_base_url()
+    
+    if (nzchar(base)) {
+      if (nzchar(route)) {
+        return(paste0(base, "/", route))
+      } else {
+        return(base)
+      }
+    }
+    
+    paste0("http://127.0.0.1:", local_port)
+  }
+  
   urls_ui <- reactive({
     s <- sid()
     
     list(
-      catalog    = paste0(base_url_for_port(apps$catalog$port),    "/?sid=", s),
-      gtex       = paste0(base_url_for_port(apps$gtex$port),       "/?sid=", s),
-      nonsyn     = paste0(base_url_for_port(apps$nonsyn$port),     "/?sid=", s),
-      ewastum    = paste0(base_url_for_port(apps$ewastum$port),    "/?sid=", s),
-      ewasdis    = paste0(base_url_for_port(apps$ewasdis$port),    "/?sid=", s),
-      integrator = paste0(base_url_for_port(apps$integrator$port), "/?sid=", s)
+      catalog    = paste0(url_for_app_key("catalog"),    "?sid=", s),
+      gtex       = paste0(url_for_app_key("gtex"),       "?sid=", s),
+      nonsyn     = paste0(url_for_app_key("nonsyn"),     "?sid=", s),
+      ewasdis    = paste0(url_for_app_key("ewasdis"),    "?sid=", s),
+      ewastum    = paste0(url_for_app_key("ewastum"),    "?sid=", s),
+      integrator = paste0(url_for_app_key("integrator"), "?sid=", s)
     )
   })
   
   output$sid_txt <- renderText(sid() %||% "")
   
+  output$open_buttons_ui <- renderUI({
+    req(sid())
+    
+    u <- urls_ui()
+    
+    if (!isTRUE(buttons_ready())) {
+      buttons_ready(TRUE)
+    }
+    
+    tagList(
+      tags$a(
+        "📚 Catalog (MASTER)",
+        href = u$catalog,
+        target = "_blank",
+        class = "btn btn-primary",
+        style = btn_style
+      ),
+      tags$a(
+        "🧠 GTEx (SLAVE)",
+        href = u$gtex,
+        target = "_blank",
+        class = "btn btn-success",
+        style = btn_style
+      ),
+      tags$a(
+        "🧬 NonSyn (SLAVE)",
+        href = u$nonsyn,
+        target = "_blank",
+        class = "btn btn-success",
+        style = btn_style
+      ),
+      tags$a(
+        "🧫 EWASdis (SLAVE)",
+        href = u$ewasdis,
+        target = "_blank",
+        class = "btn btn-success",
+        style = btn_style
+      ),
+      tags$a(
+        "🧪 EWAStum (SLAVE)",
+        href = u$ewastum,
+        target = "_blank",
+        class = "btn btn-success",
+        style = btn_style
+      ),
+      tags$a(
+        "🧩 Integrator",
+        href = u$integrator,
+        target = "_blank",
+        class = "btn btn-warning",
+        style = btn_style
+      )
+    )
+  })
+  
+###############################
   rv <- reactiveValues(
     pids = read_pids(),
     last_status = NULL,
@@ -409,163 +546,169 @@ server <- function(input, output, session) {
     )
   })
   
-  
-  # ✅ This controls the banner closing exactly when open_buttons_ui is rendered
-  banner_hidden <- reactiveVal(FALSE)
-  
-  output$open_buttons_ui <- renderUI({
-    u <- urls_ui()
-    
-    if (!isTRUE(buttons_ready())) buttons_ready(TRUE)
-    
-    tagList(
-      tags$a("📚 Catalog (MASTER)",        href=u$catalog,    target="_blank", class="btn btn-primary", style=btn_style),
-      tags$a("🧠 GTEx (SLAVE)",            href=u$gtex,       target="_blank", class="btn btn-success", style=btn_style),
-      tags$a("🧬 NonSyn (SLAVE)",          href=u$nonsyn,     target="_blank", class="btn btn-success", style=btn_style),
-      tags$a("🧫 EWASDis (SLAVE)",         href=u$ewasdis,    target="_blank", class="btn btn-success", style=btn_style),
-      tags$a("🧪 EWAStum (SLAVE)",         href=u$ewastum,    target="_blank", class="btn btn-success", style=btn_style),
-      tags$a("🧩 Integrator",    href=u$integrator, target="_blank", class="btn btn-warning", style=btn_style)
-    )
-  })
-  
-  # --- Status computation (light + stable) ---
   compute_status <- function() {
     rows <- lapply(names(apps), function(key) {
       info <- apps[[key]]
-      url  <- sprintf("http://127.0.0.1:%d/", info$port)
+      url <- paste0(url_for_app_key(key), "/")
       
       pid <- find_listen_pid(info$port)
       port_up <- is.finite(pid)
       
-      # ✅ si NO escolta, NO fem curl (evita bloqueig)
+      # si no escolta, no fem curl
       code <- if (port_up) http_status_fast(url) else NA_integer_
-      
       http_up <- is.finite(code) && code >= 200 && code < 500
       
       ts <- rv$starting[[key]] %||% NA
-      is_recent_start <- !is.na(ts) && difftime(Sys.time(), ts, units="secs") < 120
+      is_recent_start <- !is.na(ts) && difftime(Sys.time(), ts, units = "secs") < 120
       
-      status_txt <- if (http_up) {
+      status_txt <- if (port_up) {
         "UP"
-      } else if (port_up) {
-        "UP"        # listening => UP (estable)
       } else if (is_recent_start) {
         "STARTING"
       } else {
         "DOWN"
       }
       
-      if (http_up || port_up) rv$starting[[key]] <- NULL
+      if (http_up || port_up) {
+        rv$starting[[key]] <- NULL
+      }
       
       data.frame(
         app = key,
         url = url,
-        port = info$port,
-        http_code = ifelse(is.na(code), 0L, code),
+        port = as.integer(info$port),
+        http_code = ifelse(is.na(code), 0L, as.integer(code)),
         status = status_txt,
         pid = ifelse(is.na(pid), "", as.character(pid)),
         pid_alive = is.finite(pid),
         stringsAsFactors = FALSE
       )
     })
+    
     do.call(rbind, rows)
   }
   
-  
-  output$status_table <- renderDT({
-    df <- rv$last_status
-    
-    if (is.null(df)) {
-      df <- tryCatch(compute_status(), error = function(e) {
-        data.frame(
-          app = names(apps),
-          url = vapply(apps, function(x) paste0(base_url_for_port(x$port), "/"), ""),
-          port = vapply(apps, `[[`, 0L, "port"),
-          http_code = 0L,
-          status = paste0("ERR: ", conditionMessage(e)),
-          pid = "",
-          pid_alive = FALSE,
-          stringsAsFactors = FALSE
-        )
-      })
+  status_df_for_display <- function(df) {
+    if (is.null(df) || !is.data.frame(df)) {
+      return(data.frame(
+        app = character(0),
+        port = integer(0),
+        http_code = integer(0),
+        status = character(0),
+        pid = character(0),
+        pid_alive = logical(0),
+        url_link = character(0),
+        stringsAsFactors = FALSE
+      ))
     }
     
-    # Make URL clickable (absolute, works for localhost + ngrok)
+    if (!nrow(df)) {
+      return(data.frame(
+        app = character(0),
+        port = integer(0),
+        http_code = integer(0),
+        status = character(0),
+        pid = character(0),
+        pid_alive = logical(0),
+        url_link = character(0),
+        stringsAsFactors = FALSE
+      ))
+    }
+    
+    df <- as.data.frame(df, stringsAsFactors = FALSE)
+    
+    if (!"url" %in% names(df)) {
+      df$url <- ""
+    }
+    
     df$url_link <- vapply(df$url, function(u) {
+      if (is.na(u) || !nzchar(u)) return("")
       as.character(htmltools::tags$a(href = u, target = "_blank", u))
     }, character(1))
     
-    # Show url_link instead of raw url
     df$url <- NULL
     
-    datatable(
+    keep <- c("app", "port", "http_code", "status", "pid", "pid_alive", "url_link")
+    keep <- intersect(keep, names(df))
+    df[, keep, drop = FALSE]
+  }
+  
+  refresh_status_table <- function() {
+    rv$last_status <- tryCatch(
+      compute_status(),
+      error = function(e) {
+        cat("[HUB][status] compute_status failed:", conditionMessage(e), "\n")
+        data.frame(
+          app = names(apps),
+          port = vapply(apps, function(x) as.integer(x$port), integer(1)),
+          http_code = rep.int(0L, length(apps)),
+          status = rep.int("DOWN", length(apps)),
+          pid = rep.int("", length(apps)),
+          pid_alive = rep.int(FALSE, length(apps)),
+          url_link = rep("", length(apps)),
+          stringsAsFactors = FALSE
+        )
+      }
+    )
+    
+    if (!isTRUE(status_ready())) status_ready(TRUE)
+  }
+  
+  observeEvent(TRUE, {
+    refresh_status_table()
+  }, once = TRUE)
+  
+#  observe({
+#    invalidateLater(60000, session)
+#    refresh_status_table()
+#  })
+  
+  observeEvent(input$refresh_status, {
+    refresh_status_table()
+  }, ignoreInit = TRUE)
+  
+  output$status_table <- DT::renderDT({
+    req(!is.null(rv$last_status))
+    
+    df <- status_df_for_display(rv$last_status)
+    
+    DT::datatable(
       df,
       rownames = FALSE,
       selection = "none",
-      escape = FALSE,  # IMPORTANT: render <a href=...>
-      options = list(pageLength = 10, scrollX = TRUE)
+      escape = FALSE,
+      options = list(
+        pageLength = 10,
+        scrollX = TRUE,
+        dom = "tip"
+      )
     ) %>%
-      formatStyle(
-        "status", target = "row",
-        backgroundColor = styleEqual(
+      DT::formatStyle(
+        "status",
+        target = "row",
+        backgroundColor = DT::styleEqual(
           c("UP", "STARTING", "DOWN"),
           c("#e7f7ee", "#fff7e6", "#fdecea")
         )
       )
-  })
+  }, server = FALSE)
   
-  
-  # light polling (avoid heavy loops over ngrok)
-  observe({
-    invalidateLater(12000, session)
-    
-   # rv$last_status <- compute_status()
-    rv$last_status <- tryCatch(compute_status(), error = function(e) rv$last_status)
-    
-    # mark first status computed
-    if (!isTRUE(status_ready())) status_ready(TRUE)
-  })
-  
-  observe({
-    # Close banner only once, when both UI buttons + first status are ready
-    if (isTRUE(banner_hidden())) return()
-    req(isTRUE(buttons_ready()), isTRUE(status_ready()))
-    
-    elapsed <- as.numeric(difftime(Sys.time(), banner_started, units = "secs"))
-    if (elapsed < BANNER_MIN_SECS) {
-      invalidateLater(as.integer((BANNER_MIN_SECS - elapsed) * 1000), session)
-      return()
-    }
-    
-    session$sendCustomMessage("hub_banner", list(show = FALSE))
-    banner_hidden(TRUE)
-  })
-  
-  
-  observeEvent(input$refresh_status, {
-    rv$last_status <- compute_status()
-  }, ignoreInit = TRUE)
-  
-  observeEvent(input$open_4x, {
+##############################
+  observeEvent(input$open_all_slaves, {
     u <- urls_ui()
-    insertUI(selector="body", where="beforeEnd", ui=HTML(open_many_js(c(u$gtex, u$nonsyn,u$ewasdis, u$ewastum))), immediate=TRUE)
+    insertUI(
+      selector = "body",
+      where = "beforeEnd",
+      ui = HTML(open_many_js(c(
+        u$gtex,
+        u$nonsyn,
+        u$ewasdis,
+        u$ewastum
+      ))),
+      immediate = TRUE
+    )
   }, ignoreInit = TRUE)
-  
-  observeEvent(input$open_gtex_nonsyn, {
-    u <- urls_ui()
-    insertUI(selector="body", where="beforeEnd", ui=HTML(open_many_js(c(u$gtex, u$nonsyn))), immediate=TRUE)
-  }, ignoreInit = TRUE)
-  
-  observeEvent(input$open_catalog_integrator, {
-    u <- urls_ui()
-    insertUI(selector="body", where="beforeEnd", ui=HTML(open_many_js(c(u$catalog, u$integrator))), immediate=TRUE)
-  }, ignoreInit = TRUE)
-  
-  observeEvent(input$open_ewas_both, {
-    u <- urls_ui()
-    insertUI(selector="body", where="beforeEnd", ui=HTML(open_many_js(c(u$ewasdis, u$ewastum))), immediate=TRUE)
-  }, ignoreInit = TRUE)
-  
+##############################  
   observeEvent(input$start_one, {
     key <- input$manage_app
     info <- apps[[key]]
@@ -574,13 +717,13 @@ server <- function(input, output, session) {
     
     if (!dir.exists(info$dir)) {
       rv$manage_msg <- sprintf("[%s] DIR NOT FOUND: %s", key, info$dir)
-      rv$last_status <- compute_status()
+      refresh_status_table()
       return()
     }
     
     if (is_port_listening(info$port)) {
       rv$manage_msg <- sprintf("[%s] already running (port %d).", key, info$port)
-      rv$last_status <- compute_status()
+      refresh_status_table()
       return()
     }
     
@@ -601,7 +744,7 @@ server <- function(input, output, session) {
       }
     }
     
-    rv$last_status <- compute_status()
+    refresh_status_table()
   }, ignoreInit = TRUE)
   
   observeEvent(input$kill_one, {
@@ -612,7 +755,7 @@ server <- function(input, output, session) {
     rv$starting[[key]] <- NULL
     rv$manage_msg <- sprintf("[%s] kill port=%d -> %s", key, info$port, ok)
     
-    rv$last_status <- compute_status()
+    refresh_status_table()
   }, ignoreInit = TRUE)
   
   observeEvent(input$restart_one, {
@@ -639,7 +782,7 @@ server <- function(input, output, session) {
       }
     }
     
-    rv$last_status <- compute_status()
+    refresh_status_table()
   }, ignoreInit = TRUE)
   
   
@@ -688,7 +831,7 @@ server <- function(input, output, session) {
     
     write_pids(reactiveValuesToList(rv)$pids)
     rv$manage_msg <- paste(c("[ALL] start_all done.", msgs), collapse = "\n")
-    rv$last_status <- compute_status()
+    refresh_status_table()
     
     showNotification("Start all finished. Check Status table.", type="message", duration=3)
   }, ignoreInit = TRUE)
@@ -704,7 +847,7 @@ server <- function(input, output, session) {
     }
     
     rv$manage_msg  <- "[ALL] kill_all executed (hub preserved)."
-    rv$last_status <- compute_status()
+    refresh_status_table()
     
     showNotification("Killed all slave apps (Hub stays running).", type="message", duration=3)
   }, ignoreInit = TRUE)
@@ -725,7 +868,7 @@ server <- function(input, output, session) {
       
       tags$p(
         tags$b("Goal:"),
-        " Build clusters once in ", tags$b("Catalog Inspector"),
+        " Define the shared genomic regions once in ", tags$b("Catalog Inspector"),
         " (master) and reuse them across the other GItools apps. ",
         tags$b("Integrator Inspector"),
         " acts as the cross-app integration layer, including LD evidence, once the complementary inspectors have generated their exports."
@@ -744,6 +887,21 @@ server <- function(input, output, session) {
       tags$ol(
         tags$li("Open ", tags$b("Catalog Inspector"), " from the Hub."),
         tags$li(tags$b("Load Catalog/GWAS data"), " (your selected dataset)."),
+        tags$li("Choose how you want to define the shared regions:"),
+        tags$ul(
+          tags$li(
+            tags$b("Standard mode:"),
+            " build clusters from GWAS hits using the clustering controls."
+          ),
+          tags$li(
+            tags$b("User-defined mode:"),
+            " upload a file with predefined genomic intervals (cluster_id / chr / start / end)."
+          )
+        ),
+        tags$li(
+          "If using ", tags$b("user-defined intervals"),
+          ", the uploaded intervals become the canonical clusters, and the selected GWAS threshold is used to assign significant GWAS hits to those intervals."
+        ),
         tags$li("Explore hits using the Manhattan plot and summary tables."),
         tags$li("Adjust thresholds or clustering parameters as needed."),
         tags$li("Click ", tags$b("Build clusters"), "."),
@@ -751,7 +909,7 @@ server <- function(input, output, session) {
       ),
       tags$p(
         tags$i(
-          "Once clusters are built, the rest of the apps can inspect the same canonical cluster IDs and genomic intervals."
+          "Once clusters are defined, the rest of the apps inspect the same canonical cluster IDs and genomic intervals, regardless of whether they were generated from GWAS clustering or uploaded as user-defined regions."
         )
       ),
       
@@ -760,7 +918,7 @@ server <- function(input, output, session) {
       tags$h4("2) Open the complementary inspectors"),
       tags$ul(
         tags$li(
-          "After building clusters in ", tags$b("Catalog Inspector"),
+          "After defining clusters in ", tags$b("Catalog Inspector"),
           ", open the other inspectors from the Hub."
         ),
         tags$li(
@@ -812,6 +970,7 @@ server <- function(input, output, session) {
         tags$ul(
           tags$li("Explore GWAS/Catalog associations."),
           tags$li("Create canonical clusters shared across GItools."),
+          tags$li("Support both GWAS-derived clustering and uploaded user-defined cluster intervals."),
           tags$li("Define the genomic backbone for downstream inspection.")
         ),
         
@@ -881,8 +1040,14 @@ server <- function(input, output, session) {
       
       tags$h4("Recommended fast workflow"),
       tags$ol(
-        tags$li(tags$b("Hub → Catalog Inspector:"), " load data and build clusters."),
-        tags$li(tags$b("Hub → open the other inspectors:"), " review complementary evidence for the same canonical regions."),
+        tags$li(
+          tags$b("Hub → Catalog Inspector:"),
+          " load data and define clusters either from GWAS-based clustering or from uploaded user-defined intervals."
+        ),
+        tags$li(
+          tags$b("Hub → open the other inspectors:"),
+          " review complementary evidence for the same canonical regions."
+        ),
         tags$li(
           tags$b("Hub → Integrator Inspector:"),
           " consolidate all available evidence, including ", tags$b("LD evidence"),
@@ -896,13 +1061,16 @@ server <- function(input, output, session) {
       tags$ul(
         tags$li(
           tags$b("Clusters are the common language."),
-          " If an inspector looks empty, first confirm that clusters were built in Catalog Inspector."
+          " If an inspector looks empty, first confirm that clusters were defined in Catalog Inspector."
         ),
         tags$li(
-          "If you rebuild clusters in Catalog, reload the other apps so they work with the updated cluster set."
+          "If you rebuild clusters or upload a different user-defined interval set in Catalog, reload the other apps so they work with the updated cluster set."
         ),
         tags$li(
           "Cluster IDs (cluster_id) should remain canonical and consistent across all apps."
+        ),
+        tags$li(
+          "In user-defined mode, uploaded intervals define the regions, while the selected GWAS threshold is used only to assign GWAS hits to those intervals."
         ),
         tags$li(
           "Integrator summaries depend on the bridge export files written by each app. If integrated tables are empty, check that the corresponding bridge files are being generated correctly."
@@ -922,7 +1090,6 @@ server <- function(input, output, session) {
     ))
     
   }, ignoreInit = TRUE)
-  
   
   output$dl_example_zip <- downloadHandler(
     filename = function() {

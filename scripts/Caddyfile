@@ -1,0 +1,88 @@
+:8080 {
+
+  encode gzip
+
+  # -------------------------
+  # Apps (path-based)
+  # IMPORTANT: use /catalog* (not /catalog/*) so /catalog/ also matches
+  # -------------------------
+
+  handle /catalog* {
+    uri strip_prefix /catalog
+    reverse_proxy 127.0.0.1:7201 {
+      header_up Host {host}
+      header_up X-Forwarded-Proto {scheme}
+      header_up X-Forwarded-Host {host}
+      header_up X-Forwarded-For {remote}
+      header_up X-Forwarded-Prefix /catalog
+    }
+  }
+
+handle /gtex* {
+  uri strip_prefix /gtex
+  reverse_proxy 127.0.0.1:7202 {
+    header_up Host 127.0.0.1:7202
+    header_up X-Forwarded-Proto {scheme}
+    header_up X-Forwarded-Host {host}
+    header_up X-Forwarded-For {remote_host}
+    flush_interval -1
+  }
+}
+
+  handle /nonsyn* {
+    uri strip_prefix /nonsyn
+    reverse_proxy 127.0.0.1:7203 {
+      header_up Host {host}
+      header_up X-Forwarded-Proto {scheme}
+      header_up X-Forwarded-Host {host}
+      header_up X-Forwarded-For {remote}
+      header_up X-Forwarded-Prefix /nonsyn
+    }
+  }
+
+  handle /ewastum* {
+    uri strip_prefix /ewastum
+    reverse_proxy 127.0.0.1:7204 {
+      header_up Host {host}
+      header_up X-Forwarded-Proto {scheme}
+      header_up X-Forwarded-Host {host}
+      header_up X-Forwarded-For {remote}
+      header_up X-Forwarded-Prefix /ewastum
+    }
+  }
+
+  handle /ewasdis* {
+    uri strip_prefix /ewasdis
+    reverse_proxy 127.0.0.1:7205 {
+      header_up Host {host}
+      header_up X-Forwarded-Proto {scheme}
+      header_up X-Forwarded-Host {host}
+      header_up X-Forwarded-For {remote}
+      header_up X-Forwarded-Prefix /ewasdis
+    }
+  }
+
+  handle /integrator* {
+  uri strip_prefix /integrator
+  reverse_proxy 127.0.0.1:7206 {
+    header_up Host 127.0.0.1:7206
+    header_up X-Forwarded-Proto {scheme}
+    header_up X-Forwarded-Host {host}
+    header_up X-Forwarded-For {remote_host}
+    flush_interval -1
+  }
+}
+
+
+  # -------------------------
+  # Hub at /
+  # -------------------------
+  handle {
+    reverse_proxy 127.0.0.1:7101 {
+      header_up Host {host}
+      header_up X-Forwarded-Proto {scheme}
+      header_up X-Forwarded-Host {host}
+      header_up X-Forwarded-For {remote}
+    }
+  }
+}

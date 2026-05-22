@@ -708,6 +708,7 @@ ld_module_server <- function(
     id,
     app_tag,
     activate_r = NULL,
+    session_dir_r = NULL,
     ...
 ) {
   app_tag <- match.arg(app_tag, c("catalog", "gtex", "nonsyn", "ewastum", "ewasdis"))
@@ -845,14 +846,18 @@ ld_module_server <- function(
     # --------------------------------------------------------------
     clusters_rds_path <- shiny::reactive({
       if (!isTRUE(is_active())) return(NULL)
-      dd <- input$integrator_dir %||% ""
+      dd <- if (is.function(session_dir_r)) session_dir_r() else session_dir_r
+      dd <- trimws(as.character(dd %||% ""))
+      if (!nzchar(dd)) return(NULL)
       nm <- input$clusters_rds_name %||% default_clusters_rds_name
       file.path(dd, nm)
     })
     
     candidates_rds_path <- shiny::reactive({
       if (!isTRUE(is_active())) return(NULL)
-      dd <- input$integrator_dir %||% ""
+      dd <- if (is.function(session_dir_r)) session_dir_r() else session_dir_r
+      dd <- trimws(as.character(dd %||% ""))
+      if (!nzchar(dd)) return(NULL)
       nm <- input$candidates_rds_name %||% default_candidates_rds_name
       file.path(dd, nm)
     })
@@ -864,6 +869,11 @@ ld_module_server <- function(
       if (!isTRUE(is_active())) return(NULL)
       
       f <- clusters_rds_path()
+      if (is.null(f) || !nzchar(f)) {
+        append_log("[CLUSTERS] session_dir not ready")
+        return(NULL)
+      }
+      
       append_log("[CLUSTERS] reading path: ", f)
       append_log("[CLUSTERS] exists: ", file.exists(f))
       
@@ -932,6 +942,11 @@ ld_module_server <- function(
       if (!isTRUE(is_active())) return(NULL)
       
       f <- candidates_rds_path()
+      if (is.null(f) || !nzchar(f)) {
+        append_log("[CANDIDATES] session_dir not ready")
+        return(NULL)
+      }
+      
       append_log("[CANDIDATES] reading path: ", f)
       append_log("[CANDIDATES] exists: ", file.exists(f))
       
@@ -1007,7 +1022,6 @@ ld_module_server <- function(
         )
       }
       
-      
       append_log("[CANDIDATES] prepared nrow=", nrow(out), " ncol=", ncol(out))
       append_log("[CANDIDATES] prepared cols: ", paste(names(out), collapse = ", "))
       
@@ -1016,6 +1030,7 @@ ld_module_server <- function(
     
     observe({
       append_log("[DBG] integrator_dir=", input$integrator_dir %||% "")
+      append_log("[DBG] session_dir=", if (is.function(session_dir_r)) session_dir_r() %||% "" else session_dir_r %||% "")
       append_log("[DBG] clusters_rds_name=", input$clusters_rds_name %||% "")
       append_log("[DBG] candidates_rds_name=", input$candidates_rds_name %||% "")
       append_log("[DBG] clusters_rds_path=", clusters_rds_path())
@@ -1036,6 +1051,8 @@ ld_module_server <- function(
       }
     })
     
+    # --------------------------------------------------------------
+    # Cluster selector
     # --------------------------------------------------------------
     clusters_available <- shiny::reactive({
       cl <- clusters_df()
@@ -1380,8 +1397,8 @@ ld_module_server <- function(
       
       cl <- selected_cluster()
       shiny::validate(shiny::need(is.data.frame(cl) && nrow(cl) > 0, "No selected cluster available."))
-      chr_sel <- suppressWarnings(as.integer(cl$chr[1]))
       
+      chr_sel <- suppressWarnings(as.integer(cl$chr[1]))
       st      <- suppressWarnings(as.integer(cl$start[1]))
       en      <- suppressWarnings(as.integer(cl$end[1]))
       cid     <- as.character(cl$cluster_id[1])
@@ -1756,57 +1773,65 @@ ld_module_server <- function(
           shiny::validate(shiny::need(is.finite(maxn) && maxn >= 2, "Invalid max SNPs limit."))
           
           if (nrow(fl) > maxn) {
-            append_log("[LD-PLOT] Too many SNPs: ", nrow(fl), " > ", maxn, ". Auto-thinning...")
+            append_log(
+              "[LD-PLOT] Reference SNPs exceed max limit: ",
+              nrow(fl), " > ", maxn,
+              ". Even thinning on reference SNPs only..."
+            )
             
-            keep_snps <- character(0)
-            if (is.data.frame(cand_sub) && nrow(cand_sub) > 0) {
-              keep_by_rsid <- intersect(fl$SNP, cand_sub$rsid)
-              keep_by_pos  <- fl %>% dplyr::filter(BP %in% cand_sub$position) %>% dplyr::pull(SNP)
-              keep_snps <- unique(c(keep_by_rsid, keep_by_pos))
-            }
+            fl_ordered <- fl %>%
+              dplyr::arrange(BP, SNP) %>%
+              dplyr::distinct(SNP, BP, .keep_all = TRUE)
             
-            shiny::validate(shiny::need(
-              length(keep_snps) <= maxn,
-              paste0("Candidates in interval (", length(keep_snps), ") exceed max limit (", maxn, "). Increase limit.")
+            idx <- unique(pmax(
+              1,
+              pmin(nrow(fl_ordered), round(seq(1, nrow(fl_ordered), length.out = maxn)))
             ))
             
-            k <- maxn - length(keep_snps)
-            rest <- fl %>% dplyr::filter(!(SNP %in% keep_snps)) %>% dplyr::arrange(BP, SNP)
+            snps_final <- fl_ordered %>%
+              dplyr::slice(idx) %>%
+              dplyr::arrange(BP, SNP) %>%
+              dplyr::pull(SNP) %>%
+              unique()
             
-            if (k > 0 && nrow(rest) > 0) {
-              if (nrow(rest) <= k) {
-                fill_snps <- rest$SNP
-              } else {
-                idx <- unique(pmax(1, pmin(nrow(rest), round(seq(1, nrow(rest), length.out = k)))))
-                fill_snps <- rest$SNP[idx]
-              }
-            } else {
-              fill_snps <- character(0)
-            }
-            
-            snps_final <- unique(c(keep_snps, fill_snps))
             extract_file <- file.path(workdir, paste0(tag, "_extract_snps.txt"))
             writeLines(snps_final, extract_file)
             
             subset2_prefix <- file.path(workdir, paste0(tag, "_subset_thin"))
-            args_thin <- c("--bfile", subset_prefix, "--extract", extract_file, "--make-bed", "--out", subset2_prefix)
+            
+            args_thin <- c(
+              "--bfile", subset_prefix,
+              "--extract", extract_file,
+              "--make-bed",
+              "--out", subset2_prefix
+            )
+            
             rthin <- run_plink(args_thin, subset2_prefix, input$plink_bin %||% "")
             if (length(rthin$stdout)) append_log(paste(rthin$stdout, collapse = "\n"))
-            if (is.null(rthin$status) || rthin$status != 0) stop("PLINK thinning subset failed.")
+            if (is.null(rthin$status) || rthin$status != 0) {
+              stop("PLINK thinning subset failed.")
+            }
             
             subset_prefix <- subset2_prefix
             
-            bim2 <- utils::read.table(paste0(subset_prefix, ".bim"), header = FALSE, stringsAsFactors = FALSE)
-            colnames(bim2) <- c("CHR","SNP","CM","BP","A1","A2")
+            bim2 <- utils::read.table(
+              paste0(subset_prefix, ".bim"),
+              header = FALSE,
+              stringsAsFactors = FALSE
+            )
+            colnames(bim2) <- c("CHR", "SNP", "CM", "BP", "A1", "A2")
             
             fl <- bim2 %>%
-              dplyr::transmute(SNP = as.character(SNP), BP = suppressWarnings(as.integer(BP))) %>%
+              dplyr::transmute(
+                SNP = as.character(SNP),
+                BP = suppressWarnings(as.integer(BP))
+              ) %>%
               dplyr::filter(!is.na(SNP), nzchar(SNP), is.finite(BP)) %>%
               dplyr::distinct(SNP, BP, .keep_all = TRUE) %>%
               dplyr::arrange(BP, SNP) %>%
               dplyr::mutate(ix = dplyr::row_number())
             
-            append_log("[LD-PLOT] SNPs after thinning: ", nrow(fl))
+            append_log("[LD-PLOT] SNPs after reference-only thinning: ", nrow(fl))
           }
           
           incProgress(0.60, detail = "Computing full LD")
@@ -2562,7 +2587,6 @@ ld_module_server <- function(
       }
     })
     
-    # Optional return
     invisible(list(
       clusters_df = clusters_df,
       candidates_df = candidates_df,

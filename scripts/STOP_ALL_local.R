@@ -6,6 +6,7 @@
 # Usage:
 #   Rscript --vanilla scripts/STOP_ALL_local.R
 #   Rscript --vanilla scripts/STOP_ALL_local.R --kill-ngrok
+# /Volumes/DISK1TB/Inspector_app_slaves_ngroc/GItools/scripts/STOP_ALL_local.R --kill-ngrok
 #   Rscript --vanilla scripts/STOP_ALL_local.R --clean-logs
 #   Rscript --vanilla scripts/STOP_ALL_local.R --ports=7101,7201,7202,7203,7204,7205,7206
 #

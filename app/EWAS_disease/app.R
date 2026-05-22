@@ -49,6 +49,8 @@ source(cfg_file, local = TRUE)
 
 cfg <- gi_cfg()
 
+
+
 options(gi_state_root = file.path(cfg$root, "app", "_state"))
 
 gi_root        <- cfg$root
@@ -90,6 +92,40 @@ gi_dir <- function(...) {
 #----------------------------------------------------------------------------
 # --- Canonical engines / modules from _shared ---
 source(file.path(gi_shared_root, "gi_clusters_canonical.R"), local = TRUE)
+
+####### TEMPORAL ############
+source(file.path(gi_shared_root, "gi_state.R"), local = TRUE)
+
+cat("\n================ GI PATH DEBUG ================\n")
+cat("APP:", if (exists("APP_KEY")) APP_KEY else "unknown", "\n")
+cat("PID:", Sys.getpid(), "\n")
+cat("WD:", getwd(), "\n")
+
+if (exists("cfg")) {
+  cat("cfg$root:", cfg$root, "\n")
+  cat("cfg$shared:", cfg$shared, "\n")
+}
+
+if (exists("BASE")) {
+  cat("BASE:", BASE, "\n")
+}
+
+if (exists("gi_shared_root")) {
+  cat("gi_shared_root:", gi_shared_root, "\n")
+}
+
+if (exists("gi_state_root", mode = "function")) {
+  cat("gi_state_root():", gi_state_root(), "\n")
+} else {
+  cat("gi_state_root(): NOT AVAILABLE\n")
+}
+
+cat("GITOOLS_ROOT:", Sys.getenv("GITOOLS_ROOT", ""), "\n")
+cat("GITOOLS_REPO_ROOT:", Sys.getenv("GITOOLS_REPO_ROOT", ""), "\n")
+cat("GITOOLS_SHARED_DIR:", Sys.getenv("GITOOLS_SHARED_DIR", ""), "\n")
+cat("===============================================\n\n")
+#############################
+
 
 ld_file <- file.path(gi_shared_root, "mod_ld.R")
 stopifnot(file.exists(ld_file))
@@ -1246,6 +1282,8 @@ server <- function(input, output, session) {
   # -----------------------------
   source(file.path(SHARED, "gi_clusters_canonical.R"), local = TRUE)
   
+  
+  
   # NOTE: gwas_df is defined later in this server() in the original file.
   # We therefore create a thin proxy here, and re-bind it right after gwas_df exists.
   gwas_df_proxy <- shiny::reactive({
@@ -2185,6 +2223,8 @@ server <- function(input, output, session) {
           
           if (identical(cm, "window")) {
             "window"
+          } else if (identical(cm, "user_defined")) {
+            "user_defined"
           } else if (identical(cm, "hits")) {
             if (identical(hm, "span1mb")) {
               "hits_span1mb"
@@ -2203,6 +2243,8 @@ server <- function(input, output, session) {
         get_ewasdis_threshold <- function(input, cluster_method) {
           if (identical(cluster_method, "window")) {
             suppressWarnings(as.numeric(input$pthr))
+          } else if (identical(cluster_method, "user_defined")) {
+            suppressWarnings(as.numeric(input$pthr_user_defined))
           } else if (cluster_method %in% c("hits_span1mb", "hits_tiled", "hits_sliding", "hits_unknown")) {
             suppressWarnings(as.numeric(input$min_logp))
           } else {
@@ -2225,97 +2267,491 @@ server <- function(input, output, session) {
           
           "unknown_gwas_source"
         }
+
+        # ============================================================
+        # SESSION / SETTINGS FOLDER
+        # ============================================================
         
-        gi_get_integrator_session_dir <- function(gi_shared_root, cluster_method, threshold_used) {
+        get_ewasdis_gwas_path <- function(input) {
+          pth <- tryCatch(as.character(input$gwas_file$datapath %||% NA_character_), error = function(e) NA_character_)
+          if (!is.na(pth) && nzchar(trimws(pth)) && file.exists(trimws(pth))) {
+            return(trimws(pth))
+          }
+          NA_character_
+        }
+        
+        gi_compute_gwas_file_hash <- function(gwas_file_path) {
+          pth <- trimws(as.character(gwas_file_path %||% ""))
+          
+          if (!nzchar(pth)) {
+            return(NA_character_)
+          }
+          
+          if (!file.exists(pth)) {
+            return(NA_character_)
+          }
+          
+          unname(tools::md5sum(pth))
+        }
+        
+        gi_get_integrator_session_dir <- function(
+    gi_shared_root,
+    input,
+    cluster_method,
+    threshold_used,
+    gwas_session_file,
+    gwas_hash = NA_character_,
+    canonical_settings = NULL
+        ) {
+          `%||%` <- function(a, b) {
+            if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
+          }
+          
+          normalize_na_chr <- function(x) {
+            x <- as.character(x %||% NA_character_)
+            if (!length(x) || is.na(x) || !nzchar(trimws(x))) return(NA_character_)
+            trimws(x)
+          }
+          
+          normalize_na_num <- function(x) {
+            x <- suppressWarnings(as.numeric(x %||% NA_real_))
+            if (!length(x) || is.na(x) || !is.finite(x)) return(NA_real_)
+            x
+          }
+          
+          normalize_na_int <- function(x) {
+            x <- suppressWarnings(as.integer(x %||% NA_integer_))
+            if (!length(x) || is.na(x) || !is.finite(x)) return(NA_integer_)
+            x
+          }
+          
+          if (is.null(gi_shared_root) || !nzchar(as.character(gi_shared_root))) {
+            stop("gi_shared_root is empty. Cannot create Integrator session folder.")
+          }
+          
           integrator_root <- file.path(gi_shared_root, "integrator_exports")
           dir.create(integrator_root, recursive = TRUE, showWarnings = FALSE)
           
-          method_tag <- fmt_tag(cluster_method)
-          thr_tag    <- fmt_threshold_for_path(threshold_used)
+          if (!dir.exists(integrator_root)) {
+            stop("Could not create integrator_root: ", integrator_root)
+          }
           
-          session_id <- paste0(
-            "clust_", method_tag,
-            "__thr_", thr_tag
+          # ============================================================
+          # HUB MODE: do not recalculate session_id
+          # ============================================================
+          st_sync <- tryCatch(
+            {
+              if (exists("gi_sync", inherits = TRUE) &&
+                  is.list(gi_sync) &&
+                  is.function(gi_sync$state_shared)) {
+                gi_sync$state_shared()
+              } else {
+                NULL
+              }
+            },
+            error = function(e) NULL
           )
           
+          hub_session_id <- normalize_na_chr(st_sync$session_id %||% NA_character_)
+          
+          if (is.list(st_sync) && !is.na(hub_session_id)) {
+            
+            session_id <- hub_session_id
+            session_dir <- file.path(integrator_root, session_id)
+            
+            dir.create(session_dir, recursive = TRUE, showWarnings = FALSE)
+            
+            if (!dir.exists(session_dir)) {
+              stop("Could not create Hub-provided session_dir: ", session_dir)
+            }
+            
+            settings_list <- st_sync$settings_list %||% canonical_settings %||% list(
+              cluster_method    = normalize_na_chr(st_sync$cluster_method %||% cluster_method),
+              threshold_used    = normalize_na_num(st_sync$threshold_used %||% st_sync$thr_value %||% threshold_used),
+              hits_mode         = normalize_na_chr(st_sync$hits_mode),
+              min_hits          = normalize_na_int(st_sync$min_hits),
+              flank_bp          = normalize_na_int(st_sync$flank_bp),
+              win_bp            = normalize_na_int(st_sync$win_bp),
+              step_bp           = normalize_na_int(st_sync$step_bp),
+              user_defined      = isTRUE(st_sync$user_defined),
+              user_cluster_file = normalize_na_chr(st_sync$user_cluster_file)
+            )
+            
+            settings_key <- normalize_na_chr(st_sync$settings_key %||% NA_character_)
+            settings_sig <- normalize_na_chr(st_sync$settings_sig %||% NA_character_)
+            
+            if (is.na(settings_key)) {
+              settings_key <- paste(
+                paste0("cluster_method=", settings_list$cluster_method %||% ""),
+                paste0("hits_mode=", settings_list$hits_mode %||% ""),
+                paste0("threshold_used=", settings_list$threshold_used %||% ""),
+                paste0("min_hits=", settings_list$min_hits %||% ""),
+                paste0("flank_bp=", settings_list$flank_bp %||% ""),
+                paste0("win_bp=", settings_list$win_bp %||% ""),
+                paste0("step_bp=", settings_list$step_bp %||% ""),
+                paste0("user_defined=", settings_list$user_defined %||% ""),
+                paste0("user_cluster_file=", settings_list$user_cluster_file %||% ""),
+                sep = ";"
+              )
+            }
+            
+            if (is.na(settings_sig)) {
+              settings_sig <- sub("^.*_sig_", "", session_id)
+            }
+            
+            cm_tag <- normalize_na_chr(settings_list$cluster_method %||% st_sync$cluster_method)
+            if (is.na(cm_tag)) cm_tag <- "unknown"
+            
+            thr_tag <- normalize_na_num(settings_list$threshold_used %||% st_sync$thr_value)
+            thr_tag <- if (is.na(thr_tag)) {
+              "NA"
+            } else {
+              gsub("\\.", "p", format(thr_tag, trim = TRUE, scientific = FALSE))
+            }
+            
+            return(list(
+              integrator_root   = integrator_root,
+              session_dir       = session_dir,
+              session_id        = session_id,
+              method_tag        = cm_tag,
+              thr_tag           = thr_tag,
+              settings_sig      = settings_sig,
+              settings_key      = settings_key,
+              settings_list     = settings_list,
+              gwas_hash         = normalize_na_chr(st_sync$gwas_hash %||% gwas_hash),
+              gwas_session_file = normalize_na_chr(
+                st_sync$gwas_session_file %||%
+                  st_sync$gwas_name %||%
+                  gwas_session_file
+              )
+            ))
+          }
+          
+          # ============================================================
+          # STANDALONE MODE: calculate local session_id
+          # ============================================================
+          settings_from_input <- function() {
+            cm  <- normalize_na_chr(cluster_method)
+            thr <- normalize_na_num(threshold_used)
+            
+            raw_cluster_method <- cm
+            raw_hits_mode <- normalize_na_chr(input$hits_mode)
+            current_user_defined <- identical(raw_cluster_method, "user_defined")
+            
+            current_cluster_method <- gi_resolve_cluster_method(
+              cluster_method = raw_cluster_method,
+              hits_mode      = raw_hits_mode,
+              user_defined   = current_user_defined
+            )
+            
+            if (identical(current_cluster_method, "window")) {
+              list(
+                cluster_method    = current_cluster_method,
+                threshold_used    = thr,
+                hits_mode         = NA_character_,
+                min_hits          = normalize_na_int(input$min_hits_window %||% input$min_hits),
+                flank_bp          = normalize_na_int(input$flank),
+                win_bp            = NA_integer_,
+                step_bp           = NA_integer_,
+                user_defined      = FALSE,
+                user_cluster_file = NA_character_
+              )
+              
+            } else if (identical(current_cluster_method, "user_defined")) {
+              list(
+                cluster_method    = current_cluster_method,
+                threshold_used    = thr,
+                hits_mode         = NA_character_,
+                min_hits          = normalize_na_int(input$min_hits_user_defined %||% input$min_hits),
+                flank_bp          = NA_integer_,
+                win_bp            = NA_integer_,
+                step_bp           = NA_integer_,
+                user_defined      = TRUE,
+                user_cluster_file = tryCatch(
+                  normalize_na_chr(input$cluster_file$name),
+                  error = function(e) NA_character_
+                )
+              )
+              
+            } else {
+              list(
+                cluster_method    = current_cluster_method,
+                threshold_used    = thr,
+                hits_mode         = raw_hits_mode,
+                min_hits          = normalize_na_int(input$min_hits_hits %||% input$min_hits),
+                flank_bp          = NA_integer_,
+                win_bp            = normalize_na_int(input$win_bp),
+                step_bp           = normalize_na_int(input$step_bp),
+                user_defined      = FALSE,
+                user_cluster_file = NA_character_
+              )
+            }
+          }
+          
+          settings_from_canonical <- function(cs) {
+            cm_raw <- normalize_na_chr(cs$cluster_method %||% cluster_method)
+            hm_raw <- normalize_na_chr(cs$hits_mode)
+            
+            cm_final <- gi_resolve_cluster_method(
+              cluster_method = cm_raw,
+              hits_mode      = hm_raw,
+              user_defined   = isTRUE(cs$user_defined)
+            )
+            
+            list(
+              cluster_method    = cm_final,
+              threshold_used    = normalize_na_num(cs$threshold_used %||% threshold_used),
+              hits_mode         = hm_raw,
+              min_hits          = normalize_na_int(cs$min_hits),
+              flank_bp          = normalize_na_int(cs$flank_bp),
+              win_bp            = normalize_na_int(cs$win_bp),
+              step_bp           = normalize_na_int(cs$step_bp),
+              user_defined      = isTRUE(cs$user_defined),
+              user_cluster_file = normalize_na_chr(cs$user_cluster_file)
+            )
+          }
+          
+          settings_list <- if (is.list(canonical_settings) && length(canonical_settings) > 0) {
+            settings_from_canonical(canonical_settings)
+          } else {
+            settings_from_input()
+          }
+          
+          settings_key <- paste(
+            paste0("cluster_method=", settings_list$cluster_method %||% ""),
+            paste0("hits_mode=", settings_list$hits_mode %||% ""),
+            paste0("threshold_used=", settings_list$threshold_used %||% ""),
+            paste0("min_hits=", settings_list$min_hits %||% ""),
+            paste0("flank_bp=", settings_list$flank_bp %||% ""),
+            paste0("win_bp=", settings_list$win_bp %||% ""),
+            paste0("step_bp=", settings_list$step_bp %||% ""),
+            paste0("user_defined=", settings_list$user_defined %||% ""),
+            paste0("user_cluster_file=", settings_list$user_cluster_file %||% ""),
+            sep = ";"
+          )
+          
+          settings_sig <- substr(digest::digest(settings_key, algo = "xxhash64"), 1, 16)
+          
+          cm_tag <- normalize_na_chr(settings_list$cluster_method)
+          if (is.na(cm_tag)) cm_tag <- "unknown"
+          
+          thr_tag <- normalize_na_num(settings_list$threshold_used)
+          thr_tag <- if (is.na(thr_tag)) {
+            "NA"
+          } else {
+            gsub("\\.", "p", format(thr_tag, trim = TRUE, scientific = FALSE))
+          }
+          
+          session_id <- paste0("clust_", cm_tag, "_thr_", thr_tag, "_sig_", settings_sig)
           session_dir <- file.path(integrator_root, session_id)
+          
           dir.create(session_dir, recursive = TRUE, showWarnings = FALSE)
           
+          if (!dir.exists(session_dir)) {
+            stop("Could not create session_dir: ", session_dir)
+          }
+          
           list(
-            integrator_root = integrator_root,
-            session_id = session_id,
-            session_dir = session_dir,
-            method_tag = method_tag,
-            thr_tag = thr_tag
+            integrator_root   = integrator_root,
+            session_dir       = session_dir,
+            session_id        = session_id,
+            method_tag        = cm_tag,
+            thr_tag           = thr_tag,
+            settings_sig      = settings_sig,
+            settings_key      = settings_key,
+            settings_list     = settings_list,
+            gwas_hash         = normalize_na_chr(gwas_hash),
+            gwas_session_file = normalize_na_chr(gwas_session_file)
           )
         }
         
-        gi_load_or_create_manifest <- function(session_dir, session_id, cluster_method, threshold_used, gwas_session_file) {
+        
+        gi_load_or_create_manifest <- function(
+    session_dir,
+    session_id,
+    cluster_method,
+    threshold_used,
+    gwas_session_file,
+    settings_sig = NA_character_,
+    settings_list = NULL
+        ) {
+          `%||%` <- function(a, b) {
+            if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
+          }
+          
           manifest_path <- file.path(session_dir, "manifest.rds")
           
           if (file.exists(manifest_path)) {
             manifest <- tryCatch(readRDS(manifest_path), error = function(e) NULL)
+            
             if (is.list(manifest)) {
               if (is.null(manifest$files)) manifest$files <- list()
               if (is.null(manifest$apps_present)) manifest$apps_present <- character(0)
-              return(list(manifest = manifest, manifest_path = manifest_path))
+              if (is.null(manifest$settings_sig)) manifest$settings_sig <- settings_sig
+              if (is.null(manifest$settings_list)) manifest$settings_list <- settings_list
+              
+              saveRDS(manifest, manifest_path)
+              
+              return(list(
+                manifest = manifest,
+                manifest_path = manifest_path
+              ))
             }
           }
           
-          manifest <- list(
-            session_id = session_id,
-            created_at = as.character(Sys.time()),
-            cluster_method = cluster_method,
-            threshold_used = threshold_used,
-            gwas_session_file = gwas_session_file,
-            settings_key = paste0(
-              "cluster_method=", cluster_method,
-              ";threshold_used=", threshold_used
-            ),
-            apps_present = character(0),
-            files = list()
+          if (is.null(settings_list)) {
+            settings_list <- list(
+              cluster_method    = cluster_method,
+              threshold_used    = threshold_used,
+              hits_mode         = NA_character_,
+              min_hits          = NA_integer_,
+              flank_bp          = NA_integer_,
+              win_bp            = NA_integer_,
+              step_bp           = NA_integer_,
+              user_defined      = FALSE,
+              user_cluster_file = NA_character_
+            )
+          }
+          
+          settings_key <- paste(
+            paste0("cluster_method=", settings_list$cluster_method %||% ""),
+            paste0("hits_mode=", settings_list$hits_mode %||% ""),
+            paste0("threshold_used=", settings_list$threshold_used %||% ""),
+            paste0("min_hits=", settings_list$min_hits %||% ""),
+            paste0("flank_bp=", settings_list$flank_bp %||% ""),
+            paste0("win_bp=", settings_list$win_bp %||% ""),
+            paste0("step_bp=", settings_list$step_bp %||% ""),
+            paste0("user_defined=", settings_list$user_defined %||% ""),
+            paste0("user_cluster_file=", settings_list$user_cluster_file %||% ""),
+            sep = ";"
           )
           
-          list(manifest = manifest, manifest_path = manifest_path)
+          manifest <- list(
+            session_id        = session_id,
+            created_at        = as.character(Sys.time()),
+            cluster_method    = settings_list$cluster_method %||% cluster_method,
+            threshold_used    = settings_list$threshold_used %||% threshold_used,
+            gwas_session_file = gwas_session_file,
+            settings_sig      = settings_sig,
+            settings_list     = settings_list,
+            settings_key      = settings_key,
+            apps_present      = character(0),
+            files             = list()
+          )
+          
+          saveRDS(manifest, manifest_path)
+          
+          list(
+            manifest = manifest,
+            manifest_path = manifest_path
+          )
         }
         
         # ============================================================
         # SESSION / SETTINGS FOLDER
         # ============================================================
-        current_cluster_method <- get_ewasdis_cluster_method(input)
-        current_threshold      <- get_ewasdis_threshold(input, current_cluster_method)
-        current_gwas_name      <- get_ewasdis_gwas_name(input)
+        st_sync <- tryCatch(gi_sync$state_shared(), error = function(e) NULL)
+        
+        hub_mode_now <- is.list(st_sync) && length(st_sync) > 0 &&
+          (isTRUE(st_sync$has_gwas) || isTRUE(st_sync$has_clusters))
+        
+        current_cluster_method <- if (hub_mode_now) {
+          gi_resolve_cluster_method(
+            cluster_method = as.character(st_sync$cluster_method %||% "unknown"),
+            hits_mode      = as.character(st_sync$hits_mode %||% NA_character_),
+            user_defined   = isTRUE(st_sync$user_defined)
+          )
+        } else {
+          get_gtex_cluster_method(input)
+        }
+        
+        current_threshold <- if (hub_mode_now) {
+          suppressWarnings(as.numeric(st_sync$thr_value %||% NA_real_))
+        } else {
+          get_ewasdis_threshold(input, current_cluster_method)
+        }
+        
+        current_gwas_name <- get_ewasdis_gwas_name(input)
+        current_gwas_path <- get_ewasdis_gwas_path(input)
+        current_gwas_hash <- gi_compute_gwas_file_hash(current_gwas_path)
+        
+        canonical_settings_safe <- tryCatch({
+          st <- gi_sync$state_shared()
+          
+          if (!is.list(st)) {
+            NULL
+          } else {
+            list(
+              cluster_method    = st$cluster_method %||% NA_character_,
+              threshold_used    = suppressWarnings(as.numeric(st$thr_value %||% NA_real_)),
+              hits_mode         = st$hits_mode %||% NA_character_,
+              min_hits          = suppressWarnings(as.integer(st$min_hits %||% NA_integer_)),
+              flank_bp          = suppressWarnings(as.integer(st$flank_bp %||% NA_integer_)),
+              win_bp            = suppressWarnings(as.integer(st$win_bp %||% NA_integer_)),
+              step_bp           = suppressWarnings(as.integer(st$step_bp %||% NA_integer_)),
+              user_defined      = isTRUE(st$user_defined),
+              user_cluster_file = st$user_cluster_file %||% NA_character_
+            )
+          }
+        }, error = function(e) {
+          cat("[SLAVE] canonical settings from gi_sync$state_shared() failed:", conditionMessage(e), "\n")
+          NULL
+        })
         
         sess <- gi_get_integrator_session_dir(
-          gi_shared_root = gi_shared_root,
-          cluster_method = current_cluster_method,
-          threshold_used = current_threshold
+          gi_shared_root      = gi_shared_root,
+          input               = input,
+          cluster_method      = current_cluster_method,
+          threshold_used      = current_threshold,
+          gwas_session_file   = current_gwas_name,
+          gwas_hash           = current_gwas_hash,
+          canonical_settings  = canonical_settings_safe
         )
+        
+        append_log(paste0(
+          log_tag, " settings_list_json=",
+          jsonlite::toJSON(sess$settings_list, auto_unbox = TRUE, null = "null", na = "null")
+        ))
+        append_log(paste0(log_tag, " settings_sig=", sess$settings_sig))
         
         integrator_root <- sess$integrator_root
         session_id      <- sess$session_id
         session_dir     <- sess$session_dir
         
+        session_dir_rv(session_dir)
+        
         manifest_obj <- gi_load_or_create_manifest(
-          session_dir = session_dir,
-          session_id = session_id,
-          cluster_method = current_cluster_method,
-          threshold_used = current_threshold,
-          gwas_session_file = current_gwas_name
+          session_dir       = session_dir,
+          session_id        = session_id,
+          cluster_method    = sess$settings_list$cluster_method,
+          threshold_used    = sess$settings_list$threshold_used,
+          gwas_session_file = sess$gwas_session_file,
+          settings_sig      = sess$settings_sig,
+          settings_list     = sess$settings_list
         )
         
         manifest      <- manifest_obj$manifest
         manifest_path <- manifest_obj$manifest_path
         
-        if (!identical(as.character(manifest$cluster_method %||% ""), as.character(current_cluster_method))) {
-          stop("Existing manifest cluster_method does not match current cluster_method.")
+        if (!identical(
+          as.character(manifest$cluster_method %||% ""),
+          as.character(sess$settings_list$cluster_method %||% "")
+        )) {
+          stop("Existing manifest cluster_method does not match canonical session cluster_method.")
         }
         
         if (!isTRUE(all.equal(
           suppressWarnings(as.numeric(manifest$threshold_used)),
-          suppressWarnings(as.numeric(current_threshold))
+          suppressWarnings(as.numeric(sess$settings_list$threshold_used))
         ))) {
-          stop("Existing manifest threshold_used does not match current threshold_used.")
+          stop("Existing manifest threshold_used does not match canonical session threshold_used.")
+        }
+        
+        if (!identical(
+          as.character(manifest$settings_sig %||% ""),
+          as.character(sess$settings_sig %||% "")
+        )) {
+          stop("Existing manifest settings_sig does not match current settings signature.")
         }
         
         manifest_gwas_files <- as.character(manifest$gwas_session_file %||% character(0))
@@ -2328,6 +2764,7 @@ server <- function(input, output, session) {
         }
         
         manifest$gwas_session_file <- manifest_gwas_files
+        saveRDS(manifest, manifest_path)
         
         gene_bridge_path     <- file.path(session_dir, paste0(app_slug, "_gene_bridge.rds"))
         term_bridge_path     <- file.path(session_dir, paste0(app_slug, "_term_bridge.rds"))
@@ -2337,6 +2774,9 @@ server <- function(input, output, session) {
         append_log(paste0(log_tag, " integrator_root=", integrator_root))
         append_log(paste0(log_tag, " cluster_method=", current_cluster_method))
         append_log(paste0(log_tag, " threshold_used=", current_threshold))
+        append_log(paste0(log_tag, " settings_sig=", sess$settings_sig))
+        append_log(paste0(log_tag, " gwas_path=", current_gwas_path %||% "NA"))
+        append_log(paste0(log_tag, " gwas_hash=", current_gwas_hash %||% "NA"))
         append_log(paste0(log_tag, " gwas_session_file=", paste(manifest$gwas_session_file, collapse = " | ")))
         append_log(paste0(log_tag, " session_id=", session_id))
         append_log(paste0(log_tag, " session_dir=", session_dir))
@@ -4012,7 +4452,23 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
     axis_labels <- paste0("chr", ax$chrN)
     GENOME_END  <- max(ref$chr_cum + ref$len)
     
-    thr_y <- if ((input$cluster_method %||% "window") == "window") (input$pthr %||% 5) else (input$min_logp %||% 6)
+    st_plot <- tryCatch(gi_sync$state_shared(), error = function(e) NULL)
+    
+    thr_y <- if (is.list(st_plot) && length(st_plot) > 0) {
+      suppressWarnings(as.numeric(st_plot$thr_value %||% NA_real_))
+    } else {
+      NA_real_
+    }
+    
+    if (!is.finite(thr_y)) {
+      thr_y <- if (identical(input$cluster_method %||% "window", "window")) {
+        suppressWarnings(as.numeric(input$pthr %||% 7.3))
+      } else if (identical(input$cluster_method %||% "user_defined")) {
+        suppressWarnings(as.numeric(input$pthr_user_defined %||% 7.3))
+      } else {
+        suppressWarnings(as.numeric(input$min_logp %||% 6))
+      }
+    }
     
     dfp <- dfp %>%
       dplyr::arrange(CHR, BP) %>%
@@ -6406,10 +6862,13 @@ $(document).on('click', '#giDiseasePopup .diseasePick', function(e){
   #  ############################ LD Module   #####################################
   #  ################# GWAS -> LD module canonical cluster input###################
   
+  session_dir_rv <- reactiveVal(NULL)
+  
   ld_module_server(
     "ld",
     app_tag = "ewasdis",
-    activate_r = reactive(TRUE)
+    activate_r = reactive(TRUE),
+    session_dir_r = session_dir_rv
   )
   ##############################################################################
   ##############################    RESET    ###################################

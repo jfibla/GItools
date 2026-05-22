@@ -78,6 +78,8 @@ source(cfg_file, local = TRUE)
 
 cfg <- gi_cfg()
 
+
+
 ld_file <- file.path(cfg$shared, "mod_ld.R")
 
 cat("\n[LD-SOURCE] cfg$shared / gi_shared_root = ", cfg$shared %||% gi_shared_root, "\n", sep = "")
@@ -91,23 +93,95 @@ gi_state_file <- file.path(cfg$shared, "gi_state.R")
 stopifnot(file.exists(gi_state_file))
 source(gi_state_file, local = TRUE)
 
+####### TEMPORAL ############
+cat("\n================ GI PATH DEBUG ================\n")
+cat("APP:", APP_KEY %||% "unknown", "\n")
+cat("PID:", Sys.getpid(), "\n")
+cat("WD:", getwd(), "\n")
+
+if (exists("cfg")) {
+  cat("cfg$root:", cfg$root, "\n")
+  cat("cfg$shared:", cfg$shared, "\n")
+}
+
+if (exists("BASE")) {
+  cat("BASE:", BASE, "\n")
+}
+
+if (exists("gi_shared_root")) {
+  cat("gi_shared_root:", gi_shared_root, "\n")
+}
+
+cat("gi_state_root():", gi_state_root(), "\n")
+cat("GITOOLS_ROOT:", Sys.getenv("GITOOLS_ROOT", ""), "\n")
+
+cat("===============================================\n\n")
+#############################
+
 # Catalog as MASTER: write parameters for slaves
 write_params_rds <- function(sid, input, min_hits_value = NULL, extra = list()) {
   stopifnot(nzchar(sid))
   p <- gi_state_paths(sid)$params
   
+  cluster_method_now <- input$cluster_method %||% NA_character_
+  
+  hits_mode_now <- if (identical(cluster_method_now, "hits")) {
+    as.character(input$hits_mode %||% NA_character_)
+  } else {
+    NA_character_
+  }
+  
+  thr_type_now <- if (identical(cluster_method_now, "window")) {
+    "pthr"
+  } else if (identical(cluster_method_now, "hits")) {
+    "min_logp"
+  } else if (identical(cluster_method_now, "user_defined")) {
+    "pthr_user_defined"
+  } else {
+    NA_character_
+  }
+  
+  thr_value_now <- if (identical(cluster_method_now, "window")) {
+    suppressWarnings(as.numeric(input$pthr %||% NA_real_))
+  } else if (identical(cluster_method_now, "hits")) {
+    suppressWarnings(as.numeric(input$min_logp %||% NA_real_))
+  } else if (identical(cluster_method_now, "user_defined")) {
+    suppressWarnings(as.numeric(input$pthr_user_defined %||% NA_real_))
+  } else {
+    NA_real_
+  }
+  
   par <- c(list(
-    stamp          = as.integer(Sys.time()),
-    cluster_method = input$cluster_method %||% NULL,
-    hits_mode      = input$hits_mode %||% NULL,
-    thr_type       = if (identical(input$cluster_method, "window")) "pthr" else "min_logp",
-    thr_value      = if (identical(input$cluster_method, "window")) (input$pthr %||% NULL) else (input$min_logp %||% NULL),
-    pthr           = input$pthr %||% NULL,
-    min_logp       = input$min_logp %||% NULL,
-    flank_bp       = input$flank %||% NULL,
-    win_bp         = input$win_bp %||% NULL,
-    step_bp        = input$step_bp %||% NULL,
-    min_hits       = as.integer(min_hits_value %||% 3L)
+    stamp             = as.integer(Sys.time()),
+    cluster_method    = cluster_method_now,
+    hits_mode         = hits_mode_now,
+    thr_type          = thr_type_now,
+    thr_value         = thr_value_now,
+    pthr              = suppressWarnings(as.numeric(input$pthr %||% NA_real_)),
+    min_logp          = suppressWarnings(as.numeric(input$min_logp %||% NA_real_)),
+    pthr_user_defined = suppressWarnings(as.numeric(input$pthr_user_defined %||% NA_real_)),
+    flank_bp          = if (identical(cluster_method_now, "window")) {
+      suppressWarnings(as.integer(input$flank %||% NA_integer_))
+    } else {
+      NA_integer_
+    },
+    win_bp            = if (identical(cluster_method_now, "hits")) {
+      suppressWarnings(as.integer(input$win_bp %||% NA_integer_))
+    } else {
+      NA_integer_
+    },
+    step_bp           = if (identical(cluster_method_now, "hits")) {
+      suppressWarnings(as.integer(input$step_bp %||% NA_integer_))
+    } else {
+      NA_integer_
+    },
+    min_hits          = suppressWarnings(as.integer(min_hits_value %||% 3L)),
+    user_defined      = identical(cluster_method_now, "user_defined"),
+    user_cluster_file = if (identical(cluster_method_now, "user_defined")) {
+      tryCatch(as.character(input$cluster_file$name %||% NA_character_), error = function(e) NA_character_)
+    } else {
+      NA_character_
+    }
   ), extra)
   
   saveRDS(par, p)
@@ -321,66 +395,70 @@ extract_catalog_by_clusters <- function(clusters, cat_prepared) {
   if (is.null(clusters) || !nrow(clusters)) return(tibble::tibble())
   if (is.null(cat_prepared) || !nrow(cat_prepared)) return(tibble::tibble())
   
-  out <- vector("list", nrow(clusters))
+  cl <- data.table::as.data.table(clusters)
+  ct <- data.table::as.data.table(cat_prepared)
   
-  for (i in seq_len(nrow(clusters))) {
-    
-    chr_i   <- suppressWarnings(as.integer(clusters$chr[i]))
-    st      <- suppressWarnings(as.numeric(clusters$start[i]))
-    en      <- suppressWarnings(as.numeric(clusters$end[i]))
-    chr_lab <- chr_label_plink(chr_i)
-    
-    if (!is.finite(chr_i) || !is.finite(st) || !is.finite(en) || st > en) {
-      out[[i]] <- NULL
-      next
-    }
-    
-    sub <- cat_prepared %>%
-      dplyr::filter(chr == chr_i, pos >= st, pos <= en)
-    
-    if (!nrow(sub)) {
-      out[[i]] <- NULL
-      next
-    }
-    
-    # --- cluster metadata per row (like NonSyn normalized output) ---
-    sub$cluster_id    <- as.character(clusters$cluster_id[i])
-    sub$cluster       <- if ("cluster_n" %in% names(clusters)) as.integer(clusters$cluster_n[i]) else NA_integer_
-    sub$cluster_start <- as.integer(st)
-    sub$cluster_end   <- as.integer(en)
-    
-    # --- standard display fields ---
-    sub$CHR <- chr_lab
-    sub$POS <- sub$pos
-    
-    # parse only on the subset
-    sub2 <- sub %>%
-      dplyr::mutate(
-        rsid    = ifelse(is.na(rsid_raw), NA_character_, as.character(rsid_raw)),
-        P_VALUE = ifelse(is.na(p_raw), NA_real_, parse_p_robust(p_raw)),
-        OR_BETA = {
-          x <- or_raw
-          if (is.numeric(x)) as.numeric(x) else suppressWarnings(readr::parse_number(as.character(x)))
-        },
-        PUBMEDID     = ifelse(is.na(pmid_raw), NA_character_, as.character(pmid_raw)),
-        MAPPED_GENE  = ifelse(is.na(gene_raw), NA_character_, as.character(gene_raw)),
-        DISEASE      = ifelse(is.na(disease_raw), NA_character_, as.character(disease_raw)),
-        MAPPED_TRAIT = ifelse(is.na(trait_raw), NA_character_, as.character(trait_raw))
-      ) %>%
-      dplyr::select(
-        cluster_id, cluster, cluster_start, cluster_end,
-        CHR, POS, rsid, P_VALUE, OR_BETA, PUBMEDID, MAPPED_GENE, DISEASE, MAPPED_TRAIT
-      )
-    
-    out[[i]] <- sub2
-  }
+  cl[, chr := suppressWarnings(as.integer(chr))]
+  cl[, start := suppressWarnings(as.numeric(start))]
+  cl[, end := suppressWarnings(as.numeric(end))]
   
-  hits <- dplyr::bind_rows(out)
-  if (!nrow(hits)) return(tibble::tibble())
+  ct[, chr := suppressWarnings(as.integer(chr))]
+  ct[, pos := suppressWarnings(as.numeric(pos))]
   
-  hits %>%
-    dplyr::mutate(hit_key = ifelse(!is.na(rsid) & nzchar(rsid), rsid, paste0(CHR, ":", POS))) %>%
+  cl <- cl[is.finite(chr) & is.finite(start) & is.finite(end) & start <= end]
+  ct <- ct[is.finite(chr) & is.finite(pos)]
+  
+  if (!nrow(cl) || !nrow(ct)) return(tibble::tibble())
+  
+  if (!"cluster_n" %in% names(cl)) cl[, cluster_n := NA_integer_]
+  
+  ct[, pos_start := pos]
+  ct[, pos_end := pos]
+  
+  data.table::setkey(cl, chr, start, end)
+  
+  ov <- data.table::foverlaps(
+    x = ct,
+    y = cl,
+    by.x = c("chr", "pos_start", "pos_end"),
+    by.y = c("chr", "start", "end"),
+    type = "within",
+    nomatch = 0L
+  )
+  
+  if (!nrow(ov)) return(tibble::tibble())
+  
+  out <- ov %>%
+    tibble::as_tibble() %>%
+    dplyr::mutate(
+      cluster_id    = as.character(cluster_id),
+      cluster       = suppressWarnings(as.integer(cluster_n)),
+      cluster_start = suppressWarnings(as.integer(start)),
+      cluster_end   = suppressWarnings(as.integer(end)),
+      CHR           = vapply(chr, chr_label_plink, character(1)),
+      POS           = pos,
+      rsid          = ifelse(is.na(rsid_raw), NA_character_, as.character(rsid_raw)),
+      P_VALUE       = ifelse(is.na(p_raw), NA_real_, parse_p_robust(p_raw)),
+      OR_BETA       = {
+        x <- or_raw
+        if (is.numeric(x)) as.numeric(x) else suppressWarnings(readr::parse_number(as.character(x)))
+      },
+      PUBMEDID      = ifelse(is.na(pmid_raw), NA_character_, as.character(pmid_raw)),
+      MAPPED_GENE   = ifelse(is.na(gene_raw), NA_character_, as.character(gene_raw)),
+      DISEASE       = ifelse(is.na(disease_raw), NA_character_, as.character(disease_raw)),
+      MAPPED_TRAIT  = ifelse(is.na(trait_raw), NA_character_, as.character(trait_raw))
+    ) %>%
+    dplyr::select(
+      cluster_id, cluster, cluster_start, cluster_end,
+      CHR, POS, rsid, P_VALUE, OR_BETA, PUBMEDID,
+      MAPPED_GENE, DISEASE, MAPPED_TRAIT
+    ) %>%
+    dplyr::mutate(
+      hit_key = ifelse(!is.na(rsid) & nzchar(rsid), rsid, paste0(CHR, ":", POS))
+    ) %>%
     dplyr::distinct(cluster_id, hit_key, .keep_all = TRUE)
+  
+  out
 }
 
 
@@ -591,7 +669,7 @@ build_gwas_significance_bridge <- function(gwas_df, clusters_df) {
 # ===========================
 
 ui <- navbarPage(
-  title = div(
+  div(
     style = "font-weight:700; font-size:22px; color:#1A4E8A;",
     HTML("📚 GWAS Catalog Inspector")
   ),
@@ -670,7 +748,8 @@ ui <- navbarPage(
           "cluster_method", "Clustering method:",
           choices = c(
             "By hit intervals (thr + flank → merge)" = "window",
-            "By hit density (min_logp + min_hits)"   = "hits"
+            "By hit density (min_logp + min_hits)"   = "hits",
+            "Upload user-defined cluster intervals"  = "user_defined"
           ),
           selected = "window"
         ),
@@ -678,16 +757,19 @@ ui <- navbarPage(
         # Method: window
         conditionalPanel(
           condition = "input.cluster_method == 'window'",
+          
           sliderInput(
             "pthr",
             "-log10(P) threshold",
             min = 2, max = 20, value = 8, step = 0.5
           ),
+          
           numericInput(
             "flank",
             "Flank (+/- bp)",
             value = 10000, min = 0, max = 10000000, step = 1000
           ),
+          
           numericInput(
             "min_hits_window",
             "Minimum GWAS hits per cluster",
@@ -742,15 +824,89 @@ ui <- navbarPage(
           )
         ),
         
+        # Method: user-defined uploaded intervals
+        conditionalPanel(
+          condition = "input.cluster_method == 'user_defined'",
+          
+          div(
+            class = "panel-lite",
+            style = "margin-top:10px;",
+            
+            tags$b("Upload custom cluster intervals"),
+            tags$p(
+              style = "margin-top:8px; margin-bottom:8px;",
+              "Provide a .csv, .tsv or .txt file with columns: ",
+              tags$code("cluster_id"), ", ",
+              tags$code("chr"), ", ",
+              tags$code("start"), ", ",
+              tags$code("end"),
+              ". If ", tags$code("cluster_id"),
+              " is missing, it will be generated automatically."
+            ),
+            
+            fileInput(
+              "cluster_file",
+              "Cluster interval file",
+              accept = c(".csv", ".tsv", ".txt")
+            ),
+            
+            fluidRow(
+              column(
+                width = 4,
+                checkboxInput(
+                  "cluster_file_header",
+                  "File contains header",
+                  value = TRUE
+                )
+              ),
+              column(
+                width = 4,
+                selectInput(
+                  "cluster_file_sep",
+                  "Separator",
+                  choices = c(
+                    "Auto" = "auto",
+                    "Comma (,)" = ",",
+                    "Tab" = "\t",
+                    "Semicolon (;)" = ";"
+                  ),
+                  selected = "auto"
+                )
+              )
+            ),
+            
+            tags$hr(),
+            
+            sliderInput(
+              "pthr_user_defined",
+              "-log10(P) threshold for assigning GWAS hits to uploaded intervals",
+              min = 2, max = 20, value = 8, step = 0.5
+            ),
+            
+            numericInput(
+              "min_hits_user_defined",
+              "Minimum GWAS hits per uploaded interval",
+              value = 0, min = 0, max = 1000, step = 1
+            ),
+            
+            tags$div(
+              style = "margin-top:10px;",
+              tableOutput("cluster_file_preview")
+            ),
+            
+            uiOutput("cluster_file_status")
+          )
+        ),
+        
         actionButton(
           "build_ranges",
           "➊ Generate intervals → merge → clusters",
           style = "background-color: #ffdd57; color: black; font-weight: bold;"
         ),
+        
         h4("Preview selected_intervals.range (clusters)"),
         div(class = "panel-lite", verbatimTextOutput("ranges_preview")),
         tags$hr(),
-        
         # -----------------------------
         # Step 3: Catalog extraction
         # -----------------------------
@@ -1122,6 +1278,8 @@ server <- function(input, output, session) {
   source(file.path(cfg$shared, "GItools_local_deeplinks_ALL_IN_ONE.R"), local = TRUE)
   source(file.path(cfg$shared, "gi_clusters_canonical.R"), local = TRUE)
   
+  
+  
   ############## Catalog as MASTER >>>> save file to share
   observeEvent(list(input$gwas_file, input$gwas_p_col, input$gwas_sep, input$gwas_header), {
     df2 <- gwas_df()
@@ -1207,8 +1365,9 @@ server <- function(input, output, session) {
     txt <- HTML(
       "<b>Clustering methods — quick guide</b><br><br>",
       
-      "<p>This app can generate GWAS <b>clusters</b> using two alternative strategies. ",
-      "Both end up producing a table of clusters with <b>cluster_id</b>, <b>start</b>, and <b>end</b> (plus summary stats such as top SNP, top −log10(P), and EWAS bins when available).</p>",
+      "<p>This app can define GWAS <b>clusters</b> using three alternative strategies. ",
+      "All of them end up producing a table of clusters with <b>cluster_id</b>, <b>start</b>, and <b>end</b> ",
+      "(plus summary stats such as top SNP, top −log10(P), and app-specific evidence when available).</p>",
       
       "<hr style='margin:10px 0;'>",
       
@@ -1257,7 +1416,24 @@ server <- function(input, output, session) {
       "<br><i>Typical behavior:</i> sliding is more sensitive to local density peaks and often finds narrower clusters than tiled.</li>",
       "</ul>",
       
-      "<br><p style='margin:0;'><i>Tip:</i> Use <b>By intervals</b> for “hit-centered regions”. Use <b>By hit count</b> (especially <b>sliding</b>) when you want “hit-dense regions”.</p>"
+      "<hr style='margin:10px 0;'>",
+      
+      "<b>3) User-defined intervals (upload cluster file)</b><br>",
+      "<p style='margin-top:6px;'>",
+      "Instead of generating clusters from GWAS distribution, you may upload your own predefined genomic intervals. ",
+      "These uploaded intervals become the canonical clusters used by the rest of the app and by the downstream inspectors.",
+      "</p>",
+      
+      "<ul>",
+      "<li><b>Input used</b>: a text table with user-defined intervals.</li>",
+      "<li><b>Expected columns</b>: at minimum <b>chr</b>, <b>start</b>, and <b>end</b>. ",
+      "An optional <b>cluster_id</b> column can also be provided; if missing, cluster IDs are generated automatically.</li>",
+      "<li><b>Accepted structure</b>: one row per cluster interval; chromosome and coordinates must define valid genomic ranges.</li>",
+      "<li><b>GWAS threshold role</b>: in this mode, the selected threshold is <b>not used to create clusters</b>; it is used to assign GWAS hits to the uploaded intervals and compute summary values such as number of hits, top SNP, and top −log10(P).</li>",
+      "<li><b>Result</b>: the uploaded intervals are retained as final clusters, optionally filtered or summarised according to the assigned GWAS hits.</li>",
+      "</ul>",
+      
+      "<br><p style='margin:0;'><i>Tip:</i> Use <b>By intervals</b> for hit-centered regions, <b>By hit count</b> (especially <b>sliding</b>) for hit-dense regions, and <b>User-defined intervals</b> when you already have a trusted set of genomic regions that should be reused directly.</p>"
     )
     
     showModal(modalDialog(
@@ -1443,12 +1619,20 @@ server <- function(input, output, session) {
   # ---------------------------------------------------------------------------
   
   observeEvent(
-    gwas_p_col_final(),
+    list(
+      input$gwas_file,
+      input$gwas_sep,
+      input$gwas_header,
+      input$gwas_p_col,
+      rv$p_col_resolved,
+      rv$p_col_needs_user
+    ),
     {
       req(input$gwas_file)
       req(rv$gwas_header_df)
       
       p_col <- gwas_p_col_final()
+      req(p_col)
       
       # Modal/loading starts ONLY here
       session$sendCustomMessage("gwas_loading", TRUE)
@@ -1643,8 +1827,12 @@ server <- function(input, output, session) {
   min_hits_active <- reactive({
     if (identical(input$cluster_method, "window")) {
       input$min_hits_window %||% 3
-    } else {
+    } else if (identical(input$cluster_method, "hits")) {
       input$min_hits_hits %||% 3
+    } else if (identical(input$cluster_method, "user_defined")) {
+      input$min_hits_user_defined %||% 0
+    } else {
+      NA_integer_
     }
   })
   
@@ -1655,10 +1843,26 @@ server <- function(input, output, session) {
     gwas_df()
   })
   
+  user_defined_clusters_df <- reactive({
+    req(input$cluster_method == "user_defined")
+    req(input$cluster_file)
+    
+    sep_use <- input$cluster_file_sep %||% "auto"
+    sep_use <- if (identical(sep_use, "auto")) NULL else sep_use
+    
+    read_user_defined_clusters_file(
+      path = input$cluster_file$datapath,
+      sep = sep_use,
+      header = isTRUE(input$cluster_file_header),
+      app_count_col = "n_catalog"
+    )
+  })
+  
   # --- Canonical clusters engine (same as GTEx) ---
   clusters_engine <- gi_clusters_canonical_init(
     session = session, input = input, output = output,
     gwas_df = gwas_df_for_clustering,
+    user_clusters_df = user_defined_clusters_df,
     build_btn_id   = "build_ranges",
     clusters_dt_id = "cluster_dt",
     hits_rows_id   = "hits_tbl_rows_selected",
@@ -1692,22 +1896,37 @@ server <- function(input, output, session) {
       gwas_df[, P := Pval]
     }
     
-    # --- path ---
+    # --- paths robustos ---
     p <- gi_state_paths(sid)
-    gwas_path <- file.path(dirname(p$params), paste0("gwas_", sid, ".rds"))
+    
+    params_path <- p$params %||% ""
+    
+    if (!is.character(params_path) || length(params_path) != 1 || !nzchar(params_path) || is.na(params_path)) {
+      params_path <- file.path(
+        cfg$shared,
+        "_state",
+        sid,
+        "params.rds"
+      )
+    }
+    
+    state_dir <- dirname(params_path)
+    dir.create(state_dir, showWarnings = FALSE, recursive = TRUE)
+    
+    gwas_path <- file.path(state_dir, paste0("gwas_", sid, ".rds"))
     
     # --- save ---
     saveRDS(gwas_df, gwas_path)
     
     cat("[SAVE] GWAS saved:", gwas_path, "\n")
     
-    # --- update state.json (CLAU!) ---
+    # --- update state.json ---
     st0 <- gi_read_state(sid)
     if (!is.list(st0)) st0 <- list()
     
     st_new <- modifyList(st0, list(
-      gwas_rds  = gwas_path,
-      stamp     = gi_bump_stamp(st0$stamp %||% 0),
+      gwas_rds   = gwas_path,
+      stamp      = gi_bump_stamp(st0$stamp %||% 0),
       updated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S")
     ))
     
@@ -1892,38 +2111,81 @@ server <- function(input, output, session) {
     if (is.null(st0) || !is.list(st0)) st0 <- list()
     
     cluster_method_now <- as.character(input$cluster_method %||% "window")
-    hits_mode_now      <- as.character(input$hits_mode %||% NA_character_)
     
-    thr_type_now <- if (identical(cluster_method_now, "window")) "pthr" else "min_logp"
-    thr_value_now <- if (identical(cluster_method_now, "window")) {
-      as.numeric(input$pthr %||% NA_real_)
+    hits_mode_now <- if (identical(cluster_method_now, "hits")) {
+      as.character(input$hits_mode %||% NA_character_)
     } else {
-      as.numeric(input$min_logp %||% NA_real_)
+      NA_character_
     }
+    
+    thr_type_now <- dplyr::case_when(
+      identical(cluster_method_now, "window") ~ "pthr",
+      identical(cluster_method_now, "hits") ~ "min_logp",
+      identical(cluster_method_now, "user_defined") ~ "pthr_user_defined",
+      TRUE ~ NA_character_
+    )
+    
+    thr_value_now <- dplyr::case_when(
+      identical(cluster_method_now, "window") ~ as.numeric(input$pthr %||% NA_real_),
+      identical(cluster_method_now, "hits") ~ as.numeric(input$min_logp %||% NA_real_),
+      identical(cluster_method_now, "user_defined") ~ as.numeric(input$pthr_user_defined %||% NA_real_),
+      TRUE ~ NA_real_
+    )
     
     new_stamp <- gi_bump_stamp(st0$stamp %||% 0)
     
+    # ------------------------------------------------------------
+    # Build canonical Integrator session info for slaves
+    # ------------------------------------------------------------
+    catalog_sess <- gi_get_integrator_session_dir(
+      gi_shared_root     = SHARED,
+      input              = input,
+      cluster_method     = cluster_method_now,
+      threshold_used     = thr_value_now,
+      gwas_session_file  = tryCatch(as.character(input$gwas_file$name %||% "gwas_input.txt"),
+                                    error = function(e) "gwas_input.txt"),
+      gwas_hash          = NA_character_,
+      canonical_settings = NULL
+    )
+    
     st_new <- modifyList(st0, list(
-      stamp          = new_stamp,
-      sid            = sid,
-      updated_at     = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-      has_gwas       = TRUE,
-      gwas_rds       = p$gwas,
-      has_clusters   = TRUE,
-      clusters_rds   = p$clus,
-      clus_rds       = p$clus,
-      params_rds     = p$params,
-      cluster_method = cluster_method_now,
-      hits_mode      = hits_mode_now,
-      thr_type       = thr_type_now,
-      thr_value      = thr_value_now,
-      pthr           = as.numeric(input$pthr %||% NA_real_),
-      min_logp       = as.numeric(input$min_logp %||% NA_real_),
-      flank_bp       = as.integer(input$flank %||% 0L),
-      flank          = as.integer(input$flank %||% 0L),
-      min_hits       = as.integer(min_hits_active() %||% NA_integer_),
-      win_bp         = as.integer(input$win_bp %||% NA_integer_),
-      step_bp        = as.integer(input$step_bp %||% NA_integer_)
+      stamp             = new_stamp,
+      sid               = sid,
+      updated_at        = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      
+      session_id        = catalog_sess$session_id,
+      session_dir       = catalog_sess$session_dir,
+      integrator_root   = catalog_sess$integrator_root,
+      settings_sig      = catalog_sess$settings_sig,
+      settings_key      = catalog_sess$settings_key,
+      settings_list     = catalog_sess$settings_list,
+      gwas_hash         = catalog_sess$gwas_hash,
+      gwas_session_file = catalog_sess$gwas_session_file,
+      
+      has_gwas          = TRUE,
+      gwas_rds          = p$gwas,
+      has_clusters      = TRUE,
+      clusters_rds      = p$clus,
+      clus_rds          = p$clus,
+      params_rds        = p$params,
+      cluster_method    = cluster_method_now,
+      hits_mode         = hits_mode_now,
+      thr_type          = thr_type_now,
+      thr_value         = thr_value_now,
+      pthr              = as.numeric(input$pthr %||% NA_real_),
+      min_logp          = as.numeric(input$min_logp %||% NA_real_),
+      pthr_user_defined = as.numeric(input$pthr_user_defined %||% NA_real_),
+      flank_bp          = if (identical(cluster_method_now, "window")) as.integer(input$flank %||% 0L) else NA_integer_,
+      flank             = if (identical(cluster_method_now, "window")) as.integer(input$flank %||% 0L) else NA_integer_,
+      min_hits          = as.integer(min_hits_active() %||% NA_integer_),
+      win_bp            = if (identical(cluster_method_now, "hits")) as.integer(input$win_bp %||% NA_integer_) else NA_integer_,
+      step_bp           = if (identical(cluster_method_now, "hits")) as.integer(input$step_bp %||% NA_integer_) else NA_integer_,
+      user_defined      = identical(cluster_method_now, "user_defined"),
+      user_cluster_file = if (identical(cluster_method_now, "user_defined")) {
+        tryCatch(as.character(input$cluster_file$name %||% NA_character_), error = function(e) NA_character_)
+      } else {
+        NA_character_
+      }
     ))
     
     tryCatch({
@@ -1962,8 +2224,12 @@ server <- function(input, output, session) {
     output$ranges_preview <- renderText({
       thr_label <- if (identical(cluster_method_now, "window")) {
         paste0("pthr=", input$pthr %||% NA)
-      } else {
+      } else if (identical(cluster_method_now, "hits")) {
         paste0("min_logp=", input$min_logp %||% NA)
+      } else if (identical(cluster_method_now, "user_defined")) {
+        paste0("pthr_user_defined=", input$pthr_user_defined %||% NA)
+      } else {
+        "threshold=NA"
       }
       
       paste0(
@@ -2202,12 +2468,6 @@ server <- function(input, output, session) {
     dfp %>% group_by(chrN) %>% summarise(center = mean(BPcum, na.rm = TRUE), .groups = "drop")
   })
   
-  # hits_df <- reactive({
-  #   df <- gwas_df(); req(nrow(df) > 0)
-  #   req(input$pthr)
-  #   df %>% filter(logp >= input$pthr) %>% arrange(desc(logp)) %>% select(CHR, BP, snp, p = Pval, logp)
-  # })
-  
   hits_df <- reactive({
     df <- gwas_df()
     req(nrow(df) > 0)
@@ -2216,8 +2476,9 @@ server <- function(input, output, session) {
     hits_mode      <- as.character(input$hits_mode %||% "")
     
     mode_resolved <- dplyr::case_when(
-      cluster_method %in% c("window") ~ "window",
-      cluster_method %in% c("hits") & hits_mode %in% c("span1mb", "tiled", "sliding") ~ hits_mode,
+      cluster_method == "window" ~ "window",
+      cluster_method == "hits" & hits_mode %in% c("span1mb", "tiled", "sliding") ~ hits_mode,
+      cluster_method == "user_defined" ~ "user_defined",
       cluster_method %in% c("span1mb", "tiled", "sliding") ~ cluster_method,
       TRUE ~ NA_character_
     )
@@ -2225,10 +2486,14 @@ server <- function(input, output, session) {
     thr <- dplyr::case_when(
       mode_resolved == "window" ~ suppressWarnings(as.numeric(input$pthr)),
       mode_resolved %in% c("span1mb", "tiled", "sliding") ~ suppressWarnings(as.numeric(input$min_logp)),
+      mode_resolved == "user_defined" ~ suppressWarnings(as.numeric(input$pthr_user_defined)),
       TRUE ~ NA_real_
     )
     
-    req(!is.na(mode_resolved), is.finite(thr))
+    validate(
+      need(!is.na(mode_resolved), "Unsupported clustering mode."),
+      need(is.finite(thr), "No valid GWAS threshold available for the selected clustering mode.")
+    )
     
     out <- df %>%
       dplyr::filter(is.finite(logp), logp >= thr) %>%
@@ -2485,12 +2750,15 @@ server <- function(input, output, session) {
           }
           
           get_catalog_cluster_method <- function(input) {
-            cm <- as.character(input$cluster_method %||% NA_character_)
-            hm <- as.character(input$hits_mode %||% NA_character_)
+            cm <- input$cluster_method %||% "window"
             
             if (identical(cm, "window")) {
               "window"
+            } else if (identical(cm, "user_defined")) {
+              "user_defined"
             } else if (identical(cm, "hits")) {
+              hm <- input$hits_mode %||% "span1mb"
+              
               if (identical(hm, "span1mb")) {
                 "hits_span1mb"
               } else if (identical(hm, "tiled")) {
@@ -2510,6 +2778,8 @@ server <- function(input, output, session) {
               suppressWarnings(as.numeric(input$pthr))
             } else if (cluster_method %in% c("hits_span1mb", "hits_tiled", "hits_sliding", "hits_unknown")) {
               suppressWarnings(as.numeric(input$min_logp))
+            } else if (identical(cluster_method, "user_defined")) {
+              suppressWarnings(as.numeric(input$pthr_user_defined))
             } else {
               NA_real_
             }
@@ -2521,89 +2791,343 @@ server <- function(input, output, session) {
             "unknown_gwas_source"
           }
           
-          gi_get_integrator_session_dir <- function(gi_shared_root, cluster_method, threshold_used) {
-            integrator_root <- file.path(gi_shared_root, "integrator_exports")
-            dir.create(integrator_root, recursive = TRUE, showWarnings = FALSE)
-            
-            method_tag <- fmt_tag(cluster_method)
-            thr_tag    <- fmt_threshold_for_path(threshold_used)
-            
-            session_id <- paste0(
-              "clust_", method_tag,
-              "__thr_", thr_tag
-            )
-            
-            session_dir <- file.path(integrator_root, session_id)
-            dir.create(session_dir, recursive = TRUE, showWarnings = FALSE)
-            
-            list(
-              integrator_root = integrator_root,
-              session_id = session_id,
-              session_dir = session_dir,
-              method_tag = method_tag,
-              thr_tag = thr_tag
-            )
-          }
-          
-          gi_load_or_create_manifest <- function(session_dir, session_id, cluster_method, threshold_used, gwas_session_file) {
-            manifest_path <- file.path(session_dir, "manifest.rds")
-            
-            if (file.exists(manifest_path)) {
-              manifest <- tryCatch(readRDS(manifest_path), error = function(e) NULL)
-              if (is.list(manifest)) {
-                if (is.null(manifest$files)) manifest$files <- list()
-                if (is.null(manifest$apps_present)) manifest$apps_present <- character(0)
-                return(list(manifest = manifest, manifest_path = manifest_path))
-              }
+          get_catalog_gwas_path <- function(input) {
+            pth <- tryCatch(as.character(input$gwas_file$datapath %||% NA_character_), error = function(e) NA_character_)
+            if (!is.na(pth) && nzchar(trimws(pth)) && file.exists(trimws(pth))) {
+              return(trimws(pth))
             }
-            
-            manifest <- list(
-              session_id = session_id,
-              created_at = as.character(Sys.time()),
-              cluster_method = cluster_method,
-              threshold_used = threshold_used,
-              gwas_session_file = gwas_session_file,
-              settings_key = paste0(
-                "cluster_method=", cluster_method,
-                ";threshold_used=", threshold_used
-              ),
-              apps_present = character(0),
-              files = list()
-            )
-            
-            list(manifest = manifest, manifest_path = manifest_path)
+            NA_character_
           }
           
           # ============================================================
           # SESSION / SETTINGS FOLDER
           # ============================================================
+          
+          gi_compute_gwas_file_hash <- function(gwas_file_path) {
+            pth <- trimws(as.character(gwas_file_path %||% ""))
+            
+            if (!nzchar(pth)) {
+              return(NA_character_)
+            }
+            
+            if (!file.exists(pth)) {
+              return(NA_character_)
+            }
+            
+            unname(tools::md5sum(pth))
+          }
+          
+          gi_get_integrator_session_dir <- function(
+    gi_shared_root,
+    input,
+    cluster_method,
+    threshold_used,
+    gwas_session_file,
+    gwas_hash = NA_character_,
+    canonical_settings = NULL
+          ) {
+            `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
+            
+            normalize_na_chr <- function(x) {
+              x <- as.character(x %||% NA_character_)
+              if (!length(x) || is.na(x) || !nzchar(trimws(x))) return(NA_character_)
+              trimws(x)
+            }
+            
+            normalize_na_num <- function(x) {
+              x <- suppressWarnings(as.numeric(x %||% NA_real_))
+              if (!length(x) || is.na(x) || !is.finite(x)) return(NA_real_)
+              x
+            }
+            
+            normalize_na_int <- function(x) {
+              x <- suppressWarnings(as.integer(x %||% NA_integer_))
+              if (!length(x) || is.na(x) || !is.finite(x)) return(NA_integer_)
+              x
+            }
+            
+            if (is.null(gi_shared_root) || !nzchar(as.character(gi_shared_root))) {
+              stop("gi_shared_root is empty. Cannot create Integrator session folder.")
+            }
+            
+            integrator_root <- file.path(gi_shared_root, "integrator_exports")
+            dir.create(integrator_root, recursive = TRUE, showWarnings = FALSE)
+            
+            if (!dir.exists(integrator_root)) {
+              stop("Could not create integrator_root: ", integrator_root)
+            }
+            
+            settings_from_input <- function() {
+              cm  <- normalize_na_chr(cluster_method)
+              thr <- normalize_na_num(threshold_used)
+              
+              raw_cluster_method <- cm
+              raw_hits_mode <- normalize_na_chr(input$hits_mode)
+              current_user_defined <- identical(raw_cluster_method, "user_defined")
+              
+              current_cluster_method <- gi_resolve_cluster_method(
+                cluster_method = raw_cluster_method,
+                hits_mode      = raw_hits_mode,
+                user_defined   = current_user_defined
+              )
+              
+              if (identical(current_cluster_method, "window")) {
+                list(
+                  cluster_method    = current_cluster_method,
+                  threshold_used    = thr,
+                  hits_mode         = NA_character_,
+                  min_hits          = normalize_na_int(input$min_hits_window %||% input$min_hits),
+                  flank_bp          = normalize_na_int(input$flank),
+                  win_bp            = NA_integer_,
+                  step_bp           = NA_integer_,
+                  user_defined      = FALSE,
+                  user_cluster_file = NA_character_
+                )
+              } else if (identical(current_cluster_method, "user_defined")) {
+                list(
+                  cluster_method    = current_cluster_method,
+                  threshold_used    = thr,
+                  hits_mode         = NA_character_,
+                  min_hits          = normalize_na_int(input$min_hits_user_defined %||% input$min_hits),
+                  flank_bp          = NA_integer_,
+                  win_bp            = NA_integer_,
+                  step_bp           = NA_integer_,
+                  user_defined      = TRUE,
+                  user_cluster_file = tryCatch(
+                    normalize_na_chr(input$cluster_file$name),
+                    error = function(e) NA_character_
+                  )
+                )
+              } else {
+                list(
+                  cluster_method    = current_cluster_method,
+                  threshold_used    = thr,
+                  hits_mode         = raw_hits_mode,
+                  min_hits          = normalize_na_int(input$min_hits_hits %||% input$min_hits),
+                  flank_bp          = NA_integer_,
+                  win_bp            = normalize_na_int(input$win_bp),
+                  step_bp           = normalize_na_int(input$step_bp),
+                  user_defined      = FALSE,
+                  user_cluster_file = NA_character_
+                )
+              }
+            }
+            
+            settings_from_canonical <- function(cs) {
+              list(
+                cluster_method    = normalize_na_chr(cs$cluster_method %||% cluster_method),
+                threshold_used    = normalize_na_num(cs$threshold_used %||% threshold_used),
+                hits_mode         = normalize_na_chr(cs$hits_mode),
+                min_hits          = normalize_na_int(cs$min_hits),
+                flank_bp          = normalize_na_int(cs$flank_bp),
+                win_bp            = normalize_na_int(cs$win_bp),
+                step_bp           = normalize_na_int(cs$step_bp),
+                user_defined      = isTRUE(cs$user_defined),
+                user_cluster_file = normalize_na_chr(cs$user_cluster_file)
+              )
+            }
+            
+            settings_list <- if (is.list(canonical_settings) && length(canonical_settings) > 0) {
+              settings_from_canonical(canonical_settings)
+            } else {
+              settings_from_input()
+            }
+            
+            # Canonical normalization, but safe fallback if helper is not loaded
+            if (exists("gi_normalize_cluster_settings", mode = "function")) {
+              settings_list <- gi_normalize_cluster_settings(
+                cluster_method    = settings_list$cluster_method,
+                hits_mode         = settings_list$hits_mode,
+                threshold_used    = settings_list$threshold_used,
+                min_hits          = settings_list$min_hits,
+                flank_bp          = settings_list$flank_bp,
+                win_bp            = settings_list$win_bp,
+                step_bp           = settings_list$step_bp,
+                user_defined      = isTRUE(settings_list$user_defined),
+                user_cluster_file = settings_list$user_cluster_file
+              )
+            }
+            
+            if (exists("gi_settings_key_from_list", mode = "function")) {
+              settings_key <- gi_settings_key_from_list(settings_list)
+            } else {
+              settings_key <- paste(
+                paste0("cluster_method=", settings_list$cluster_method %||% ""),
+                paste0("hits_mode=", settings_list$hits_mode %||% ""),
+                paste0("threshold_used=", settings_list$threshold_used %||% ""),
+                paste0("min_hits=", settings_list$min_hits %||% ""),
+                paste0("flank_bp=", settings_list$flank_bp %||% ""),
+                paste0("win_bp=", settings_list$win_bp %||% ""),
+                paste0("step_bp=", settings_list$step_bp %||% ""),
+                paste0("user_defined=", settings_list$user_defined %||% ""),
+                paste0("user_cluster_file=", settings_list$user_cluster_file %||% ""),
+                sep = ";"
+              )
+            }
+            
+            settings_sig <- substr(digest::digest(settings_key, algo = "xxhash64"), 1, 16)
+            
+            cm_tag <- normalize_na_chr(settings_list$cluster_method)
+            if (is.na(cm_tag)) cm_tag <- "unknown"
+            
+            thr_tag <- normalize_na_num(settings_list$threshold_used)
+            thr_tag <- if (is.na(thr_tag)) {
+              "NA"
+            } else {
+              gsub("\\.", "p", format(thr_tag, trim = TRUE, scientific = FALSE))
+            }
+            
+            method_tag <- cm_tag
+            
+            session_id <- paste0("clust_", method_tag, "_thr_", thr_tag, "_sig_", settings_sig)
+            session_dir <- file.path(integrator_root, session_id)
+            
+            dir.create(session_dir, recursive = TRUE, showWarnings = FALSE)
+            
+            if (!dir.exists(session_dir)) {
+              stop("Could not create session_dir: ", session_dir)
+            }
+            
+            list(
+              integrator_root   = integrator_root,
+              session_dir       = session_dir,
+              session_id        = session_id,
+              method_tag        = method_tag,
+              thr_tag           = thr_tag,
+              settings_sig      = settings_sig,
+              settings_key      = settings_key,
+              settings_list     = settings_list,
+              gwas_hash         = normalize_na_chr(gwas_hash),
+              gwas_session_file = normalize_na_chr(gwas_session_file)
+            )
+          }
+          
+          gi_load_or_create_manifest <- function(
+                 session_dir,
+                 session_id,
+                 cluster_method,
+                 threshold_used,
+                 gwas_session_file,
+                 settings_sig = NA_character_,
+                 settings_list = NULL
+                       ) {
+            
+            manifest_path <- file.path(session_dir, "manifest.rds")
+            
+            if (file.exists(manifest_path)) {
+              manifest <- tryCatch(readRDS(manifest_path), error = function(e) NULL)
+              
+              if (is.list(manifest)) {
+                if (is.null(manifest$files)) manifest$files <- list()
+                if (is.null(manifest$apps_present)) manifest$apps_present <- character(0)
+                if (is.null(manifest$settings_sig)) manifest$settings_sig <- settings_sig
+                if (is.null(manifest$settings_list)) manifest$settings_list <- settings_list
+                
+                return(list(
+                  manifest = manifest,
+                  manifest_path = manifest_path
+                ))
+              }
+            }
+            
+            if (is.null(settings_list)) {
+              settings_list <- list(
+                cluster_method    = cluster_method,
+                threshold_used    = threshold_used,
+                gwas_session_file = gwas_session_file
+              )
+            }
+            
+            manifest <- list(
+              session_id        = session_id,
+              created_at        = as.character(Sys.time()),
+              cluster_method    = cluster_method,
+              threshold_used    = threshold_used,
+              gwas_session_file = gwas_session_file,
+              settings_sig      = settings_sig,
+              settings_list     = settings_list,
+              settings_key      = paste(
+                paste0("cluster_method=", settings_list$cluster_method %||% ""),
+                paste0("hits_mode=", settings_list$hits_mode %||% ""),
+                paste0("threshold_used=", settings_list$threshold_used %||% ""),
+                paste0("min_hits=", settings_list$min_hits %||% ""),
+                paste0("flank_bp=", settings_list$flank_bp %||% ""),
+                paste0("win_bp=", settings_list$win_bp %||% ""),
+                paste0("step_bp=", settings_list$step_bp %||% ""),
+                paste0("user_defined=", settings_list$user_defined %||% ""),
+                paste0("user_cluster_file=", settings_list$user_cluster_file %||% ""),
+                sep = ";"
+              ),
+              apps_present      = character(0),
+              files             = list()
+            )
+            
+            
+            saveRDS(manifest, manifest_path)
+            
+            list(
+              manifest = manifest,
+              manifest_path = manifest_path
+            )
+          }
+          
+          # ============================================================
+          # SESSION / SETTINGS FOLDER (cont.)
+          # ============================================================
           current_cluster_method <- get_catalog_cluster_method(input)
           current_threshold      <- get_catalog_threshold(input, current_cluster_method)
           current_gwas_name      <- get_catalog_gwas_name(input)
+          current_gwas_path      <- get_catalog_gwas_path(input)
+          current_gwas_hash      <- gi_compute_gwas_file_hash(current_gwas_path)
           
           sess <- gi_get_integrator_session_dir(
-            gi_shared_root = gi_shared_root,
-            cluster_method = current_cluster_method,
-            threshold_used = current_threshold
+            gi_shared_root    = gi_shared_root,
+            input             = input,
+            cluster_method    = current_cluster_method,
+            threshold_used    = current_threshold,
+            gwas_session_file = current_gwas_name,
+            gwas_hash         = current_gwas_hash
           )
           
+          append_log(paste0(
+            log_tag, " settings_list_json=",
+            jsonlite::toJSON(sess$settings_list, auto_unbox = TRUE, null = "null", na = "null")
+          ))
+          
+          append_log(paste0(log_tag, " settings_sig=", sess$settings_sig))
+        
           integrator_root <- sess$integrator_root
           session_id      <- sess$session_id
           session_dir     <- sess$session_dir
           method_tag      <- sess$method_tag
           thr_tag         <- sess$thr_tag
           
+          session_dir_rv(session_dir)
+          
           manifest_obj <- gi_load_or_create_manifest(
-            session_dir = session_dir,
-            session_id = session_id,
-            cluster_method = current_cluster_method,
-            threshold_used = current_threshold,
-            gwas_session_file = current_gwas_name
+            session_dir       = session_dir,
+            session_id        = session_id,
+            cluster_method    = current_cluster_method,
+            threshold_used    = current_threshold,
+            gwas_session_file = current_gwas_name,
+            settings_sig      = sess$settings_sig,
+            settings_list     = sess$settings_list
           )
           
           manifest      <- manifest_obj$manifest
           manifest_path <- manifest_obj$manifest_path
           
+          cat("\n[DBG SESSION DIR]\n")
+          cat("app =", "CATALOG_OR_SLAVE", "\n")
+          cat("session_dir =", session_dir, "\n")
+          cat("session_id =", session_id, "\n")
+          cat("current_cluster_method =", current_cluster_method, "\n")
+          cat("current_threshold =", current_threshold, "\n")
+          cat("settings_sig =", sess$settings_sig %||% NA, "\n")
+          cat("settings_list:\n")
+          print(sess$settings_list)
+          cat("\n")
+            
           # Validate existing manifest to avoid accidental mixing
           if (!identical(as.character(manifest$cluster_method %||% ""), as.character(current_cluster_method))) {
             stop("Existing manifest cluster_method does not match current cluster_method.")
@@ -2614,6 +3138,13 @@ server <- function(input, output, session) {
             suppressWarnings(as.numeric(current_threshold))
           ))) {
             stop("Existing manifest threshold_used does not match current threshold_used.")
+          }
+          
+          if (!identical(
+            as.character(manifest$settings_sig %||% ""),
+            as.character(sess$settings_sig %||% "")
+          )) {
+            stop("Existing manifest settings_sig does not match current settings signature.")
           }
           
           # Keep GWAS file recorded in manifest as a clean character vector
@@ -2627,22 +3158,30 @@ server <- function(input, output, session) {
           }
           
           manifest$gwas_session_file <- manifest_gwas_files
+          manifest$gwas_hash <- current_gwas_hash
           
-          gene_bridge_path     <- file.path(session_dir, paste0(app_slug, "_gene_bridge.rds"))
-          term_bridge_path     <- file.path(session_dir, paste0(app_slug, "_term_bridge.rds"))
-          clusters_master_path <- file.path(session_dir, paste0(app_slug, "_clusters_master.rds"))
-          candidates_path      <- file.path(session_dir, paste0(app_slug, "_candidates.rds"))
+          saveRDS(manifest, manifest_path)
+          
+          gene_bridge_path      <- file.path(session_dir, paste0(app_slug, "_gene_bridge.rds"))
+          term_bridge_path      <- file.path(session_dir, paste0(app_slug, "_term_bridge.rds"))
+          clusters_master_path  <- file.path(session_dir, paste0(app_slug, "_clusters_master.rds"))
+          candidates_path       <- file.path(session_dir, paste0(app_slug, "_candidates.rds"))
           gwas_sig_bridge_path  <- file.path(session_dir, "gwas_significance_bridge.rds")
           
           append_log(paste0(log_tag, " integrator_root: ", integrator_root))
           append_log(paste0(log_tag, " cluster_method: ", current_cluster_method))
           append_log(paste0(log_tag, " threshold_used: ", current_threshold))
+          append_log(paste0(log_tag, " settings_sig: ", sess$settings_sig))
+          append_log(paste0(log_tag, " gwas_name: ", current_gwas_name))
+          append_log(paste0(log_tag, " gwas_path: ", current_gwas_path %||% "NA"))
+          append_log(paste0(log_tag, " gwas_hash: ", current_gwas_hash %||% "NA"))
           append_log(paste0(log_tag, " gwas_session_file: ", paste(manifest$gwas_session_file, collapse = " | ")))
           append_log(paste0(log_tag, " session_id: ", session_id))
           append_log(paste0(log_tag, " session_dir: ", session_dir))
           append_log(paste0(log_tag, " hits nrow=", nrow(hits), " ncol=", ncol(hits)))
           append_log(paste0(log_tag, " hits cols: ", paste(names(hits), collapse = ", ")))
           
+
           # ============================================================
           # A) GENE BRIDGE
           # ============================================================
@@ -2875,26 +3414,70 @@ server <- function(input, output, session) {
               ) %>%
               dplyr::distinct()
             
-            gwas_candidates <- gwas_candidates0 %>%
-              dplyr::left_join(
-                clusters_master %>%
-                  dplyr::rename(
-                    cluster_chr   = chr,
-                    cluster_start = start,
-                    cluster_end   = end
-                  ),
-                by = dplyr::join_by(
-                  chr == cluster_chr,
-                  pos_ini >= cluster_start,
-                  pos_ini <= cluster_end
+            # ------------------------------------------------------------
+            # FAST cluster assignment (foverlaps)
+            # ------------------------------------------------------------
+            cl_dt <- data.table::as.data.table(
+              clusters_master %>%
+                dplyr::transmute(
+                  cluster_id = as.character(cluster_id),
+                  chr        = suppressWarnings(as.integer(chr)),
+                  start      = suppressWarnings(as.integer(start)),
+                  end        = suppressWarnings(as.integer(end))
                 )
+            )
+            
+            gw_dt <- data.table::as.data.table(gwas_candidates0)
+            
+            cl_dt <- cl_dt[
+              is.finite(chr) &
+                is.finite(start) &
+                is.finite(end)
+            ]
+            
+            gw_dt <- gw_dt[
+              is.finite(chr) &
+                is.finite(pos_ini)
+            ]
+            
+            if (nrow(cl_dt) > 0 && nrow(gw_dt) > 0) {
+              
+              data.table::setkey(cl_dt, chr, start, end)
+              
+              gwas_candidates <- data.table::foverlaps(
+                x = gw_dt,
+                y = cl_dt,
+                by.x = c("chr", "pos_ini", "pos_end"),
+                by.y = c("chr", "start", "end"),
+                type = "within",
+                nomatch = 0L
               ) %>%
-              dplyr::mutate(
-                cluster_id = cluster_id.y
-              ) %>%
-              dplyr::select(cluster_id, chr, pos_ini, pos_end, id_hit, classe) %>%
-              dplyr::filter(!is.na(cluster_id), nzchar(cluster_id)) %>%
-              dplyr::distinct()
+                tibble::as_tibble() %>%
+                dplyr::select(
+                  cluster_id,
+                  chr,
+                  pos_ini,
+                  pos_end,
+                  id_hit,
+                  classe
+                ) %>%
+                dplyr::filter(
+                  !is.na(cluster_id),
+                  nzchar(cluster_id)
+                ) %>%
+                dplyr::distinct()
+              
+            } else {
+              
+              gwas_candidates <- tibble::tibble(
+                cluster_id = character(),
+                chr        = integer(),
+                pos_ini    = integer(),
+                pos_end    = integer(),
+                id_hit     = character(),
+                classe     = character()
+              )
+            }
           }
           
           append_log(paste0(ld_tag, "[CANDIDATES][GWAS] nrow=", nrow(gwas_candidates)))
@@ -3656,6 +4239,18 @@ server <- function(input, output, session) {
   # Manhattan_combo plotly
   # ---------------------------------------------------------------------------
   
+  thr_active <- reactive({
+    if (identical(input$cluster_method, "window")) {
+      suppressWarnings(as.numeric(input$pthr))
+    } else if (identical(input$cluster_method, "hits")) {
+      suppressWarnings(as.numeric(input$min_logp))
+    } else if (identical(input$cluster_method, "user_defined")) {
+      suppressWarnings(as.numeric(input$pthr_user_defined))
+    } else {
+      NA_real_
+    }
+  })
+  
   
   output$manhattan_combo <- renderPlotly({
     
@@ -3686,7 +4281,16 @@ server <- function(input, output, session) {
         dplyr::filter(is.finite(chr_num), is.finite(chr_cum))
     }
     
-    thr_y <- if ((input$cluster_method %||% "window") == "window") (input$pthr %||% 7.3) else (input$min_logp %||% 6)
+    thr_y <- dplyr::case_when(
+      identical(input$cluster_method %||% "window", "window") ~ as.numeric(input$pthr %||% 7.3),
+      identical(input$cluster_method %||% "window", "hits") ~ as.numeric(input$min_logp %||% 6),
+      identical(input$cluster_method %||% "window", "user_defined") ~ as.numeric(input$pthr_user_defined %||% 8),
+      TRUE ~ NA_real_
+    )
+    
+    if (!is.finite(thr_y)) {
+      thr_y <- 8
+    }
     
     # ============================
     # p1: GWAS (NO segments here)
@@ -7138,10 +7742,13 @@ server <- function(input, output, session) {
   #  ############################ LD Module   #####################################
   #  ################# GWAS -> LD module canonical cluster input###################
   
+  session_dir_rv <- reactiveVal(NULL)
+  
   ld_mod <- ld_module_server(
     id = "ld",
     app_tag = "catalog",
-    activate_r = reactive(identical(input$topnav, "ld_tab"))
+    activate_r = reactive(identical(input$topnav, "ld_tab")),
+    session_dir_r = session_dir_rv
   )
   
   ##############################################################################

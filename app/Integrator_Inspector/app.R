@@ -16,6 +16,7 @@ library(shinycssloaders)
 library(ComplexUpset)
 library(ggplot2)
 library(UpSetR)
+library(later)
 
 
 # Gene model (hg38)
@@ -58,6 +59,9 @@ source("R/mod_gwas_hit_priority.R")
 source("R/module_audit_table.R")
 
 cfg <- gi_cfg()
+
+
+
 gi_root        <- cfg$root
 gi_shared_root <- cfg$shared
 gi_res_root    <- cfg$resources
@@ -78,6 +82,40 @@ cat("[Integrator_Inspector] dir.exists(gi_pop_dir) =", dir.exists(gi_pop_dir), "
 # -----------------------------
 dl_file <- file.path(gi_shared_root, "GItools_local_deeplinks_ALL_IN_ONE.R")
 if (file.exists(dl_file)) source(dl_file, local = TRUE)
+
+
+
+######## TEMPORAL ############
+#cat("\n================ GI PATH DEBUG ================\n")
+#cat("APP:", if (exists("APP_KEY")) APP_KEY else "integrator", "\n")
+#cat("PID:", Sys.getpid(), "\n")
+#cat("WD:", getwd(), "\n")
+#
+#if (exists("cfg")) {
+#  cat("cfg$root:", cfg$root, "\n")
+#  cat("cfg$shared:", cfg$shared, "\n")
+#}
+#
+#if (exists("BASE")) {
+#  cat("BASE:", BASE, "\n")
+#}
+#
+#if (exists("gi_shared_root")) {
+#  cat("gi_shared_root:", gi_shared_root, "\n")
+#}
+#
+#if (exists("gi_state_root", mode = "function")) {
+#  cat("gi_state_root():", gi_state_root(), "\n")
+#} else {
+#  cat("gi_state_root(): NOT AVAILABLE\n")
+#}
+#
+#cat("GITOOLS_ROOT:", Sys.getenv("GITOOLS_ROOT", ""), "\n")
+#cat("GITOOLS_REPO_ROOT:", Sys.getenv("GITOOLS_REPO_ROOT", ""), "\n")
+#cat("GITOOLS_SHARED_DIR:", Sys.getenv("GITOOLS_SHARED_DIR", ""), "\n")
+#cat("===============================================\n\n")
+############################# 
+
 
 stopifnot(nzchar(gi_pop_dir))
 stopifnot(dir.exists(gi_pop_dir))
@@ -147,6 +185,32 @@ read_multi_files <- function(files, header = TRUE, user_delim = NULL, label = "f
 # -----------------------------
 # Helpers
 # -----------------------------
+
+ # colapte columns if >5 lines
+collapse_long_cell <- function(x, max_lines = 5) {
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  
+  vapply(x, function(z) {
+    parts <- unlist(strsplit(z, "\\s*;\\s*|\\n+", perl = TRUE))
+    parts <- trimws(parts)
+    parts <- parts[nzchar(parts)]
+    
+    if (length(parts) <= max_lines) return(z)
+    
+    shown <- paste(parts[seq_len(max_lines)], collapse = "<br>")
+    hidden <- paste(parts[-seq_len(max_lines)], collapse = "<br>")
+    
+    paste0(
+      shown,
+      "<br><details><summary>Mostrar més (",
+      length(parts) - max_lines,
+      ")</summary>",
+      hidden,
+      "</details>"
+    )
+  }, character(1))
+}
 
 pick_col <- function(df, candidates) {
   nm <- intersect(candidates, names(df))
@@ -255,6 +319,15 @@ read_manifest_safe <- function(session_dir) {
 }
 
 manifest_to_display_df <- function(manifest) {
+  fmt <- function(x, collapse = " | ") {
+    if (is.null(x) || length(x) == 0) return("")
+    x <- unlist(x, use.names = FALSE)
+    x <- as.character(x)
+    x <- x[!is.na(x)]
+    if (!length(x)) return("")
+    paste(x, collapse = collapse)
+  }
+  
   if (is.null(manifest) || !is.list(manifest)) {
     return(tibble::tibble(
       field = c(
@@ -264,13 +337,19 @@ manifest_to_display_df <- function(manifest) {
         "hits_mode",
         "threshold_used",
         "min_hits",
+        "flank_bp",
+        "win_bp",
+        "step_bp",
         "apps_present",
         "created_at",
         "last_updated"
       ),
-      value = c(NA, NA, NA, NA, NA, NA, NA, NA, NA)
+      value = rep(NA_character_, 12)
     ))
   }
+  
+  st <- manifest$settings_list
+  if (!is.list(st)) st <- list()
   
   tibble::tibble(
     field = c(
@@ -280,20 +359,26 @@ manifest_to_display_df <- function(manifest) {
       "hits_mode",
       "threshold_used",
       "min_hits",
+      "flank_bp",
+      "win_bp",
+      "step_bp",
       "apps_present",
       "created_at",
       "last_updated"
     ),
     value = c(
-      paste(manifest$session_id %||% "", collapse = " | "),
-      paste(as.character(manifest$gwas_session_file %||% ""), collapse = " | "),
-      paste(as.character(manifest$cluster_method %||% ""), collapse = " | "),
-      paste(as.character(manifest$hits_mode %||% ""), collapse = " | "),
-      paste(as.character(manifest$threshold_used %||% ""), collapse = " | "),
-      paste(as.character(manifest$min_hits %||% ""), collapse = " | "),
-      paste(as.character(manifest$apps_present %||% ""), collapse = "; "),
-      paste(as.character(manifest$created_at %||% ""), collapse = " | "),
-      paste(as.character(manifest$last_updated %||% ""), collapse = " | ")
+      fmt(manifest$session_id),
+      fmt(manifest$gwas_session_file),
+      fmt(manifest$cluster_method),
+      fmt(st$hits_mode),
+      fmt(manifest$threshold_used),
+      fmt(st$min_hits),
+      fmt(st$flank_bp),
+      fmt(st$win_bp),
+      fmt(st$step_bp),
+      fmt(manifest$apps_present, collapse = "; "),
+      fmt(manifest$created_at),
+      fmt(manifest$last_updated)
     )
   )
 }
@@ -617,146 +702,6 @@ read_keep_file_global <- function(pop, ld_pops_dir) {
   out
 }
 
-compute_ld_for_cluster_global <- function(
-    cluster_row,
-    candidates_df,
-    bfile_ref,
-    keep_path,
-    plink_bin,
-    workdir,
-    pop,
-    ld_metric = "R2",
-    r2_min = 0.6,
-    compute_blocks = TRUE,
-    max_snps_interval = 400
-) {
-  bundle <- compute_ld_bundle_common(
-    cluster_row = cluster_row,
-    candidates_df = candidates_df,
-    bfile_ref = bfile_ref,
-    keep_path = keep_path,
-    plink_bin = plink_bin,
-    workdir = workdir,
-    pop = pop,
-    ld_metric = ld_metric,
-    r2_min = r2_min,
-    max_snps_interval = max_snps_interval,
-    compute_blocks = compute_blocks,
-    append_log = NULL
-  )
-  
-  cid <- as.character(bundle$cluster_id)
-  
-  if (!is.data.frame(bundle$block_summary)) {
-    bundle$block_summary <- tibble::tibble()
-  }
-  if (!is.data.frame(bundle$block_hits)) {
-    bundle$block_hits <- tibble::tibble()
-  }
-  if (!is.data.frame(bundle$block_genes)) {
-    bundle$block_genes <- tibble::tibble()
-  }
-  if (!is.data.frame(bundle$block_ranges)) {
-    bundle$block_ranges <- tibble::tibble()
-  }
-  if (!is.data.frame(bundle$proxies)) {
-    bundle$proxies <- tibble::tibble()
-  }
-  if (!is.data.frame(bundle$seeds)) {
-    bundle$seeds <- tibble::tibble()
-  }
-  if (!is.data.frame(bundle$gwas_hits)) {
-    bundle$gwas_hits <- tibble::tibble()
-  }
-  if (!is.data.frame(bundle$candidates)) {
-    bundle$candidates <- tibble::tibble()
-  }
-  if (!is.data.frame(bundle$fl)) {
-    bundle$fl <- tibble::tibble()
-  }
-  
-  summary_row <- data.frame(
-    cluster_id = cid,
-    chr = as.character(cluster_row$chr[1]),
-    start = as.integer(cluster_row$start[1]),
-    end = as.integer(cluster_row$end[1]),
-    population = as.character(pop),
-    ld_metric = as.character(ld_metric),
-    n_interval_snps = nrow(bundle$fl),
-    n_candidate_snps = nrow(bundle$candidates),
-    n_gwas_hits = nrow(bundle$gwas_hits),
-    gwas_hits = if ("rsid" %in% names(bundle$gwas_hits)) {
-      paste(unique(stats::na.omit(bundle$gwas_hits$rsid)), collapse = "; ")
-    } else {
-      ""
-    },
-    n_seeds_exact = if ("seed_type" %in% names(bundle$seeds)) sum(bundle$seeds$seed_type == "exact", na.rm = TRUE) else 0L,
-    n_seeds_nearest = if ("seed_type" %in% names(bundle$seeds)) sum(bundle$seeds$seed_type == "nearest", na.rm = TRUE) else 0L,
-    seed_snps = if ("seed_snp" %in% names(bundle$seeds)) {
-      paste(unique(stats::na.omit(bundle$seeds$seed_snp)), collapse = "; ")
-    } else {
-      ""
-    },
-    n_proxy_snps = if ("proxy_snp" %in% names(bundle$proxies)) dplyr::n_distinct(bundle$proxies$proxy_snp) else 0L,
-    proxy_snps = if ("proxy_snp" %in% names(bundle$proxies)) {
-      paste(unique(stats::na.omit(bundle$proxies$proxy_snp)), collapse = "; ")
-    } else {
-      ""
-    },
-    max_ld_value = if (nrow(bundle$proxies) && "ld_value" %in% names(bundle$proxies)) max(bundle$proxies$ld_value, na.rm = TRUE) else NA_real_,
-    mean_ld_value = if (nrow(bundle$proxies) && "ld_value" %in% names(bundle$proxies)) mean(bundle$proxies$ld_value, na.rm = TRUE) else NA_real_,
-    n_blocks = if (is.data.frame(bundle$block_ranges)) nrow(bundle$block_ranges) else 0L,
-    n_block_hits = if (nrow(bundle$block_summary) && "n_block_hits" %in% names(bundle$block_summary)) {
-      sum(bundle$block_summary$n_block_hits, na.rm = TRUE)
-    } else {
-      0L
-    },
-    n_block_genes = if (nrow(bundle$block_summary) && "n_genes_in_block" %in% names(bundle$block_summary)) {
-      sum(bundle$block_summary$n_genes_in_block, na.rm = TRUE)
-    } else {
-      0L
-    },
-    block_apps = if (nrow(bundle$block_summary) && "external_apps" %in% names(bundle$block_summary)) {
-      paste(unique(stats::na.omit(bundle$block_summary$external_apps)), collapse = "; ")
-    } else {
-      ""
-    },
-    block_genes = if (nrow(bundle$block_summary) && "genes_in_block" %in% names(bundle$block_summary)) {
-      paste(unique(stats::na.omit(bundle$block_summary$genes_in_block)), collapse = "; ")
-    } else {
-      ""
-    },
-    ld_has_signal = as.integer(nrow(bundle$proxies) > 0),
-    ld_computed = TRUE,
-    status = "ok",
-    stringsAsFactors = FALSE
-  )
-  
-  details <- list(
-    cluster_id = cid,
-    chr = as.character(cluster_row$chr[1]),
-    start = as.integer(cluster_row$start[1]),
-    end = as.integer(cluster_row$end[1]),
-    population = as.character(pop),
-    ld_metric = as.character(ld_metric),
-    fl = bundle$fl,
-    candidates = bundle$candidates,
-    gwas_hits = bundle$gwas_hits,
-    seeds = bundle$seeds,
-    proxies = bundle$proxies,
-    blocks = bundle$blocks,
-    blocks_ij = bundle$blocks_ij,
-    block_ranges = bundle$block_ranges,
-    block_hits = bundle$block_hits,
-    block_genes = bundle$block_genes,
-    block_summary = bundle$block_summary,
-    summary = summary_row
-  )
-  
-  list(summary = summary_row, details = details)
-}
-
-
 run_ld_global_for_clusters <- function(
     clusters_df,
     candidates_df,
@@ -769,9 +714,10 @@ run_ld_global_for_clusters <- function(
     pop,
     ld_metric = "R2",
     r2_min = 0.6,
-    compute_blocks = FALSE,
-    max_snps_interval = 400,
-    progress_fun = NULL
+    compute_blocks = TRUE,
+    max_snps_interval = "auto",
+    progress_fun = NULL,
+    gwas_bridge_df = NULL
 ) {
   if (!is.data.frame(clusters_df) || !nrow(clusters_df)) {
     stop("clusters_df has 0 rows")
@@ -796,6 +742,14 @@ run_ld_global_for_clusters <- function(
   dir.create(dirname(out_details_rds), recursive = TRUE, showWarnings = FALSE)
   dir.create(workdir, recursive = TRUE, showWarnings = FALSE)
   
+  global_summary_rds <- file.path(dirname(out_summary_rds), "ld_global_block_summary.rds")
+  global_details_rds <- file.path(dirname(out_details_rds), "ld_global_details.rds")
+  
+  global_session_dir <- dirname(global_details_rds)
+  
+  options(gi_active_integrator_dir = global_session_dir)
+  Sys.setenv(GI_ACTIVE_INTEGRATOR_DIR = global_session_dir)
+  
   res <- lapply(seq_len(nrow(clusters_df)), function(i) {
     cl <- clusters_df[i, , drop = FALSE]
     cid <- as.character(cl$cluster_id[1])
@@ -804,65 +758,118 @@ run_ld_global_for_clusters <- function(
       progress_fun(i = i, n = nrow(clusters_df), cluster_id = cid, stage = "start")
     }
     
-    ans <- tryCatch(
-      {
-        out_one <- compute_ld_for_cluster_global(
-          cluster_row = cl,
-          candidates_df = candidates_df,
-          bfile_ref = bfile_ref,
-          keep_path = keep_path,
-          plink_bin = plink_bin,
-          workdir = workdir,
-          pop = pop,
-          ld_metric = ld_metric,
-          r2_min = r2_min,
-          compute_blocks = compute_blocks,
-          max_snps_interval = max_snps_interval
-        )
-        
-        cat("[GLOBAL LD][OK] ", cid,
-            " | details names = ",
-            paste(names(out_one$details), collapse = ", "),
-            "\n", sep = "")
-        
-        out_one
-      },
-      error = function(e) {
-        msg <- conditionMessage(e)
-        cat("[GLOBAL LD][ERROR] ", cid, " -> ", msg, "\n", sep = "")
-        
-        summary_row <- data.frame(
-          cluster_id = cid,
-          chr = as.character(cl$chr[1]),
-          start = as.integer(cl$start[1]),
-          end = as.integer(cl$end[1]),
-          population = as.character(pop),
-          ld_metric = as.character(ld_metric),
-          n_interval_snps = NA_integer_,
-          n_candidate_snps = NA_integer_,
-          n_gwas_hits = NA_integer_,
-          gwas_hits = "",
-          n_seeds_exact = 0L,
-          n_seeds_nearest = 0L,
-          seed_snps = "",
-          n_proxy_snps = 0L,
-          proxy_snps = "",
-          max_ld_value = NA_real_,
-          mean_ld_value = NA_real_,
-          n_blocks = 0L,
-          n_block_hits = 0L,
-          n_block_genes = 0L,
-          block_apps = "",
-          block_genes = "",
-          ld_has_signal = 0L,
-          ld_computed = FALSE,
-          status = paste("error:", msg),
-          stringsAsFactors = FALSE
-        )
-        
-        list(summary = summary_row, details = NULL)
+    ans <- tryCatch({
+      
+      region_bp <- ld_region_size_bp(cl)
+      
+      maxn_i <- if (identical(as.character(max_snps_interval), "auto")) {
+        ld_recommended_max_snps(region_bp)
+      } else {
+        suppressWarnings(as.integer(max_snps_interval))
       }
-    )
+      
+      if (!is.finite(maxn_i) || maxn_i < 2) {
+        maxn_i <- 400L
+      }
+      
+      cat(
+        "[GLOBAL LD][SNP LIMIT] cluster=", cid,
+        " | region_size=", ld_format_region_size(region_bp),
+        " | max_snps=", maxn_i,
+        "\n",
+        sep = ""
+      )
+      
+      out_one <- compute_ld_cluster_from_module_engine(
+        cluster_row = cl,
+        candidates_df = candidates_df,
+        gwas_bridge_df = gwas_bridge_df,
+        bfile_ref = bfile_ref,
+        keep_path = keep_path,
+        plink_bin = plink_bin,
+        workdir = workdir,
+        pop = pop,
+        ld_metric = ld_metric,
+        r2_min = r2_min,
+        max_snps_interval = maxn_i,
+        compute_blocks = compute_blocks,
+        x_mode = "bp",
+        append_log = function(...) cat(paste(..., collapse = ""), "\n")
+      )
+      
+      if (!is.list(out_one) || !is.data.frame(out_one$summary)) {
+        stop("compute_ld_cluster_from_module_engine() did not return a valid summary.")
+      }
+      
+      if (!is.list(out_one$details)) {
+        stop("compute_ld_cluster_from_module_engine() did not return valid details.")
+      }
+      
+      if (!is.data.frame(out_one$details$block_summary)) {
+        stop("compute_ld_cluster_from_module_engine() details has no block_summary.")
+      }
+      
+      cat(
+        "[GLOBAL LD][OK] ", cid,
+        " | details names = ",
+        paste(names(out_one$details), collapse = ", "),
+        " | block_summary rows = ",
+        nrow(out_one$details$block_summary),
+        "\n",
+        sep = ""
+      )
+      
+      out_one
+      
+    }, error = function(e) {
+      msg <- conditionMessage(e)
+      cat("[GLOBAL LD][ERROR] ", cid, " -> ", msg, "\n", sep = "")
+      
+      summary_row <- data.frame(
+        cluster_id = cid,
+        chr = as.character(cl$chr[1]),
+        start = as.integer(cl$start[1]),
+        end = as.integer(cl$end[1]),
+        population = as.character(pop),
+        ld_metric = as.character(ld_metric),
+        n_interval_snps = NA_integer_,
+        n_candidate_snps = NA_integer_,
+        n_gwas_hits = NA_integer_,
+        gwas_hits = "",
+        n_seeds_exact = 0L,
+        n_seeds_nearest = 0L,
+        seed_snps = "",
+        n_proxy_snps = 0L,
+        proxy_snps = "",
+        max_ld_value = NA_real_,
+        mean_ld_value = NA_real_,
+        n_blocks = 0L,
+        n_block_hits = 0L,
+        n_block_genes = 0L,
+        block_apps = "",
+        block_genes = "",
+        ld_has_signal = 0L,
+        ld_computed = FALSE,
+        status = paste("error:", msg),
+        stringsAsFactors = FALSE
+      )
+      
+      details_row <- list(
+        cluster_id = cid,
+        chr = as.character(cl$chr[1]),
+        start = as.integer(cl$start[1]),
+        end = as.integer(cl$end[1]),
+        population = as.character(pop),
+        ld_metric = as.character(ld_metric),
+        block_summary = tibble::tibble(
+          cluster_id = character(),
+          block_id = character()
+        ),
+        error = msg
+      )
+      
+      list(summary = summary_row, details = details_row)
+    })
     
     if (is.function(progress_fun)) {
       progress_fun(i = i, n = nrow(clusters_df), cluster_id = cid, stage = "done")
@@ -875,8 +882,18 @@ run_ld_global_for_clusters <- function(
   details_list <- lapply(res, `[[`, "details")
   names(details_list) <- summary_df$cluster_id
   
-  saveRDS(summary_df, out_summary_rds)
-  saveRDS(details_list, out_details_rds)
+  global_block_summary <- dplyr::bind_rows(lapply(details_list, function(x) {
+    if (!is.list(x)) return(NULL)
+    if (!is.data.frame(x$block_summary) || !nrow(x$block_summary)) return(NULL)
+    x$block_summary
+  }))
+  
+  if (!is.data.frame(global_block_summary)) {
+    global_block_summary <- tibble::tibble()
+  }
+  
+  saveRDS(global_block_summary, global_summary_rds)
+  saveRDS(details_list, global_details_rds)
   
   cat("[GLOBAL LD] summary status table:\n")
   print(table(summary_df$status, useNA = "ifany"))
@@ -1082,22 +1099,23 @@ summarize_gwas_significance_by_block <- function(block_df, gwas_bridge_df) {
   
   gg <- gwas_bridge_df %>%
     dplyr::transmute(
-      cluster_id = as.character(cluster_id),
       chr = suppressWarnings(as.integer(chr)),
       position = suppressWarnings(as.integer(position)),
       rsid = as.character(rsid),
       logp = suppressWarnings(as.numeric(logp))
     ) %>%
     dplyr::filter(
-      !is.na(cluster_id), nzchar(cluster_id),
-      is.finite(chr), is.finite(position)
+      is.finite(chr),
+      is.finite(position),
+      !is.na(rsid),
+      nzchar(rsid)
     )
   
   ov <- gg %>%
     dplyr::inner_join(
       bb %>%
         dplyr::select(cluster_id, chr, block_id, block_start, block_end),
-      by = c("cluster_id", "chr"),
+      by = "chr",
       relationship = "many-to-many"
     ) %>%
     dplyr::filter(
@@ -1402,6 +1420,12 @@ full_table_render_note <- function() {
     style = "margin-bottom:8px; color:#666;",
     HTML("Some tables may take a few seconds to appear. Full export of all rows is enabled.")
   )
+}
+
+safe_read_rds <- function(path, default = NULL) {
+  if (is.null(path) || !length(path) || !nzchar(path)) return(default)
+  if (!file.exists(path)) return(default)
+  tryCatch(readRDS(path), error = function(e) default)
 }
 
 # -----------------------------
@@ -2677,10 +2701,41 @@ ui <- navbarPage(
                           )
                         )
                       ),
-                      
+                      selectInput(
+                        "priority_audit_sankey_cluster_filter",
+                        "Cluster Sankey",
+                        choices = c("All"),
+                        selected = "All"
+                      ),
                       div(
                         class = "panelGrey",
-                        withSpinner(plotly::plotlyOutput("priority_audit_sankey_full", height = "1200px"))
+                        
+                        h3("Priority Audit Sankey: Cluster \u2192 Block \u2192 Gene \u2192 GWAS Hit"),
+                        
+                        div(
+                          style = "display:flex; gap:22px; align-items:center; justify-content:flex-end; margin-bottom:10px;",
+                          tags$span(style = "color:#1f77b4; font-weight:700;", "\u25A0 Cluster"),
+                          tags$span(style = "color:#ff7f0e; font-weight:700;", "\u25A0 Block"),
+                          tags$span(style = "color:#2ca02c; font-weight:700;", "\u25A0 Gene"),
+                          tags$span(style = "color:#6a3d9a; font-weight:700;", "\u25A0 GWAS Hit")
+                        ),
+                        
+                        withSpinner(plotly::plotlyOutput("priority_audit_sankey_full", height = "950px")),
+                        
+                        div(
+                          style = "display:grid; grid-template-columns: repeat(4, 1fr); text-align:center; margin-top:8px;",
+                          div(tags$b(style = "color:#1f77b4;", "Cluster"), br(), "Top clusters by score"),
+                          div(tags$b(style = "color:#ff7f0e;", "Block"), br(), "Top blocks per cluster"),
+                          div(tags$b(style = "color:#2ca02c;", "Gene"), br(), "Top genes per block"),
+                          div(tags$b(style = "color:#6a3d9a;", "GWAS Hit"), br(), "Top hits per gene")
+                        ),
+                        
+                        tags$p(
+                          style = "margin-top:18px; font-style:italic;",
+                          "Note: widths represent propagated prioritized-hit support. The same GWAS hit may appear more than once when it supports multiple genes."
+                        ),
+                        
+                        uiOutput("priority_audit_sankey_stats")
                       )
                     ),
                     
@@ -2742,6 +2797,27 @@ ui <- navbarPage(
   )
   
 )
+
+# ============================================================
+# Compatibility helper for legacy Global LD code
+# ============================================================
+
+active_integrator_dir <- function() {
+  d <- getOption("gi_active_integrator_dir", "")
+  
+  if (!is.null(d) && length(d) == 1 && nzchar(d) && dir.exists(d)) {
+    return(d)
+  }
+  
+  d <- Sys.getenv("GI_ACTIVE_INTEGRATOR_DIR", "")
+  
+  if (!is.null(d) && length(d) == 1 && nzchar(d) && dir.exists(d)) {
+    return(d)
+  }
+  
+  stop("active_integrator_dir not configured.")
+}
+
 # -----------------------------
 # 
 # -----------------------------
@@ -2786,29 +2862,55 @@ server <- function(input, output, session) {
       )
     )
   )
+  
   ##############
   ld_summary_version <- reactiveVal(0)
   ld_details_version <- reactiveVal(0)
   
+  integrator_cache <- reactiveValues(
+    session_dir = NULL,
+    loaded = FALSE
+  )
+  
   #---------------- Reactius base --------------------
   session_dir_r <- reactive({
-    ss <- available_sessions()
-    req(length(ss) > 0)
+    req(isTRUE(integrator_cache$loaded))
+    req(!is.null(integrator_cache$session_dir))
+    req(nzchar(integrator_cache$session_dir))
     
-    sel <- input$integrator_session
-    if (is.null(sel) || !nzchar(sel) || !sel %in% names(ss)) {
-      sel <- names(ss)[1]
-    }
-    
-    unname(ss[[sel]])
+    integrator_cache$session_dir
   })
   
   selected_session_dir <- session_dir_r
   
+  observeEvent(input$load_integrator, {
+    ss <- available_sessions()
+    req(length(ss) > 0)
+    req(input$integrator_session)
+    
+    sel <- input$integrator_session
+    req(sel %in% names(ss))
+    
+    integrator_cache$session_dir <- unname(ss[[sel]])
+    integrator_cache$loaded <- TRUE
+    
+    updateSelectizeInput(
+      session,
+      "integrator_session",
+      choices = names(ss),
+      selected = sel,
+      server = TRUE
+    )
+    
+    ld_summary_version(ld_summary_version() + 1)
+    ld_details_version(ld_details_version() + 1)
+  }, ignoreInit = TRUE)
+  
+  
   ld_summary_r <- reactive({
     ld_summary_version()
     
-    path <- file.path(session_dir_r(), "ld_cluster_summary.rds")
+    path <- file.path(session_dir_r(), "ld_global_block_summary.rds")
     if (!file.exists(path)) return(tibble::tibble())
     
     x <- tryCatch(readRDS(path), error = function(e) NULL)
@@ -2820,7 +2922,7 @@ server <- function(input, output, session) {
   ld_details_r <- reactive({
     ld_details_version()
     
-    path <- file.path(session_dir_r(), "ld_cluster_details.rds")
+    path <- file.path(session_dir_r(), "ld_global_details.rds")
     if (!file.exists(path)) return(list())
     
     x <- tryCatch(readRDS(path), error = function(e) NULL)
@@ -2850,20 +2952,52 @@ server <- function(input, output, session) {
       )
     }
     
-    sel <- input$integrator_session
+    sel <- isolate(input$integrator_session)
+    
+    if (isTRUE(integrator_cache$loaded) &&
+        !is.null(integrator_cache$session_dir) &&
+        nzchar(integrator_cache$session_dir)) {
+      
+      loaded_name <- names(ss)[vapply(ss, identical, logical(1), integrator_cache$session_dir)]
+      
+      if (length(loaded_name) && loaded_name %in% names(ss)) {
+        sel <- loaded_name[1]
+      }
+    }
+    
     if (is.null(sel) || !nzchar(sel) || !sel %in% names(ss)) {
       sel <- names(ss)[1]
     }
     
-    selectInput(
-      "integrator_session",
-      "Integrator session folder",
-      choices = names(ss),
-      selected = sel
+    tagList(
+      div(
+        style = "width: 100%; max-width: 900px;",
+        selectizeInput(
+          "integrator_session",
+          "Select integrator session folder",
+          choices = names(ss),
+          selected = sel,
+          width = "100%",
+          options = list(
+            maxOptions = 10000,
+            placeholder = "Select Integrator session folder",
+            openOnFocus = TRUE
+          )
+        )
+      ),
+      actionButton(
+        "load_integrator",
+        "Load selected Integrator session",
+        class = "btn-primary"
+      )
     )
   })
   
   output$integrator_session_status <- renderText({
+    if (!isTRUE(integrator_cache$loaded)) {
+      return("No Integrator session loaded yet. Select a session and click 'Load selected Integrator session'.")
+    }
+    
     ss_dir <- selected_session_dir()
     mf <- selected_manifest()
     chk <- validate_manifest_basic(mf)
@@ -2893,7 +3027,8 @@ server <- function(input, output, session) {
     candidates_cluster_col_idx = NA_integer_
   )
   
-  observeEvent(session_dir_r(), {
+  observeEvent(input$load_integrator, {
+    req(isTRUE(integrator_cache$loaded))
     req(session_dir_r())
     
     t0 <- Sys.time()
@@ -2945,7 +3080,7 @@ server <- function(input, output, session) {
     message("[TIMING] candidates sanitize: ", round(as.numeric(Sys.time() - t_ca_san, units = "secs"), 2), " s")
     
     message("[TIMING] table preload total: ", round(as.numeric(Sys.time() - t0, units = "secs"), 2), " s")
-  }, ignoreInit = FALSE)
+  }, ignoreInit = TRUE)
   
   
   # manifest #########################
@@ -3321,26 +3456,59 @@ server <- function(input, output, session) {
         .groups = "drop"
       ) %>%
       dplyr::mutate(
-        has_position_link = stringr::str_detect(evidence_types, "catalog_gene|nonsyn_gene"),
-        has_effect_link = stringr::str_detect(evidence_types, "eqtl_gene|ewas_nearby_gene"),
+        has_position_link = stringr::str_detect(
+          evidence_types,
+          "catalog_gene|nonsyn_gene"
+        ),
+        has_effect_link = stringr::str_detect(
+          evidence_types,
+          "eqtl_gene|ewas_nearby_gene"
+        ),
         gene_link_mode = dplyr::case_when(
           has_position_link & has_effect_link ~ "position + effect",
-          has_position_link ~ "position",
-          has_effect_link ~ "effect",
+          has_position_link ~ "position-linked",
+          has_effect_link ~ "effect-linked",
           TRUE ~ "other"
+        ),
+        gene_link_label = dplyr::case_when(
+          gene_link_mode == "position + effect" ~ "Position-linked + effect-linked",
+          gene_link_mode == "position-linked" ~ "Position-linked",
+          gene_link_mode == "effect-linked" ~ "Effect-linked",
+          TRUE ~ "Other / unclassified"
         ),
         gene_label = dplyr::case_when(
           gene_link_mode == "position + effect" ~ paste0("◐ ", gene),
-          gene_link_mode == "position" ~ paste0("● ", gene),
-          gene_link_mode == "effect" ~ paste0("◆ ", gene),
+          gene_link_mode == "position-linked" ~ paste0("● ", gene),
+          gene_link_mode == "effect-linked" ~ paste0("◆ ", gene),
           TRUE ~ gene
         ),
         gene_link_rank = dplyr::case_when(
           gene_link_mode == "position + effect" ~ 1L,
-          gene_link_mode == "position" ~ 2L,
-          gene_link_mode == "effect" ~ 3L,
+          gene_link_mode == "position-linked" ~ 2L,
+          gene_link_mode == "effect-linked" ~ 3L,
           TRUE ~ 4L
-        )
+        ),
+        apps_summary = paste0(n_apps, " app(s)"),
+        evidence_summary = paste0(n_evidence_types, " evidence type(s)"),
+        clusters_summary = paste0(n_clusters, " cluster(s)")
+      ) %>%
+      dplyr::select(
+        gene_label,
+        gene,
+        gene_link_label,
+        n_apps,
+        apps_summary,
+        apps,
+        n_evidence_types,
+        evidence_summary,
+        evidence_types,
+        n_clusters,
+        clusters_summary,
+        clusters,
+        n_records,
+        chr_set,
+        gene_link_mode,
+        gene_link_rank
       ) %>%
       dplyr::arrange(
         gene_link_rank,
@@ -3353,15 +3521,45 @@ server <- function(input, output, session) {
   })
   
   output$genes_dt <- DT::renderDT({
-    dt <- genes_integrated()
-    if (!nrow(dt)) {
-      return(DT::datatable(data.frame(Message = "No optional gene evidence loaded yet."), rownames = FALSE))
+    
+    dt <- shared_genes_df()
+    
+    if (!is.data.frame(dt) || !nrow(dt)) {
+      return(DT::datatable(
+        data.frame(Message = "No shared gene evidence available yet."),
+        rownames = FALSE,
+        options = list(dom = "t")
+      ))
     }
+    
+    dt_display <- dt %>%
+      dplyr::select(
+        -dplyr::any_of(c(
+          "n_apps",
+          "n_evidence_types",
+          "n_clusters",
+          "n_records"
+        ))
+      )
+    
+    hide_cols <- c(
+      "apps",
+      "evidence_types",
+      "clusters"
+    )
+    
+    hide_idx <- which(names(dt_display) %in% hide_cols)
+    
+    apps_idx <- which(names(dt_display) == "apps") - 1L
+    evidence_idx <- which(names(dt_display) == "evidence_types") - 1L
+    clusters_idx <- which(names(dt_display) == "clusters") - 1L
+    
     DT::datatable(
-      sanitize_dt_types(dt),
+      sanitize_dt_types(dt_display),
       rownames = FALSE,
       extensions = "Buttons",
       width = "100%",
+      escape = TRUE,
       options = list(
         dom = "Bfrtip",
         buttons = list(
@@ -3371,13 +3569,46 @@ server <- function(input, output, session) {
         ),
         pageLength = 15,
         scrollX = TRUE,
-        scrollY = "450px",
-        autoWidth = FALSE
+        autoWidth = FALSE,
+        columnDefs = list(
+          list(className = "dt-control", orderable = FALSE, targets = 0),
+          list(visible = FALSE, targets = hide_idx - 1L)
+        )
       ),
       class = "compact stripe hover order-column",
+      callback = DT::JS(
+        sprintf(
+          "
+        table.on('click', 'td.dt-control', function () {
+          var tr = $(this).closest('tr');
+          var row = table.row(tr);
+
+          if (row.child.isShown()) {
+            row.child.hide();
+            tr.removeClass('shown');
+          } else {
+            var d = row.data();
+
+            var html =
+              '<div style=\"padding:10px 18px; background:#f8f9fa; border-left:4px solid #6c757d;\">' +
+              '<b>Apps:</b><br>' + d[%s] + '<br><br>' +
+              '<b>Evidence types:</b><br>' + d[%s] + '<br><br>' +
+              '<b>Clusters:</b><br>' + d[%s] +
+              '</div>';
+
+            row.child(html).show();
+            tr.addClass('shown');
+          }
+        });
+        ",
+          apps_idx,
+          evidence_idx,
+          clusters_idx
+        )
+      ),
       fillContainer = TRUE
     )
-  })
+  }, server = FALSE)
   
   shared_genes_dt_data <- reactive({
     req(input$shared_genes_view_tab == "table")
@@ -3385,11 +3616,19 @@ server <- function(input, output, session) {
     dt <- shared_genes_df()
     
     validate(
-      need(is.data.frame(dt), "Load optional gene evidence to populate this panel."),
-      need(nrow(dt) > 0, "Load optional gene evidence to populate this panel.")
+      need(is.data.frame(dt), "Load shared gene evidence to populate this panel."),
+      need(nrow(dt) > 0, "Load shared gene evidence to populate this panel.")
     )
     
     dt %>%
+      dplyr::select(
+        -dplyr::any_of(c(
+          "n_apps",
+          "n_evidence_types",
+          "n_clusters",
+          "n_records"
+        ))
+      ) %>%
       dplyr::mutate(
         gene = make_genecards_links(gene)
       )
@@ -4776,7 +5015,7 @@ server <- function(input, output, session) {
           ld_metric = input$ld_global_metric %||% "R2",
           r2_min = as.numeric(input$ld_global_r2_min %||% 0.6),
           compute_blocks = TRUE,
-          max_snps_interval = 400,
+          max_snps_interval = "auto",
           progress_fun = function(i, n, cluster_id, stage) {
             if (stage == "start") {
               detail_txt <- paste0("Cluster ", i, "/", n, ": ", cluster_id)
@@ -4925,7 +5164,7 @@ server <- function(input, output, session) {
     count_semicolon_items <- function(x) {
       x <- as.character(x)
       x <- trimws(x)
-      if (is.na(x) || !nzchar(x)) return(0L)
+      if (length(x) == 0 || is.na(x) || !nzchar(x)) return(0L)
       
       vals <- unlist(strsplit(x, "\\s*;\\s*"))
       vals <- trimws(vals)
@@ -4968,16 +5207,25 @@ server <- function(input, output, session) {
       )
     
     # ============================================================
-    # 2) DESCRIPTORS DE GWAS HITS
-    #    (informatius / auditoria, no entren directament al score)
+    # 2) GWAS HIT SUMMARY
     # ============================================================
     hit_sum <- if (is.data.frame(gh) && nrow(gh) > 0) {
+      
+      score_col <- intersect(c("gwas_hit_score", "score", "priority_score"), names(gh))[1]
+      
       gh %>%
+        dplyr::mutate(
+          gwas_hit_score_tmp = if (!is.na(score_col)) {
+            suppressWarnings(as.numeric(.data[[score_col]]))
+          } else {
+            0
+          }
+        ) %>%
         dplyr::transmute(
           cluster_id = as.character(cluster_id),
           gwas_hit = as.character(gwas_hit),
           gwas_pos = suppressWarnings(as.numeric(gwas_pos)),
-          gwas_hit_score = dplyr::coalesce(as.numeric(gwas_hit_score), 0),
+          gwas_hit_score = dplyr::coalesce(gwas_hit_score_tmp, 0),
           apps_supported = dplyr::coalesce(as.character(gwas_hit_apps), "")
         ) %>%
         dplyr::filter(!is.na(cluster_id), nzchar(cluster_id)) %>%
@@ -4985,6 +5233,7 @@ server <- function(input, output, session) {
         dplyr::summarise(
           n_gwas_hits = dplyr::n_distinct(paste(cluster_id, gwas_hit, gwas_pos, sep = "||")),
           top_gwas_hit_score = round(max(gwas_hit_score, na.rm = TRUE), 2),
+          sum_gwas_hit_scores = round(sum(gwas_hit_score, na.rm = TRUE), 2),
           apps_supported = collapse_unique_semicolon(apps_supported),
           .groups = "drop"
         ) %>%
@@ -4995,26 +5244,29 @@ server <- function(input, output, session) {
             0L
           )
         )
+      
     } else {
       tibble::tibble(
         cluster_id = character(),
         n_gwas_hits = integer(),
         top_gwas_hit_score = numeric(),
+        sum_gwas_hit_scores = numeric(),
         apps_supported = character(),
         n_apps_supported = integer()
       )
     }
     
     # ============================================================
-    # 3) COMPONENT CANÒNIC DES DE BLOCKS
-    #    cluster_score_from_blocks =
-    #      top_block_score + 0.05 * other_block_score
+    # 3) BLOCK / OUT-BLOCK NORMALIZATION
     # ============================================================
-    block_sum <- if (is.data.frame(blk) && nrow(blk) > 0) {
+    blk_norm <- if (is.data.frame(blk) && nrow(blk) > 0) {
       blk %>%
-        dplyr::transmute(
+        dplyr::mutate(
           cluster_id = as.character(cluster_id),
           block_id = as.character(block_id),
+          block_label = if ("block_label" %in% names(.)) as.character(block_label) else "",
+          is_outblock = grepl("OUT", block_id, ignore.case = TRUE) |
+            grepl("OUT", block_label, ignore.case = TRUE),
           block_score = dplyr::coalesce(as.numeric(block_score), 0),
           block_score_from_hits = dplyr::coalesce(as.numeric(block_score_from_hits), 0),
           block_gene_content_bonus = dplyr::coalesce(
@@ -5023,9 +5275,22 @@ server <- function(input, output, session) {
             0
           ),
           n_genes_in_block = dplyr::coalesce(as.integer(n_genes_in_block), 0L),
-          genes_in_block = dplyr::coalesce(as.character(genes_in_block), "")
+          genes_in_block = dplyr::coalesce(as.character(genes_in_block), ""),
+          gwas_hits = if ("gwas_hits" %in% names(.)) dplyr::coalesce(as.character(gwas_hits), "") else ""
         ) %>%
-        dplyr::filter(!is.na(cluster_id), nzchar(cluster_id)) %>%
+        dplyr::filter(!is.na(cluster_id), nzchar(cluster_id))
+    } else {
+      tibble::tibble()
+    }
+    
+    # ============================================================
+    # 4) COMPONENT DE BLOCKS LD REALS
+    #    OUT-BLOCK queda exclòs del score de blocks
+    # ============================================================
+    block_sum <- if (is.data.frame(blk_norm) && nrow(blk_norm) > 0) {
+      
+      blk_norm %>%
+        dplyr::filter(!is_outblock) %>%
         dplyr::group_by(cluster_id) %>%
         dplyr::summarise(
           n_blocks = dplyr::n_distinct(block_id[!is.na(block_id) & nzchar(block_id)]),
@@ -5033,11 +5298,19 @@ server <- function(input, output, session) {
           block_ids = paste(sort(unique(block_id[!is.na(block_id) & nzchar(block_id)])), collapse = "; "),
           genes_in_blocks = collapse_unique_semicolon(genes_in_block),
           
-          top_block_score = round(max(block_score, na.rm = TRUE), 2),
-          other_block_score = round(sum(block_score, na.rm = TRUE) - max(block_score, na.rm = TRUE), 2),
+          top_block_score = if (dplyr::n() > 0) round(max(block_score, na.rm = TRUE), 2) else 0,
+          other_block_score = if (dplyr::n() > 0) {
+            round(sum(block_score, na.rm = TRUE) - max(block_score, na.rm = TRUE), 2)
+          } else {
+            0
+          },
           
-          top_block_score_from_hits = round(max(block_score_from_hits, na.rm = TRUE), 2),
-          other_block_score_from_hits = round(sum(block_score_from_hits, na.rm = TRUE) - max(block_score_from_hits, na.rm = TRUE), 2),
+          top_block_score_from_hits = if (dplyr::n() > 0) round(max(block_score_from_hits, na.rm = TRUE), 2) else 0,
+          other_block_score_from_hits = if (dplyr::n() > 0) {
+            round(sum(block_score_from_hits, na.rm = TRUE) - max(block_score_from_hits, na.rm = TRUE), 2)
+          } else {
+            0
+          },
           
           sum_block_scores = round(sum(block_score, na.rm = TRUE), 2),
           sum_block_scores_from_hits = round(sum(block_score_from_hits, na.rm = TRUE), 2),
@@ -5065,6 +5338,7 @@ server <- function(input, output, session) {
             2
           )
         )
+      
     } else {
       tibble::tibble(
         cluster_id = character(),
@@ -5086,14 +5360,48 @@ server <- function(input, output, session) {
     }
     
     # ============================================================
-    # 4) RESULTAT FINAL
+    # 5) OUT-BLOCK SUMMARY
+    #    No crea outblock_score agregat.
+    #    Només informa elements fora de LD blocks.
+    # ============================================================
+    outblock_sum <- if (is.data.frame(blk_norm) && nrow(blk_norm) > 0) {
+      
+      blk_norm %>%
+        dplyr::filter(is_outblock) %>%
+        dplyr::group_by(cluster_id) %>%
+        dplyr::summarise(
+          has_outblock = TRUE,
+          outblock_ids = paste(sort(unique(block_id[!is.na(block_id) & nzchar(block_id)])), collapse = "; "),
+          outblock_gwas_hits = collapse_unique_semicolon(gwas_hits),
+          outblock_genes = collapse_unique_semicolon(genes_in_block),
+          n_outblock_gwas_hits = vapply(outblock_gwas_hits, count_semicolon_items, integer(1)),
+          n_outblock_genes = vapply(outblock_genes, count_semicolon_items, integer(1)),
+          .groups = "drop"
+        )
+      
+    } else {
+      tibble::tibble(
+        cluster_id = character(),
+        has_outblock = logical(),
+        outblock_ids = character(),
+        outblock_gwas_hits = character(),
+        outblock_genes = character(),
+        n_outblock_gwas_hits = integer(),
+        n_outblock_genes = integer()
+      )
+    }
+    
+    # ============================================================
+    # 6) RESULTAT FINAL
     # ============================================================
     out <- cl_base %>%
       dplyr::left_join(hit_sum, by = "cluster_id") %>%
       dplyr::left_join(block_sum, by = "cluster_id") %>%
+      dplyr::left_join(outblock_sum, by = "cluster_id") %>%
       dplyr::mutate(
         n_gwas_hits = dplyr::coalesce(as.integer(n_gwas_hits), 0L),
         top_gwas_hit_score = dplyr::coalesce(as.numeric(top_gwas_hit_score), 0),
+        sum_gwas_hit_scores = dplyr::coalesce(as.numeric(sum_gwas_hit_scores), 0),
         apps_supported = dplyr::coalesce(as.character(apps_supported), ""),
         n_apps_supported = dplyr::coalesce(as.integer(n_apps_supported), 0L),
         
@@ -5112,7 +5420,14 @@ server <- function(input, output, session) {
         
         cluster_score_from_blocks = dplyr::coalesce(as.numeric(cluster_score_from_blocks), 0),
         cluster_gene_bonus = dplyr::coalesce(as.numeric(cluster_gene_bonus), 0),
-        cluster_fragmentation_bonus = dplyr::coalesce(as.numeric(cluster_fragmentation_bonus), 0)
+        cluster_fragmentation_bonus = dplyr::coalesce(as.numeric(cluster_fragmentation_bonus), 0),
+        
+        has_outblock = dplyr::coalesce(as.logical(has_outblock), FALSE),
+        outblock_ids = dplyr::coalesce(as.character(outblock_ids), ""),
+        outblock_gwas_hits = dplyr::coalesce(as.character(outblock_gwas_hits), ""),
+        outblock_genes = dplyr::coalesce(as.character(outblock_genes), ""),
+        n_outblock_gwas_hits = dplyr::coalesce(as.integer(n_outblock_gwas_hits), 0L),
+        n_outblock_genes = dplyr::coalesce(as.integer(n_outblock_genes), 0L)
       ) %>%
       dplyr::mutate(
         cluster_score = round(
@@ -5124,9 +5439,24 @@ server <- function(input, output, session) {
         priority_class = dplyr::case_when(
           cluster_score >= 30 ~ "High",
           cluster_score >= 10 ~ "Medium",
-          TRUE ~ "Low"
+          cluster_score > 0   ~ "Low",
+          TRUE             ~ "No score"
         ),
-        priority_class_relative = classify_priority_tertiles(cluster_score)
+        priority_class_relative = classify_priority_tertiles(cluster_score),
+        
+        score_breakdown = paste0(
+          "LD_blocks=", round(cluster_score_from_blocks, 2),
+          "; genes=", round(cluster_gene_bonus, 2),
+          "; fragmentation=", round(cluster_fragmentation_bonus, 2)
+        ),
+        
+        outblock_summary = dplyr::case_when(
+          has_outblock ~ paste0(
+            "out-block GWAS=", n_outblock_gwas_hits,
+            "; out-block genes=", n_outblock_genes
+          ),
+          TRUE ~ ""
+        )
       ) %>%
       dplyr::arrange(
         dplyr::desc(cluster_score),
@@ -5142,7 +5472,7 @@ server <- function(input, output, session) {
   ################################################################################
   
   
-  #---------------- bar plot---------------------------------------
+  #---------------- Cliuster priorityb table---------------------------------------
   
   output$prioritized_cluster_dt <- DT::renderDT({
     df <- prioritized_cluster_df_v2()
@@ -5172,7 +5502,10 @@ server <- function(input, output, session) {
       "priority_class_relative",
       "genes_in_blocks",
       "apps_supported",
-      "support_signature"
+      "support_signature",
+      "outblock_summary",
+      "outblock_gwas_hits",
+      "outblock_genes"
     )
     
     needed_num <- c(
@@ -5206,6 +5539,10 @@ server <- function(input, output, session) {
         apps_supported = dplyr::coalesce(as.character(apps_supported), ""),
         support_signature = dplyr::coalesce(as.character(support_signature), ""),
         
+        outblock_summary = dplyr::coalesce(as.character(outblock_summary), ""),
+        outblock_gwas_hits = dplyr::coalesce(as.character(outblock_gwas_hits), ""),
+        outblock_genes = dplyr::coalesce(as.character(outblock_genes), ""),
+        
         cluster_score = round(dplyr::coalesce(as.numeric(cluster_score), 0), 2),
         cluster_score_from_blocks = round(dplyr::coalesce(as.numeric(cluster_score_from_blocks), 0), 2),
         top_block_score = round(dplyr::coalesce(as.numeric(top_block_score), 0), 2),
@@ -5221,6 +5558,8 @@ server <- function(input, output, session) {
         n_unique_genes_in_blocks = dplyr::coalesce(as.integer(n_unique_genes_in_blocks), 0L),
         n_apps_supported = dplyr::coalesce(as.integer(n_apps_supported), 0L),
         
+        
+        
         n_genes_from_label = vapply(genes_in_blocks, count_semicolon_items, integer(1)),
         n_unique_genes_in_blocks = dplyr::if_else(
           n_unique_genes_in_blocks > 0L,
@@ -5235,7 +5574,12 @@ server <- function(input, output, session) {
           " | ",
           n_unique_genes_in_blocks, " genes",
           " | ",
-          n_apps_supported, " apps"
+          n_apps_supported, " apps",
+          ifelse(
+            nzchar(outblock_summary),
+            paste0(" | ", outblock_summary),
+            ""
+          )
         ),
         
         support_signature = dplyr::case_when(
@@ -5252,7 +5596,18 @@ server <- function(input, output, session) {
           " | frag_bonus=", format(cluster_fragmentation_bonus, nsmall = 2)
         ),
         
-        genes_in_blocks = make_genecards_links(genes_in_blocks),
+        genes_in_blocks_raw = genes_in_blocks,
+        genes_in_blocks = dplyr::if_else(
+          n_unique_genes_in_blocks > 0L,
+          paste0(
+            "<details><summary>",
+            n_unique_genes_in_blocks,
+            " genes</summary>",
+            make_genecards_links(genes_in_blocks_raw),
+            "</details>"
+          ),
+          ""
+        ),
         priority_class = make_priority_badge(priority_class),
         priority_class_relative = make_priority_badge(priority_class_relative)
       ) %>%
@@ -5264,6 +5619,9 @@ server <- function(input, output, session) {
         evidence_summary,
         support_signature,
         score_breakdown,
+        outblock_summary,
+        outblock_gwas_hits,
+        outblock_genes,
         genes_in_blocks,
         cluster_score_from_blocks,
         top_block_score,
@@ -5886,18 +6244,54 @@ server <- function(input, output, session) {
     metric_sel <- as.character(input$ld_global_metric %||% "R2")
     
     out <- dplyr::bind_rows(lapply(dd, function(x) {
-      if (is.null(x) || !is.list(x) || !is.data.frame(x$block_hits) || !nrow(x$block_hits)) {
-        return(NULL)
+      if (is.null(x) || !is.list(x)) return(NULL)
+      
+      cid <- as.character(x$cluster_id %||% NA_character_)
+      chr <- suppressWarnings(as.integer(x$chr %||% NA))
+      
+      cl <- tibble::tibble(
+        cluster_id = cid,
+        chr = chr,
+        start = suppressWarnings(as.integer(x$start %||% NA)),
+        end = suppressWarnings(as.integer(x$end %||% NA))
+      )
+      
+      bh_saved <- if (is.data.frame(x$block_hits) && nrow(x$block_hits)) {
+        tibble::as_tibble(x$block_hits)
+      } else {
+        tibble::tibble()
       }
       
-      bh <- tibble::as_tibble(x$block_hits)
+      bh_rebuilt <- tryCatch(
+        rebuild_block_hits_from_components(
+          cl = cl,
+          ca = if (is.data.frame(x$candidates)) x$candidates else NULL,
+          hits = if (is.data.frame(x$gwas_hits)) x$gwas_hits else NULL,
+          blk = if (is.data.frame(x$block_ranges)) x$block_ranges else NULL,
+          proxy_tbl = if (is.data.frame(x$proxies)) x$proxies else NULL
+        ),
+        error = function(e) tibble::tibble()
+      )
       
-      if (!"cluster_id" %in% names(bh)) bh$cluster_id <- as.character(x$cluster_id %||% NA_character_)
-      if (!"chr" %in% names(bh)) bh$chr <- suppressWarnings(as.integer(x$chr %||% NA))
+      bh <- dplyr::bind_rows(bh_saved, bh_rebuilt)
+      
+      if (!is.data.frame(bh) || !nrow(bh)) return(NULL)
+      
+      if (!"cluster_id" %in% names(bh)) bh$cluster_id <- cid
+      if (!"chr" %in% names(bh)) bh$chr <- chr
       if (!"population" %in% names(bh)) bh$population <- as.character(x$population %||% NA_character_)
       if (!"ld_metric" %in% names(bh)) bh$ld_metric <- as.character(x$ld_metric %||% NA_character_)
       
-      bh
+      bh %>%
+        dplyr::mutate(
+          cluster_id = as.character(cluster_id),
+          block_id = as.character(block_id),
+          classe = as.character(classe),
+          hit_rsid = as.character(hit_rsid),
+          hit_id = as.character(hit_id),
+          hit_pos = suppressWarnings(as.integer(hit_pos))
+        ) %>%
+        dplyr::distinct()
     }))
     
     if (!is.data.frame(out) || !nrow(out)) {
@@ -5911,19 +6305,59 @@ server <- function(input, output, session) {
     if (nzchar(metric_sel) && "ld_metric" %in% names(out)) {
       out <- out %>% dplyr::filter(as.character(ld_metric) == metric_sel)
     }
-    
-    out
+
   })
   
   ### equival al block_overlap_summary_df del cluster
   block_overlap_summary_global_df <- reactive({
-    block_overlap_summary_df(
-      block_ranges = block_ranges_global(),
-      block_hits = ld_block_hits_global(),
-      block_genes = block_gene_overlap_summary_global(),
-      gwas_bridge_df = gwas_bridge_r(),
-      proxy_tbl = ld_proxy_table_global()
-    )
+    sdir <- selected_session_dir()
+    
+    dd <- tryCatch(ld_details_rds(), error = function(e) NULL)
+    out <- tibble::tibble()
+    
+    # 1) Estat viu del Global LD
+    if (is.list(dd) && length(dd)) {
+      out <- dplyr::bind_rows(lapply(dd, function(x) {
+        if (!is.list(x)) return(NULL)
+        if (!is.data.frame(x$block_summary) || !nrow(x$block_summary)) return(NULL)
+        x$block_summary
+      }))
+    }
+    
+    # 2) Fallback: fitxer summary global
+    if ((!is.data.frame(out) || !nrow(out)) && nzchar(sdir) && dir.exists(sdir)) {
+      out <- safe_read_rds(
+        file.path(sdir, "ld_global_block_summary.rds"),
+        default = tibble::tibble()
+      )
+    }
+    
+    # 3) Fallback: fitxer details global
+    if ((!is.data.frame(out) || !nrow(out)) && nzchar(sdir) && dir.exists(sdir)) {
+      dd2 <- safe_read_rds(
+        file.path(sdir, "ld_global_details.rds"),
+        default = NULL
+      )
+      
+      if (is.list(dd2) && length(dd2)) {
+        out <- dplyr::bind_rows(lapply(dd2, function(x) {
+          if (!is.list(x)) return(NULL)
+          if (!is.data.frame(x$block_summary) || !nrow(x$block_summary)) return(NULL)
+          x$block_summary
+        }))
+      }
+    }
+    
+    if (!is.data.frame(out) || !nrow(out)) {
+      return(tibble::tibble())
+    }
+    
+    if (!all(c("cluster_id", "block_id") %in% names(out))) {
+      return(tibble::tibble())
+    }
+    
+    out %>%
+      dplyr::distinct(cluster_id, block_id, .keep_all = TRUE)
   })
   
   ###################################### Taula amb score de blocks
@@ -6220,169 +6654,120 @@ function(data, row, column, node){
   }, server = TRUE)
   
   output$ld_summary_dt <- DT::renderDT({
-    dt <- ld_summary_rds()
+    
+    # ------------------------------------------------------------
+    # Global LD block summary:
+    # one row per LD block, built from GLOBAL live calculation only
+    # ------------------------------------------------------------
+    
+    dt <- tryCatch({
+      block_overlap_summary_global_df()
+    }, error = function(e) {
+      NULL
+    })
     
     if (!is.data.frame(dt) || !nrow(dt)) {
       return(DT::datatable(
-        data.frame(Message = "No LD summary available yet. Run 'Compute global LD / blocks'."),
+        data.frame(Message = "Run Compute global LD / blocks to populate the global block-level summary."),
         rownames = FALSE,
         options = list(dom = "t")
       ))
     }
     
-    # ------------------------------------------------------------
-    # Helper: converteix cel·les amb llistes llargues en desplegables
-    # i opcionalment aplica funcions de links als ítems
-    # ------------------------------------------------------------
-    make_collapsible_items <- function(x, max_items = 5, link_fun = NULL) {
-      
-      split_items <- function(txt) {
-        if (is.null(txt) || is.na(txt) || !nzchar(trimws(as.character(txt)))) {
-          return(character(0))
-        }
-        
-        txt <- as.character(txt)
-        parts <- unlist(strsplit(txt, "\\s*;\\s*|\\s*\\|\\s*|\\n+"))
-        parts <- trimws(parts)
-        parts <- parts[nzchar(parts)]
-        unique(parts)
-      }
-      
-      vapply(x, function(cell) {
-        items <- split_items(cell)
-        
-        if (length(items) == 0) {
-          return("")
-        }
-        
-        items_out <- items
-        if (is.function(link_fun)) {
-          items_out <- link_fun(items)
-        }
-        
-        if (length(items_out) <= max_items) {
-          return(paste(items_out, collapse = "<br>"))
-        }
-        
-        paste0(
-          "<div class='ld-collapsible-cell'>",
-          "<a href='#' class='ld-toggle'>", length(items_out), " items ▼</a>",
-          "<div class='ld-collapsible-content' style='display:none; margin-top:4px;'>",
-          paste(items_out, collapse = "<br>"),
-          "</div>",
-          "</div>"
+    dt2 <- make_block_canonical_table_display(dt)
+    
+    if (!is.data.frame(dt2) || !nrow(dt2)) {
+      return(DT::datatable(
+        data.frame(Message = "No LD block summary rows available for display."),
+        rownames = FALSE,
+        options = list(dom = "t")
+      ))
+    }
+    
+    if (!"cluster_id" %in% names(dt2)) dt2$cluster_id <- NA_character_
+    if (!"block_id" %in% names(dt2)) dt2$block_id <- NA_character_
+    if (!"block_label" %in% names(dt2)) dt2$block_label <- NA_character_
+    if (!"genes_name" %in% names(dt2)) dt2$genes_name <- ""
+    if (!"gwas_hits" %in% names(dt2)) dt2$gwas_hits <- ""
+    if (!"ld_proxy_snps" %in% names(dt2)) dt2$ld_proxy_snps <- ""
+    if (!"gwas_min_p" %in% names(dt2)) dt2$gwas_min_p <- NA_real_
+    if (!"gwas_top_logp" %in% names(dt2)) dt2$gwas_top_logp <- NA_real_
+    
+    dt2 <- dt2 %>%
+      dplyr::mutate(
+        gwas_min_p = dplyr::if_else(
+          is.finite(suppressWarnings(as.numeric(gwas_min_p))),
+          formatC(as.numeric(gwas_min_p), format = "e", digits = 2),
+          ""
+        ),
+        genes_name = vapply(
+          genes_name,
+          build_gene_link_column_html,
+          character(1)
+        ),
+        gwas_hits = vapply(
+          gwas_hits,
+          function(z) collapse_plain_list_html(
+            z,
+            max_visible = 5L,
+            summary_label = paste0(length(split_semicolon(z)), " GWAS hits")
+          ),
+          character(1)
+        ),
+        ld_proxy_snps = vapply(
+          ld_proxy_snps,
+          build_snp_link_column_html,
+          character(1)
         )
-      }, character(1))
-    }
+      )
     
-    clean_gene_items_text <- function(x) {
-      if (is.null(x) || is.na(x) || !nzchar(trimws(as.character(x)))) {
-        return("")
-      }
-      
-      txt <- as.character(x)
-      parts <- unlist(strsplit(txt, "\\s*;\\s*|\\s*\\|\\s*|\\n+"))
-      parts <- trimws(parts)
-      parts <- parts[nzchar(parts)]
-      
-      # elimina identificadors purament numèrics
-      parts <- parts[!grepl("^[0-9]+$", parts)]
-      
-      parts <- unique(parts)
-      paste(parts, collapse = "; ")
-    }
-    
-    dt2 <- sanitize_dt_types(dt)
-    
-    # ------------------------------------------------------------
-    # Columnes amb links
-    # ------------------------------------------------------------
-    gene_cols <- intersect(
+    keep_cols <- intersect(
       c(
-        "block_genes",
-        "genes_in_block",
-        "genes",
-        "gwas_genes",
-        "catalog_genes",
-        "gtex_genes",
-        "nonsyn_genes",
-        "ewasdis_genes",
-        "ewastum_genes"
-      ),
-      names(dt2)
-    )
-    
-    snp_cols <- intersect(
-      c(
+        "cluster_id",
+        "block_id",
+        "block_label",
+        "start",
+        "end",
+        "size_kb",
+        "support_apps",
+        "catalog_hits",
+        "gtex_hits",
+        "nonsyn_hits",
+        "ewasdis_hits",
+        "ewastum_hits",
         "gwas_hits",
-        "seed_snps",
-        "proxy_snps",
-        "lead_snps",
-        "supporting_snps"
+        "gwas_top_logp",
+        "gwas_min_p",
+        "n_ld_proxy_hits",
+        "block_max_ld",
+        "block_mean_ld",
+        "ld_proxy_snps",
+        "genes_name"
       ),
       names(dt2)
     )
     
-    trait_cols <- intersect(
-      c("catalog_traits"),
-      names(dt2)
-    )
+    dt2 <- dt2 %>%
+      dplyr::select(dplyr::all_of(keep_cols)) %>%
+      dplyr::arrange(
+        suppressWarnings(as.numeric(cluster_id)),
+        start,
+        block_id
+      )
     
-    plain_collapsible_cols <- intersect(
-      c(),
-      names(dt2)
-    )
-    
-    # Gens -> GeneCards
-    if (length(gene_cols)) {
-      for (cc in gene_cols) {
-        dt2[[cc]] <- vapply(dt2[[cc]], clean_gene_items_text, character(1))
-        
-        dt2[[cc]] <- make_collapsible_items(
-          dt2[[cc]],
-          max_items = 5,
-          link_fun = make_genecards_links
+    df_display <- dt2 %>%
+      dplyr::mutate(
+        dplyr::across(
+          where(is.character),
+          ~ dplyr::if_else(is.na(.) | trimws(.) == "", "-", .)
         )
-      }
-    }
-    
-    # SNPs / rsid -> dbSNP
-    if (length(snp_cols)) {
-      for (cc in snp_cols) {
-        dt2[[cc]] <- make_collapsible_items(
-          dt2[[cc]],
-          max_items = 5,
-          link_fun = make_dbsnp_links
-        )
-      }
-    }
-    
-    # Traits -> GWAS Catalog
-    if (length(trait_cols)) {
-      for (cc in trait_cols) {
-        dt2[[cc]] <- make_collapsible_items(
-          dt2[[cc]],
-          max_items = 5,
-          link_fun = make_gwascatalog_term_links
-        )
-      }
-    }
-    
-    # Altres columnes llargues sense links
-    if (length(plain_collapsible_cols)) {
-      for (cc in plain_collapsible_cols) {
-        dt2[[cc]] <- make_collapsible_items(
-          dt2[[cc]],
-          max_items = 5,
-          link_fun = NULL
-        )
-      }
-    }
+      )
     
     out <- DT::datatable(
-      dt2,
+      df_display,
       rownames = FALSE,
       escape = FALSE,
+      filter = "top",
       extensions = "Buttons",
       width = "100%",
       options = list(
@@ -6392,59 +6777,65 @@ function(data, row, column, node){
             extend = "copy",
             exportOptions = list(
               columns = ":visible",
-              modifier = list(
-                page = "all",
-                search = "none",
-                order = "index"
-              )
+              modifier = list(page = "all", search = "none", order = "index")
             )
           ),
           list(
             extend = "csv",
             exportOptions = list(
               columns = ":visible",
-              modifier = list(
-                page = "all",
-                search = "none",
-                order = "index"
-              )
+              modifier = list(page = "all", search = "none", order = "index")
             )
           ),
           list(
             extend = "excel",
             exportOptions = list(
               columns = ":visible",
-              modifier = list(
-                page = "all",
-                search = "none",
-                order = "index"
-              )
+              modifier = list(page = "all", search = "none", order = "index")
             )
           )
         ),
         scrollX = TRUE,
         pageLength = 15,
-        autoWidth = FALSE
-      ),
-      callback = DT::JS("
-      table.on('click', 'a.ld-toggle', function(e) {
-        e.preventDefault();
-        var $link = $(this);
-        var $content = $link.closest('.ld-collapsible-cell').find('.ld-collapsible-content');
-        
-        if ($content.is(':visible')) {
-          $content.hide();
-          $link.text($link.text().replace('▲', '▼'));
-        } else {
-          $content.show();
-          $link.text($link.text().replace('▼', '▲'));
-        }
-      });
-    ")
+        autoWidth = FALSE,
+        order = list(
+          list(which(names(df_display) == "cluster_id") - 1L, "asc"),
+          list(which(names(df_display) == "start") - 1L, "asc")
+        )
+      )
     )
     
-    if ("mean_ld_value" %in% names(dt2)) {
-      out <- out %>% DT::formatRound("mean_ld_value", 2)
+    numeric0_cols <- intersect(
+      c(
+        "start",
+        "end",
+        "support_apps",
+        "catalog_hits",
+        "gtex_hits",
+        "nonsyn_hits",
+        "ewasdis_hits",
+        "ewastum_hits",
+        "n_ld_proxy_hits"
+      ),
+      names(df_display)
+    )
+    
+    numeric2_cols <- intersect(
+      c(
+        "size_kb",
+        "gwas_top_logp",
+        "block_max_ld",
+        "block_mean_ld"
+      ),
+      names(df_display)
+    )
+    
+    if (length(numeric0_cols)) {
+      out <- out %>% DT::formatRound(numeric0_cols, 0)
+    }
+    
+    if (length(numeric2_cols)) {
+      out <- out %>% DT::formatRound(numeric2_cols, 2)
     }
     
     out
@@ -6865,6 +7256,17 @@ function(data, row, column, node){
     
     validate(
       need(is.data.frame(df) && nrow(df) > 0, "No global block summary available.")
+    )
+    
+    df <- df %>%
+      dplyr::filter(
+        !grepl("OUT", as.character(block_id), ignore.case = TRUE),
+        !grepl("OUT", as.character(block_label), ignore.case = TRUE),
+        !grepl("OUT", as.character(block_label2), ignore.case = TRUE)
+      )
+    
+    validate(
+      need(is.data.frame(df) && nrow(df) > 0, "No LD blocks available after excluding OUT-BLOCK rows.")
     )
     
     cluster_levels <- df %>%
@@ -7323,6 +7725,35 @@ function(data, row, column, node){
       length(vals)
     }
     
+    build_support_signature <- function(gene_evidence_types, apps_supported) {
+      
+      tt <- split_unique_semicolon(gene_evidence_types)
+      aa <- split_unique_semicolon(apps_supported)
+      
+      sig <- character(0)
+      
+      if ("nonsyn_gene" %in% tt) {
+        sig <- c(sig, "functional")
+      }
+      
+      if (any(c("gtex_gene", "ewas_nearby_gene") %in% tt) ||
+          any(aa %in% c("gtex", "ewas", "ewasdis", "ewastum"))) {
+        sig <- c(sig, "regulatory")
+      }
+      
+      if ("physical_overlap" %in% tt) {
+        sig <- c(sig, "physical")
+      }
+      
+      if ("catalog_gene" %in% tt || "catalog" %in% aa) {
+        sig <- c(sig, "literature")
+      }
+      
+      paste(unique(sig), collapse = "; ")
+    }
+    
+    
+    
     count_blocks_by_app_string <- function(block_keys, app_strings) {
       block_keys <- as.character(block_keys)
       app_strings <- as.character(app_strings)
@@ -7357,8 +7788,14 @@ function(data, row, column, node){
         paste(collapse = "; ")
     }
     
-    gene_support <- if (is.data.frame(audit_units) && nrow(audit_units)) {
-      audit_units %>%
+    audit_units2 <- audit_units
+    
+    if (!"structural_support" %in% names(audit_units2)) {
+      audit_units2$structural_support <- ""
+    }
+    
+    gene_support <- if (is.data.frame(audit_units2) && nrow(audit_units2)) {
+      audit_units2 %>%
         dplyr::mutate(
           cluster_id = trimws(as.character(cluster_id)),
           gene = trimws(as.character(gene)),
@@ -7370,36 +7807,78 @@ function(data, row, column, node){
           apps_supported = dplyr::coalesce(as.character(apps_supported), ""),
           match_apps = dplyr::coalesce(as.character(match_apps), ""),
           marker_apps = dplyr::coalesce(as.character(marker_apps), ""),
+          structural_support = dplyr::coalesce(as.character(structural_support), ""),
           gene_score_component = dplyr::coalesce(as.numeric(gene_score_component), 0),
           gwas_hit_priority_score = dplyr::coalesce(as.numeric(gwas_hit_priority_score), 0),
           hit_support_score = gene_score_component * gwas_hit_priority_score,
+          
+          # Canonical support unit:
+          # - LD block if available
+          # - otherwise independent GWAS-hit unit
+          support_unit_key = dplyr::case_when(
+            nzchar(block_id) ~ paste(cluster_id, block_id, sep = "||"),
+            nzchar(gwas_hit) ~ paste(cluster_id, "NO_BLOCK", gwas_hit, gwas_pos, sep = "||"),
+            TRUE ~ paste(cluster_id, "NO_BLOCK", dplyr::row_number(), sep = "||")
+          ),
+          
           supporting_block_key = dplyr::case_when(
             nzchar(block_id) ~ paste(cluster_id, block_id, sep = "||"),
             TRUE ~ ""
           )
         ) %>%
-        dplyr::group_by(cluster_id, gene) %>%
+        dplyr::filter(
+          !is.na(cluster_id), nzchar(cluster_id),
+          !is.na(gene), nzchar(gene)
+        ) %>%
+        
+        # First score each gene within each LD block / independent support unit
+        dplyr::group_by(cluster_id, gene, support_unit_key) %>%
         dplyr::arrange(
           dplyr::desc(hit_support_score),
           dplyr::desc(gwas_hit_priority_score),
           .by_group = TRUE
         ) %>%
         dplyr::summarise(
-          top_hit_support_score = {
+          unit_top_hit_support_score = {
             hs <- hit_support_score
             hs <- hs[!is.na(hs)]
             if (!length(hs)) 0 else hs[1]
           },
-          other_hit_support_score = {
+          unit_other_hit_support_score = {
             hs <- hit_support_score
             hs <- hs[!is.na(hs)]
             if (length(hs) <= 1) 0 else sum(hs[-1], na.rm = TRUE)
           },
           other_hits_weight = 0.05,
-          gene_score = top_hit_support_score + other_hits_weight * other_hit_support_score,
-          n_supporting_blocks = dplyr::n_distinct(supporting_block_key[nzchar(supporting_block_key)]),
-          top_gwas_hit_score = max(gwas_hit_priority_score, na.rm = TRUE),
+          unit_gene_score = unit_top_hit_support_score +
+            other_hits_weight * unit_other_hit_support_score,
+          
+          unit_top_gwas_hit_score = max(gwas_hit_priority_score, na.rm = TRUE),
+          supporting_block_key = dplyr::first(supporting_block_key),
+          apps_supported = collapse_unique_semicolon(apps_supported),
+          structural_support = collapse_unique_semicolon(structural_support),
+          match_apps = collapse_unique_semicolon(match_apps),
+          marker_apps = collapse_unique_semicolon(marker_apps),
+          .groups = "drop"
+        ) %>%
+        
+        # Then sum independent block/support-unit scores per cluster + gene
+        dplyr::group_by(cluster_id, gene) %>%
+        dplyr::summarise(
+          top_hit_support_score = sum(unit_top_hit_support_score, na.rm = TRUE),
+          other_hit_support_score = sum(unit_other_hit_support_score, na.rm = TRUE),
+          other_hits_weight = max(other_hits_weight, na.rm = TRUE),
+          gene_score = sum(unit_gene_score, na.rm = TRUE),
+          
+          n_supporting_blocks = dplyr::n_distinct(
+            supporting_block_key[nzchar(supporting_block_key)]
+          ),
+          n_support_units = dplyr::n_distinct(support_unit_key),
+          top_gwas_hit_score = max(unit_top_gwas_hit_score, na.rm = TRUE),
+          
           apps_supported_audit = collapse_unique_semicolon(apps_supported),
+          structural_support = collapse_unique_semicolon(structural_support),
+          
           match_support = count_blocks_by_app_string(
             supporting_block_key[nzchar(supporting_block_key)],
             match_apps[nzchar(supporting_block_key)]
@@ -7419,6 +7898,7 @@ function(data, row, column, node){
         other_hits_weight = numeric(),
         gene_score = numeric(),
         n_supporting_blocks = integer(),
+        n_support_units = integer(),
         top_gwas_hit_score = numeric(),
         apps_supported_audit = character(),
         match_support = character(),
@@ -7431,6 +7911,12 @@ function(data, row, column, node){
         gene_support,
         by = c("cluster_id", "gene")
       ) %>%
+      {
+        if (!"structural_support" %in% names(.)) {
+          .$structural_support <- ""
+        }
+        .
+      } %>%
       dplyr::mutate(
         top_hit_support_score = dplyr::coalesce(as.numeric(top_hit_support_score), 0),
         other_hit_support_score = dplyr::coalesce(as.numeric(other_hit_support_score), 0),
@@ -7443,6 +7929,8 @@ function(data, row, column, node){
         gene_source_apps = dplyr::coalesce(as.character(gene_source_apps), ""),
         apps_supported_audit = dplyr::coalesce(as.character(apps_supported_audit), ""),
         match_support = dplyr::coalesce(as.character(match_support), ""),
+        n_support_units = dplyr::coalesce(as.integer(n_support_units), 0L),
+        structural_support = dplyr::coalesce(as.character(structural_support), ""),
         marker_support = dplyr::coalesce(as.character(marker_support), "")
       ) %>%
       dplyr::group_by(gene) %>%
@@ -7460,20 +7948,36 @@ function(data, row, column, node){
         gene_source_apps = collapse_unique_semicolon(gene_source_apps),
         apps_supported_audit = collapse_unique_semicolon(apps_supported_audit),
         match_support = collapse_unique_semicolon(match_support),
+        n_support_units = sum(n_support_units, na.rm = TRUE),
         marker_support = collapse_unique_semicolon(marker_support),
+        structural_support = collapse_unique_semicolon(structural_support),
         .groups = "drop"
       ) %>%
       dplyr::mutate(
-        apps_supported = dplyr::coalesce(as.character(apps_supported_audit), ""),
+        apps_supported = dplyr::case_when(
+          nzchar(trimws(as.character(apps_supported_audit))) ~ as.character(apps_supported_audit),
+          nzchar(trimws(as.character(gene_source_apps))) ~ as.character(gene_source_apps),
+          TRUE ~ ""
+        ),
+        
         n_apps_supported = vapply(apps_supported, count_unique_semicolon, integer(1)),
+        
+        support_signature = mapply(
+          build_support_signature,
+          gene_evidence_types,
+          apps_supported,
+          USE.NAMES = FALSE
+        ),
+        
+        structural_support = dplyr::coalesce(as.character(structural_support), ""),
         priority_class = dplyr::case_when(
           gene_score >= 40 ~ "High",
           gene_score >= 10 ~ "Medium",
-          TRUE ~ "Low"
+          gene_score > 0   ~ "Low",
+          TRUE             ~ "No score"
         ),
         priority_class_relative = classify_priority_tertiles(gene_score)
       ) %>%
-      dplyr::filter(gene_score > 0) %>%
       dplyr::arrange(
         dplyr::desc(gene_score),
         dplyr::desc(n_supporting_blocks),
@@ -7543,6 +8047,8 @@ function(data, row, column, node){
   })
   
   global_block_ranges_r <- reactive({
+    df <- ld_global_blocks_plot_df()
+    
     normalize_chr_label <- function(x) {
       x <- as.character(x)
       x <- trimws(x)
@@ -7550,10 +8056,32 @@ function(data, row, column, node){
       x
     }
     
-    ld_global_blocks_plot_df() %>%
+    if (!is.data.frame(df) || !nrow(df)) {
+      return(tibble::tibble(
+        cluster_id = character(),
+        chr = character(),
+        block_id = character(),
+        block_start = numeric(),
+        block_end = numeric()
+      ))
+    }
+    
+    chr_col <- dplyr::case_when(
+      "chr" %in% names(df) ~ "chr",
+      "chromosome" %in% names(df) ~ "chromosome",
+      "CHR" %in% names(df) ~ "CHR",
+      "chr_num" %in% names(df) ~ "chr_num",
+      TRUE ~ NA_character_
+    )
+    
+    validate(
+      need(!is.na(chr_col), "No chromosome column found in ld_global_blocks_plot_df().")
+    )
+    
+    df %>%
       dplyr::transmute(
         cluster_id = trimws(as.character(cluster_id)),
-        chr = normalize_chr_label(chr_num),
+        chr = normalize_chr_label(.data[[chr_col]]),
         block_id = trimws(as.character(block_id)),
         block_start = suppressWarnings(as.numeric(block_start)),
         block_end = suppressWarnings(as.numeric(block_end))
@@ -7562,18 +8090,23 @@ function(data, row, column, node){
         !is.na(cluster_id), nzchar(cluster_id),
         !is.na(chr), nzchar(chr),
         !is.na(block_id), nzchar(block_id),
-        !is.na(block_start),
-        !is.na(block_end)
+        !grepl("OUT", block_id, ignore.case = TRUE),
+        is.finite(block_start),
+        is.finite(block_end)
       ) %>%
-      dplyr::distinct()
+      dplyr::distinct(cluster_id, chr, block_id, block_start, block_end)
   })
   
   gene_gwas_hit_score_audit_df <- reactive({
     ga <- gwas_hit_priority_mod$gwas_hit_match_audit_summary_with_gene_df()
     gh <- gwas_hit_priority_df_v2()
     canon_genes <- canonical_prioritized_cluster_genes_df()
-    block_ranges_df <- global_block_ranges_r()
     gtex_src <- gtex_pos_summary_r()
+    
+    block_ranges_df <- tryCatch(
+      block_overlap_summary_global_df(),
+      error = function(e) NULL
+    )
     
     validate(
       need(is.data.frame(ga) && nrow(ga) > 0, "No GWAS hit × app × gene audit data available."),
@@ -7666,6 +8199,144 @@ function(data, row, column, node){
       )
     
     # ------------------------------------------------------------
+    # 2b) Inject canonical MARKER support from GWAS hit priority
+    # ------------------------------------------------------------
+    
+    gh_marker_support <- gh %>%
+      dplyr::mutate(
+        cluster_id = trimws(as.character(cluster_id)),
+        chr = normalize_chr_label(chr),
+        gwas_hit = trimws(as.character(gwas_hit)),
+        gwas_pos = suppressWarnings(as.numeric(gwas_pos)),
+        support_signature = dplyr::coalesce(as.character(support_signature), "")
+      ) %>%
+      dplyr::filter(
+        grepl("MARKER", support_signature)
+      )
+    
+    block_gene_raw <- block_gene_overlap_summary_global()
+    
+    gene_col2 <- dplyr::case_when(
+      "gene" %in% names(block_gene_raw) ~ "gene",
+      "gene_name" %in% names(block_gene_raw) ~ "gene_name",
+      "genes_in_block" %in% names(block_gene_raw) ~ "genes_in_block",
+      "genes_name" %in% names(block_gene_raw) ~ "genes_name",
+      "genes" %in% names(block_gene_raw) ~ "genes",
+      TRUE ~ NA_character_
+    )
+    
+    validate(
+      need(!is.na(gene_col2), "No gene column found in block_gene_overlap_summary_global().")
+    )
+    
+    block_gene_df <- block_gene_overlap_summary_global() %>%
+      dplyr::mutate(
+        cluster_id = trimws(as.character(cluster_id)),
+        block_id = trimws(as.character(block_id)),
+        gene = trimws(as.character(genes_in_block))
+      ) %>%
+      tidyr::separate_rows(
+        gene,
+        sep = "\\s*;\\s*|\\s*,\\s*"
+      ) %>%
+      dplyr::mutate(gene = trimws(gene)) %>%
+      dplyr::filter(
+        !is.na(gene),
+        nzchar(gene)
+      )
+    
+    # Mapar els GWAS hits canònics al seu LD block real.
+    gwas_block_map_2b <- gh_marker_support %>%
+      dplyr::select(
+        cluster_id,
+        chr,
+        gwas_hit,
+        gwas_pos
+      ) %>%
+      dplyr::inner_join(
+        block_ranges_df %>%
+          dplyr::transmute(
+            cluster_id = trimws(as.character(cluster_id)),
+            block_id = trimws(as.character(block_id)),
+            block_start = suppressWarnings(as.numeric(block_start)),
+            block_end = suppressWarnings(as.numeric(block_end))
+          ) %>%
+          dplyr::filter(
+            !is.na(cluster_id),
+            nzchar(cluster_id),
+            !is.na(block_id),
+            nzchar(block_id),
+            !grepl("OUT", block_id, ignore.case = TRUE),
+            is.finite(block_start),
+            is.finite(block_end)
+          ),
+        by = "cluster_id",
+        relationship = "many-to-many"
+      ) %>%
+      dplyr::filter(
+        is.finite(gwas_pos),
+        gwas_pos >= block_start,
+        gwas_pos <= block_end
+      ) %>%
+      dplyr::distinct(
+        cluster_id,
+        chr,
+        block_id,
+        gwas_hit,
+        gwas_pos
+      )
+    
+    gwas_block_gene <- gwas_block_map_2b %>%
+      dplyr::inner_join(
+        block_gene_df,
+        by = c("cluster_id", "block_id")
+      )
+    
+    canonical_marker_rows <- gh_marker_support %>%
+      dplyr::select(
+        cluster_id,
+        chr,
+        gwas_hit,
+        gwas_pos,
+        support_signature
+      ) %>%
+      dplyr::inner_join(
+        gwas_block_gene,
+        by = c(
+          "cluster_id",
+          "chr",
+          "gwas_hit",
+          "gwas_pos"
+        )
+      ) %>%
+      dplyr::mutate(
+        source_app = "ldblock",
+        score_app = "ldblock",
+        link_state = "MARKER",
+        matched_ids = "",
+        matched_pos = "",
+        hit_label = "",
+        nearest_gene = gene,
+        nearest_gene_dist_bp = NA_real_,
+        n_rows = NA_integer_,
+        n_verified = NA_integer_
+      )
+    
+    missing_cols <- setdiff(names(ga_base), names(canonical_marker_rows))
+    for (cc in missing_cols) {
+      canonical_marker_rows[[cc]] <- NA
+    }
+    
+    canonical_marker_rows <- canonical_marker_rows %>%
+      dplyr::select(dplyr::all_of(names(ga_base)))
+    
+    ga_base <- dplyr::bind_rows(
+      ga_base,
+      canonical_marker_rows
+    ) %>%
+      dplyr::distinct()
+    
+    # ------------------------------------------------------------
     # 3) Afegir score global del GWAS hit
     # ------------------------------------------------------------
     gh_base <- gh %>%
@@ -7694,64 +8365,230 @@ function(data, row, column, node){
       )
     
     # ------------------------------------------------------------
-    # 4) Assignar block_id per solapament amb blocs globals
+    # 4) Assignar block_id i validar MARKER per mateix LD block
     # ------------------------------------------------------------
-    ga_dt <- ga_base %>%
-      dplyr::transmute(
-        gene,
-        cluster_id,
-        chr,
-        gwas_hit,
-        gwas_pos,
-        hit_start = gwas_pos,
-        hit_end = gwas_pos,
-        source_app,
-        score_app,
-        link_state,
-        matched_ids,
-        matched_pos,
-        hit_label,
-        nearest_gene_dist_bp,
-        gwas_hit_priority_score,
-        priority_class,
-        priority_class_relative
-      ) %>%
-      data.table::as.data.table()
+    # Regla canònica:
+    # - MATCH pot entrar pel mateix hit.
+    # - MARKER només és vàlid si el GWAS hit i el hit funcional
+    #   matched_pos cauen dins del mateix LD block.
+    # - No n'hi ha prou amb estar al mateix cluster.
+    # ------------------------------------------------------------
+    
+    parse_matched_positions <- function(x) {
+      x <- as.character(x %||% "")
+      x <- trimws(x)
+      
+      if (!nzchar(x)) {
+        return(numeric(0))
+      }
+      
+      parts <- unlist(
+        strsplit(x, "\\s*;\\s*|\\s*,\\s*|\\s*\\|\\s*", perl = TRUE),
+        use.names = FALSE
+      )
+      
+      parts <- trimws(parts)
+      parts <- parts[nzchar(parts)]
+      
+      out <- suppressWarnings(readr::parse_number(parts))
+      out <- out[is.finite(out)]
+      
+      unique(out)
+    }
+    
+    ga_base2 <- ga_base %>%
+      dplyr::mutate(
+        row_id = dplyr::row_number()
+      )
     
     block_dt <- block_ranges_df %>%
       dplyr::transmute(
         cluster_id = trimws(as.character(cluster_id)),
-        chr = normalize_chr_label(chr),
         block_id = trimws(as.character(block_id)),
         block_start = suppressWarnings(as.numeric(block_start)),
         block_end = suppressWarnings(as.numeric(block_end))
       ) %>%
+      dplyr::filter(
+        !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(block_id), nzchar(block_id),
+        !grepl("OUT", block_id, ignore.case = TRUE),
+        is.finite(block_start),
+        is.finite(block_end)
+      ) %>%
       data.table::as.data.table()
     
-    data.table::setkey(ga_dt, cluster_id, chr, hit_start, hit_end)
-    data.table::setkey(block_dt, cluster_id, chr, block_start, block_end)
+    # ------------------------------------------------------------
+    # 4a) Block del GWAS hit
+    # ------------------------------------------------------------
+    ga_gwas_dt <- ga_base2 %>%
+      dplyr::transmute(
+        row_id,
+        cluster_id,
+        chr,
+        gwas_hit,
+        gwas_pos,
+        gwas_start = gwas_pos,
+        gwas_end = gwas_pos
+      ) %>%
+      dplyr::filter(
+        !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(chr), nzchar(chr),
+        is.finite(gwas_start),
+        is.finite(gwas_end)
+      ) %>%
+      data.table::as.data.table()
     
-    joined_dt <- data.table::foverlaps(
-      x = ga_dt,
+    data.table::setkey(ga_gwas_dt, cluster_id, gwas_start, gwas_end)
+    data.table::setkey(block_dt, cluster_id, block_start, block_end)
+    
+    gwas_block_dt <- data.table::foverlaps(
+      x = ga_gwas_dt,
       y = block_dt,
-      by.x = c("cluster_id", "chr", "hit_start", "hit_end"),
-      by.y = c("cluster_id", "chr", "block_start", "block_end"),
+      by.x = c("cluster_id", "gwas_start", "gwas_end"),
+      by.y = c("cluster_id", "block_start", "block_end"),
       type = "within",
       nomatch = NA
     )
     
-    ga_with_blocks <- joined_dt %>%
+    gwas_block_map <- gwas_block_dt %>%
       tibble::as_tibble() %>%
-      dplyr::mutate(
-        block_id = dplyr::coalesce(as.character(block_id), ""),
-        has_block = !is.na(block_id) & nzchar(block_id),
-        score_unit_id = dplyr::case_when(
-          score_app %in% c("gtex", "ewas") & has_block ~ paste(gene, cluster_id, chr, score_app, block_id, sep = "||"),
-          score_app %in% c("gtex", "ewas") & !has_block ~ paste(gene, cluster_id, chr, score_app, gwas_hit, gwas_pos, sep = "||"),
-          link_state == "MARKER" & has_block ~ paste(gene, cluster_id, chr, score_app, block_id, sep = "||"),
-          TRUE ~ paste(gene, cluster_id, chr, score_app, gwas_hit, gwas_pos, sep = "||")
-        )
+      dplyr::transmute(
+        row_id,
+        gwas_block_id = dplyr::coalesce(as.character(block_id), ""),
+        gwas_block_start = suppressWarnings(as.numeric(block_start)),
+        gwas_block_end = suppressWarnings(as.numeric(block_end))
+      ) %>%
+      dplyr::group_by(row_id) %>%
+      dplyr::summarise(
+        gwas_block_id = collapse_unique_semicolon(gwas_block_id),
+        gwas_block_start = if (any(is.finite(gwas_block_start))) min(gwas_block_start, na.rm = TRUE) else NA_real_,
+        gwas_block_end = if (any(is.finite(gwas_block_end))) max(gwas_block_end, na.rm = TRUE) else NA_real_,
+        .groups = "drop"
       )
+    
+    # ------------------------------------------------------------
+    # 4b) Blocks dels matched_pos funcionals
+    # ------------------------------------------------------------
+    matched_pos_long <- ga_base2 %>%
+      dplyr::select(
+        row_id,
+        cluster_id,
+        chr,
+        source_app,
+        score_app,
+        link_state,
+        matched_pos
+      ) %>%
+      dplyr::rowwise() %>%
+      dplyr::mutate(
+        matched_pos_list = list(parse_matched_positions(matched_pos))
+      ) %>%
+      dplyr::ungroup() %>%
+      tidyr::unnest_longer(
+        matched_pos_list,
+        values_to = "matched_pos_num",
+        keep_empty = FALSE
+      ) %>%
+      dplyr::mutate(
+        matched_pos_num = suppressWarnings(as.numeric(matched_pos_num)),
+        matched_start = matched_pos_num,
+        matched_end = matched_pos_num
+      ) %>%
+      dplyr::filter(
+        is.finite(matched_pos_num),
+        !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(chr), nzchar(chr)
+      )
+    
+    if (nrow(matched_pos_long) > 0) {
+      
+      matched_dt <- matched_pos_long %>%
+        data.table::as.data.table()
+      
+      data.table::setkey(matched_dt, cluster_id, matched_start, matched_end)
+      
+      matched_block_dt <- data.table::foverlaps(
+        x = matched_dt,
+        y = block_dt,
+        by.x = c("cluster_id", "matched_start", "matched_end"),
+        by.y = c("cluster_id", "block_start", "block_end"),
+        type = "within",
+        nomatch = NA
+      )
+      
+      matched_block_map <- matched_block_dt %>%
+        tibble::as_tibble() %>%
+        dplyr::transmute(
+          row_id,
+          matched_pos_num,
+          matched_block_id = dplyr::coalesce(as.character(block_id), "")
+        ) %>%
+        dplyr::filter(!is.na(row_id)) %>%
+        dplyr::group_by(row_id) %>%
+        dplyr::summarise(
+          matched_pos_all = collapse_unique_semicolon(matched_pos_num),
+          matched_block_ids = collapse_unique_semicolon(matched_block_id),
+          .groups = "drop"
+        )
+      
+    } else {
+      
+      matched_block_map <- tibble::tibble(
+        row_id = integer(),
+        matched_pos_all = character(),
+        matched_block_ids = character()
+      )
+    }
+    
+    # ------------------------------------------------------------
+    # 4c) Taula amb blocks i validació estricta de MARKER
+    # ------------------------------------------------------------
+    ga_with_blocks <- ga_base2 %>%
+      dplyr::left_join(gwas_block_map, by = "row_id") %>%
+      dplyr::left_join(matched_block_map, by = "row_id") %>%
+      dplyr::mutate(
+        gwas_block_id = dplyr::coalesce(as.character(gwas_block_id), ""),
+        matched_block_ids = dplyr::coalesce(as.character(matched_block_ids), ""),
+        matched_pos_all = dplyr::coalesce(as.character(matched_pos_all), ""),
+        
+        block_id = gwas_block_id,
+        has_block = !is.na(block_id) & nzchar(block_id),
+        
+        matched_block_vec = strsplit(matched_block_ids, "\\s*;\\s*", perl = TRUE),
+        
+        matched_pos_in_gwas_block = purrr::map2_lgl(
+          matched_block_vec,
+          gwas_block_id,
+          function(mb, gb) {
+            gb <- trimws(as.character(gb))
+            mb <- trimws(as.character(mb))
+            mb <- mb[!is.na(mb) & nzchar(mb)]
+            
+            nzchar(gb) && length(mb) > 0 && gb %in% mb
+          }
+        ),
+        
+        valid_marker_by_block = dplyr::case_when(
+          link_state != "MARKER" ~ TRUE,
+          link_state == "MARKER" & has_block & matched_pos_in_gwas_block ~ TRUE,
+          TRUE ~ FALSE
+        ),
+        
+        score_unit_id = dplyr::case_when(
+          score_app %in% c("gtex", "ewas") & has_block ~
+            paste(gene, cluster_id, chr, score_app, block_id, sep = "||"),
+          
+          score_app %in% c("gtex", "ewas") & !has_block ~
+            paste(gene, cluster_id, chr, score_app, gwas_hit, gwas_pos, sep = "||"),
+          
+          link_state == "MARKER" & valid_marker_by_block & has_block ~
+            paste(gene, cluster_id, chr, score_app, block_id, sep = "||"),
+          
+          TRUE ~
+            paste(gene, cluster_id, chr, score_app, gwas_hit, gwas_pos, sep = "||")
+        )
+      ) %>%
+      dplyr::select(-matched_block_vec)
     
     # ------------------------------------------------------------
     # 5) MATCH funcionals: GTEx/EWAS col·lapsats per block
@@ -7799,16 +8636,46 @@ function(data, row, column, node){
         gene_score_component = unname(app_weights[score_app]) * state_weights["MATCH"]
       )
     
+    
+    
+ #  cat("\n[MARKER VALIDATION DEBUG]\n")
+ #  
+ #  print(
+ #    ga_with_blocks %>%
+ #      dplyr::filter(!is.na(gwas_hit), nzchar(gwas_hit)) %>%
+ #      dplyr::select(
+ #        gene,
+ #        gwas_hit,
+ #        block_id,
+ #        matched_pos,
+ #        matched_block_ids,
+ #        matched_pos_in_gwas_block,
+ #        valid_marker_by_block,
+ #        source_app,
+ #        score_app,
+ #        link_state
+ #      ) %>%
+ #      dplyr::arrange(
+ #        dplyr::desc(valid_marker_by_block),
+ #        gene
+ #      )
+ #  )
+    
     # ------------------------------------------------------------
-    # 7) MARKER: GTEx/EWAS col·lapsats per block o per hit si no block
-    #    ALTRES apps: mantenim criteri general per score_unit_id
+    # 7) MARKER app-derived: només si GWAS hit i hit funcional comparteixen LD block
     # ------------------------------------------------------------
-    marker_units <- ga_with_blocks %>%
+    marker_units_app <- ga_with_blocks %>%
       dplyr::filter(
-        link_state == "MARKER"
+        link_state == "MARKER",
+        valid_marker_by_block
       ) %>%
       dplyr::group_by(score_unit_id) %>%
-      dplyr::arrange(dplyr::desc(gwas_hit_priority_score), gwas_pos, gwas_hit, .by_group = TRUE) %>%
+      dplyr::arrange(
+        dplyr::desc(gwas_hit_priority_score),
+        gwas_pos,
+        gwas_hit,
+        .by_group = TRUE
+      ) %>%
       dplyr::slice(1) %>%
       dplyr::ungroup() %>%
       dplyr::mutate(
@@ -7817,26 +8684,293 @@ function(data, row, column, node){
       )
     
     # ------------------------------------------------------------
+    # 7b) Base gene × block per MARKER estructural
+    # Font correcta: block_ranges_df, perquè és qui té block_id
+    # ------------------------------------------------------------
+    
+    block_genes_df <- block_gene_overlap_summary_global()
+    
+    validate(
+      need(
+        is.data.frame(block_genes_df) && nrow(block_genes_df) > 0,
+        "No block-gene overlap data available."
+      )
+    )
+    
+    gene_col <- dplyr::case_when(
+      "gene" %in% names(block_genes_df) ~ "gene",
+      "gene_name" %in% names(block_genes_df) ~ "gene_name",
+      "genes_in_block" %in% names(block_genes_df) ~ "genes_in_block",
+      "genes_name" %in% names(block_genes_df) ~ "genes_name",
+      "genes" %in% names(block_genes_df) ~ "genes",
+      TRUE ~ NA_character_
+    )
+    
+    validate(
+      need(!is.na(gene_col), "No gene column found in block-gene overlap summary.")
+    )
+    
+    block_chr_lookup <- gh_base %>%
+      dplyr::mutate(
+        cluster_id = trimws(as.character(cluster_id)),
+        chr = normalize_chr_label(chr)
+      ) %>%
+      dplyr::select(cluster_id, chr) %>%
+      dplyr::distinct() %>%
+      dplyr::inner_join(
+        block_ranges_df %>%
+          dplyr::mutate(
+            cluster_id = trimws(as.character(cluster_id)),
+            block_id = trimws(as.character(block_id))
+          ) %>%
+          dplyr::select(cluster_id, block_id) %>%
+          dplyr::distinct(),
+        by = "cluster_id",
+        relationship = "many-to-many"
+      ) %>%
+      dplyr::distinct(cluster_id, block_id, chr)
+    
+    structural_marker_base <- block_genes_df %>%
+      dplyr::mutate(
+        cluster_id = trimws(as.character(.data$cluster_id)),
+        block_id = trimws(as.character(.data$block_id)),
+        gene = trimws(as.character(.data[[gene_col]]))
+      ) %>%
+      dplyr::left_join(
+        block_chr_lookup,
+        by = c("cluster_id", "block_id")
+      ) %>%
+      tidyr::separate_rows(gene, sep = "\\s*;\\s*|\\s*,\\s*") %>%
+      dplyr::mutate(
+        chr = normalize_chr_label(chr),
+        gene = trimws(gene),
+        gene = gsub("^\\d+\\s+genes\\s*", "", gene)
+      ) %>%
+      dplyr::filter(
+        !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(chr), nzchar(chr),
+        !is.na(block_id), nzchar(block_id),
+        !is.na(gene), nzchar(gene),
+        gene != "-",
+        !grepl("^\\d+\\s+genes$", gene)
+      ) %>%
+      dplyr::distinct(cluster_id, chr, block_id, gene)
+    
+    gwas_hits_in_blocks <- gh_base %>%
+      dplyr::mutate(
+        gwas_start = gwas_pos,
+        gwas_end = gwas_pos
+      ) %>%
+      dplyr::filter(
+        !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(chr), nzchar(chr),
+        is.finite(gwas_start),
+        is.finite(gwas_end)
+      ) %>%
+      data.table::as.data.table()
+    
+    block_dt2 <- block_dt
+    
+    # Afegir chr a block_dt2 des de block_ranges_df, no com NA
+    if (!"chr" %in% names(block_dt2)) {
+      block_chr_map <- block_ranges_df %>%
+        tibble::as_tibble() %>%
+        dplyr::mutate(
+          cluster_id = trimws(as.character(cluster_id)),
+          block_id = trimws(as.character(block_id))
+        )
+      
+      if (!"chr" %in% names(block_chr_map)) {
+        block_chr_map$chr <- sub(
+          "^chr([0-9XYM]+).*",
+          "\\1",
+          block_chr_map$cluster_id,
+          ignore.case = TRUE
+        )
+      }
+      
+      block_chr_map <- block_chr_map %>%
+        dplyr::mutate(
+          chr = normalize_chr_label(.data[["chr"]])
+        ) %>%
+        dplyr::select(cluster_id, block_id, chr) %>%
+        dplyr::distinct()
+      
+      block_dt2 <- block_dt2 %>%
+        tibble::as_tibble() %>%
+        dplyr::mutate(
+          cluster_id = trimws(as.character(cluster_id)),
+          block_id = trimws(as.character(block_id))
+        ) %>%
+        dplyr::left_join(
+          block_chr_map,
+          by = c("cluster_id", "block_id")
+        )
+    }
+    
+    gwas_hits_in_blocks <- gwas_hits_in_blocks %>%
+      tibble::as_tibble() %>%
+      dplyr::mutate(
+        chr = normalize_chr_label(chr),
+        gwas_start = suppressWarnings(as.numeric(gwas_start)),
+        gwas_end = suppressWarnings(as.numeric(gwas_end))
+      ) %>%
+      dplyr::filter(
+        !is.na(chr), nzchar(chr),
+        is.finite(gwas_start),
+        is.finite(gwas_end)
+      )
+    
+    block_dt2 <- block_dt2 %>%
+      tibble::as_tibble() %>%
+      dplyr::mutate(
+        chr = normalize_chr_label(chr),
+        block_start = suppressWarnings(as.numeric(block_start)),
+        block_end = suppressWarnings(as.numeric(block_end))
+      ) %>%
+      dplyr::filter(
+        !is.na(chr), nzchar(chr),
+        is.finite(block_start),
+        is.finite(block_end)
+      )
+    
+    data.table::setDT(gwas_hits_in_blocks)
+    data.table::setDT(block_dt2)
+    
+    data.table::setkey(gwas_hits_in_blocks, chr, gwas_start, gwas_end)
+    data.table::setkey(block_dt2, chr, block_start, block_end)
+    
+    gwas_block_hits <- data.table::foverlaps(
+      x = gwas_hits_in_blocks,
+      y = block_dt2,
+      by.x = c("chr", "gwas_start", "gwas_end"),
+      by.y = c("chr", "block_start", "block_end"),
+      type = "within",
+      nomatch = 0
+    ) %>%
+      tibble::as_tibble() %>%
+      dplyr::transmute(
+        cluster_id = as.character(cluster_id),
+        chr = normalize_chr_label(chr),
+        block_id = as.character(block_id),
+        gwas_hit,
+        gwas_pos,
+        gwas_hit_priority_score,
+        priority_class,
+        priority_class_relative
+      ) %>%
+      dplyr::filter(
+        !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(block_id), nzchar(block_id)
+      ) %>%
+      dplyr::distinct()
+    
+    match_keys <- dplyr::bind_rows(match_functional, match_catalog) %>%
+      dplyr::transmute(
+        gene,
+        cluster_id,
+        chr,
+        block_id,
+        gwas_hit,
+        gwas_pos
+      ) %>%
+      dplyr::distinct()
+    
+    marker_units_structural <- structural_marker_base %>%
+      dplyr::inner_join(
+        gwas_block_hits,
+        by = c("cluster_id", "chr", "block_id")
+      ) %>%
+      dplyr::anti_join(
+        match_keys,
+        by = c("gene", "cluster_id", "chr", "block_id", "gwas_hit", "gwas_pos")
+      ) %>%
+      dplyr::mutate(
+        source_app = "ldblock",
+        score_app = "ldblock",
+        score_family = "ldblock",
+        link_state = "MARKER",
+        unit_type = "MARKER",
+        matched_ids = "",
+        matched_pos = "",
+        hit_label = "",
+        nearest_gene_dist_bp = NA_real_,
+        gtex_gene_name = "",
+        gtex_gene_id = "",
+        gtex_tissues = "",
+        gtex_variant_id = "",
+        gwas_block_id = block_id,
+        matched_block_ids = block_id,
+        matched_pos_in_gwas_block = TRUE,
+        valid_marker_by_block = TRUE,
+        score_unit_id = paste(gene, cluster_id, chr, "ldblock", block_id, gwas_hit, gwas_pos, sep = "||"),
+        gene_score_component = 0.5
+      )
+    
+    # ------------------------------------------------------------
     # 8) Unir unitats
     # ------------------------------------------------------------
     units_df <- dplyr::bind_rows(
       match_functional,
       match_catalog,
-      marker_units
+      marker_units_app,
+      marker_units_structural
     ) %>%
       dplyr::mutate(
-        apps_supported = source_app,
-        score_family = score_app,
-        n_apps_supported = 1L,
-        match_apps = dplyr::if_else(unit_type == "MATCH", source_app, ""),
-        marker_apps = dplyr::if_else(unit_type == "MARKER", source_app, ""),
-        n_match_apps = dplyr::if_else(unit_type == "MATCH", 1L, 0L),
-        n_marker_apps = dplyr::if_else(unit_type == "MARKER", 1L, 0L)
+        source_app = dplyr::coalesce(as.character(source_app), ""),
+        score_family = dplyr::coalesce(score_family, score_app),
+        
+        structural_support = dplyr::if_else(
+          source_app == "ldblock",
+          paste0(
+            "physical_overlap via LD block ",
+            block_id,
+            " / GWAS hit ",
+            gwas_hit
+          ),
+          ""
+        ),
+        
+        apps_supported = dplyr::if_else(
+          source_app == "ldblock",
+          "",
+          source_app
+        ),
+        
+        n_apps_supported = dplyr::if_else(
+          source_app == "ldblock",
+          0L,
+          1L
+        ),
+        
+        match_apps = dplyr::if_else(
+          unit_type == "MATCH" & source_app != "ldblock",
+          source_app,
+          ""
+        ),
+        
+        marker_apps = dplyr::if_else(
+          unit_type == "MARKER" & source_app != "ldblock",
+          source_app,
+          ""
+        ),
+        
+        n_match_apps = dplyr::if_else(
+          unit_type == "MATCH" & source_app != "ldblock",
+          1L,
+          0L
+        ),
+        
+        n_marker_apps = dplyr::if_else(
+          unit_type == "MARKER" & source_app != "ldblock",
+          1L,
+          0L
+        )
       )
-    
     # ------------------------------------------------------------
     # 9) Enriquir amb metadata GTEx des del gene bridge
     # ------------------------------------------------------------
+    
     if (!is.data.frame(gtex_src) || !nrow(gtex_src)) {
       gtex_src <- tibble::tibble(
         cluster_id = character(),
@@ -7849,45 +8983,91 @@ function(data, row, column, node){
       )
     }
     
-    units_df <- units_df %>%
+    for (nm in c("cluster_id", "chr", "gene", "gtex_gene_name", "gtex_gene_id", "gtex_tissues", "gtex_variant_id")) {
+      if (!nm %in% names(gtex_src)) {
+        gtex_src[[nm]] <- ""
+      }
+    }
+    
+    gtex_src2 <- gtex_src %>%
       dplyr::mutate(
-        cluster_id = trimws(as.character(cluster_id)),
-        chr = normalize_chr_label(chr),
-        gene = trimws(as.character(gene))
+        cluster_id = trimws(as.character(.data$cluster_id)),
+        chr = normalize_chr_label(.data$chr),
+        gene = trimws(as.character(.data$gene)),
+        gtex_gene_name = dplyr::coalesce(as.character(.data$gtex_gene_name), ""),
+        gtex_gene_id = dplyr::coalesce(as.character(.data$gtex_gene_id), ""),
+        gtex_tissues = dplyr::coalesce(as.character(.data$gtex_tissues), ""),
+        gtex_variant_id = dplyr::coalesce(as.character(.data$gtex_variant_id), "")
       ) %>%
-      dplyr::left_join(
-        gtex_src %>%
-          dplyr::mutate(
-            cluster_id = trimws(as.character(cluster_id)),
-            chr = normalize_chr_label(chr),
-            gene = trimws(as.character(gene))
-          ) %>%
-          dplyr::group_by(cluster_id, chr, gene) %>%
-          dplyr::summarise(
-            gtex_gene_name = collapse_unique_semicolon(gtex_gene_name),
-            gtex_gene_id = collapse_unique_semicolon(gtex_gene_id),
-            gtex_tissues = collapse_unique_semicolon(gtex_tissues),
-            gtex_variant_id = collapse_unique_semicolon(gtex_variant_id),
-            .groups = "drop"
-          ),
-        by = c("cluster_id", "chr", "gene")
-      ) %>%
-      dplyr::mutate(
-        gtex_gene_name = dplyr::if_else(score_app == "gtex", dplyr::coalesce(as.character(gtex_gene_name), ""), ""),
-        gtex_gene_id = dplyr::if_else(score_app == "gtex", dplyr::coalesce(as.character(gtex_gene_id), ""), ""),
-        gtex_tissues = dplyr::if_else(score_app == "gtex", dplyr::coalesce(as.character(gtex_tissues), ""), ""),
-        gtex_variant_id = dplyr::if_else(score_app == "gtex", dplyr::coalesce(as.character(gtex_variant_id), ""), "")
+      dplyr::group_by(cluster_id, chr, gene) %>%
+      dplyr::summarise(
+        gtex_gene_name = collapse_unique_semicolon(gtex_gene_name),
+        gtex_gene_id = collapse_unique_semicolon(gtex_gene_id),
+        gtex_tissues = collapse_unique_semicolon(gtex_tissues),
+        gtex_variant_id = collapse_unique_semicolon(gtex_variant_id),
+        .groups = "drop"
       )
     
+    units_df <- units_df %>%
+      dplyr::mutate(
+        cluster_id = trimws(as.character(.data$cluster_id)),
+        chr = normalize_chr_label(.data$chr),
+        gene = trimws(as.character(.data$gene))
+      ) %>%
+      dplyr::left_join(
+        gtex_src2,
+        by = c("cluster_id", "chr", "gene")
+      )
+    
+    for (nm in c("gtex_gene_name", "gtex_gene_id", "gtex_tissues", "gtex_variant_id")) {
+      if (!nm %in% names(units_df)) {
+        units_df[[nm]] <- ""
+      }
+    }
+    
+    units_df <- units_df %>%
+      dplyr::mutate(
+        gtex_gene_name = dplyr::if_else(
+          .data$score_app == "gtex",
+          dplyr::coalesce(as.character(.data$gtex_gene_name), ""),
+          ""
+        ),
+        gtex_gene_id = dplyr::if_else(
+          .data$score_app == "gtex",
+          dplyr::coalesce(as.character(.data$gtex_gene_id), ""),
+          ""
+        ),
+        gtex_tissues = dplyr::if_else(
+          .data$score_app == "gtex",
+          dplyr::coalesce(as.character(.data$gtex_tissues), ""),
+          ""
+        ),
+        gtex_variant_id = dplyr::if_else(
+          .data$score_app == "gtex",
+          dplyr::coalesce(as.character(.data$gtex_variant_id), ""),
+          ""
+        )
+      )
     # ------------------------------------------------------------
     # 10) Selecció final
     # ------------------------------------------------------------
     units_df %>%
+      dplyr::mutate(
+        block_id = dplyr::coalesce(as.character(block_id), ""),
+        gwas_block_id = dplyr::coalesce(as.character(gwas_block_id), ""),
+        matched_block_ids = dplyr::coalesce(as.character(matched_block_ids), ""),
+        matched_pos_in_gwas_block = dplyr::coalesce(as.logical(matched_pos_in_gwas_block), FALSE),
+        valid_marker_by_block = dplyr::coalesce(as.logical(valid_marker_by_block), link_state != "MARKER")
+      ) %>%
       dplyr::select(
         gene,
         cluster_id,
         chr,
         block_id,
+        gwas_block_id,
+        matched_block_ids,
+        matched_pos_in_gwas_block,
+        valid_marker_by_block,
         gwas_hit,
         gwas_pos,
         hit_label,
@@ -7908,6 +9088,7 @@ function(data, row, column, node){
         n_apps_supported,
         match_apps,
         marker_apps,
+        structural_support,
         n_match_apps,
         n_marker_apps,
         priority_class,
@@ -7915,7 +9096,11 @@ function(data, row, column, node){
       ) %>%
       dplyr::group_by(gene) %>%
       dplyr::mutate(
-        top_gwas_hit_score = if (all(is.na(gwas_hit_priority_score))) 0 else max(gwas_hit_priority_score, na.rm = TRUE),
+        top_gwas_hit_score = if (all(is.na(gwas_hit_priority_score))) {
+          0
+        } else {
+          max(gwas_hit_priority_score, na.rm = TRUE)
+        },
         is_top_gwas_hit_for_gene = dplyr::if_else(
           !is.na(gwas_hit_priority_score) & gwas_hit_priority_score == top_gwas_hit_score,
           TRUE,
@@ -8204,15 +9389,17 @@ function(data, row, column, node){
   
   prioritized_block_df_v2 <- reactive({
     
-    blk <- priority_source_blocks()
-    gh  <- gwas_hit_priority_df_v2()
+    blk <- tryCatch(priority_source_blocks(), error = function(e) tibble::tibble())
+    gh  <- tryCatch(gwas_hit_priority_df_v2(), error = function(e) tibble::tibble())
     
-    req(is.data.frame(blk), nrow(blk) > 0)
-    req(is.data.frame(gh),  nrow(gh)  > 0)
+    if (!is.data.frame(blk) || !nrow(blk)) {
+      return(tibble::tibble())
+    }
     
-    # ---------------------------
-    # Helpers
-    # ---------------------------
+    if (!is.data.frame(gh) || !nrow(gh)) {
+      return(tibble::tibble())
+    }
+    
     collapse_unique_semicolon <- function(x) {
       x <- as.character(x)
       x <- trimws(x)
@@ -8231,42 +9418,59 @@ function(data, row, column, node){
       x <- as.character(x)
       x <- trimws(x)
       if (is.na(x) || !nzchar(x)) return(0L)
+      
       vals <- unlist(strsplit(x, "\\s*;\\s*"))
       vals <- trimws(vals)
       vals <- vals[!is.na(vals) & nzchar(vals)]
+      
       length(unique(vals))
     }
     
-    # ---------------------------
-    # 1) Detectar columnes reals del summary global
-    # ---------------------------
+    split_semicolon_local <- function(x) {
+      x <- as.character(x)
+      x <- trimws(x)
+      if (!length(x) || is.na(x) || !nzchar(x)) return(character())
+      
+      vals <- unlist(strsplit(x, "\\s*;\\s*"))
+      vals <- trimws(vals)
+      vals[!is.na(vals) & nzchar(vals)]
+    }
+    
+    parse_bp_num <- function(x) {
+      suppressWarnings(as.numeric(gsub(",", "", as.character(x))))
+    }
+    
     start_col  <- intersect(c("start", "block_start", "pos_ini"), names(blk))
     end_col    <- intersect(c("end", "block_end", "pos_end"), names(blk))
     score_col  <- intersect(c("block_priority_score", "priority_score", "block_score"), names(blk))
     genes_col  <- intersect(c("genes_name", "genes_in_block", "genes"), names(blk))
     ngenes_col <- intersect(c("n_genes", "n_genes_in_block"), names(blk))
+    gwas_col   <- intersect(c("gwas_hits", "gwas_sig_hits"), names(blk))
     
     start_col  <- if (length(start_col))  start_col[1]  else NULL
     end_col    <- if (length(end_col))    end_col[1]    else NULL
     score_col  <- if (length(score_col))  score_col[1]  else NULL
     genes_col  <- if (length(genes_col))  genes_col[1]  else NULL
     ngenes_col <- if (length(ngenes_col)) ngenes_col[1] else NULL
+    gwas_col   <- if (length(gwas_col))   gwas_col[1]   else NULL
     
-    # ---------------------------
-    # 2) Estandaritzar blocks
-    # ---------------------------
     blocks_std <- blk %>%
       dplyr::transmute(
         cluster_id = trimws(as.character(cluster_id)),
         block_id   = trimws(as.character(block_id)),
+        block_label = if ("block_label" %in% names(blk)) trimws(as.character(block_label)) else "",
         block_score_input = if (!is.null(score_col)) suppressWarnings(as.numeric(.data[[score_col]])) else NA_real_,
-        block_start = if (!is.null(start_col)) suppressWarnings(as.numeric(.data[[start_col]])) else NA_real_,
-        block_end   = if (!is.null(end_col))   suppressWarnings(as.numeric(.data[[end_col]]))   else NA_real_,
+        block_start = if (!is.null(start_col)) parse_bp_num(.data[[start_col]]) else NA_real_,
+        block_end   = if (!is.null(end_col))   parse_bp_num(.data[[end_col]])   else NA_real_,
         genes_in_block = if (!is.null(genes_col)) as.character(.data[[genes_col]]) else "",
-        n_genes_in_block = if (!is.null(ngenes_col)) suppressWarnings(as.integer(.data[[ngenes_col]])) else NA_integer_
+        n_genes_in_block = if (!is.null(ngenes_col)) suppressWarnings(as.integer(.data[[ngenes_col]])) else NA_integer_,
+        gwas_hits_from_summary = if (!is.null(gwas_col)) as.character(.data[[gwas_col]]) else ""
       ) %>%
       dplyr::mutate(
-        genes_in_block   = dplyr::coalesce(genes_in_block, ""),
+        is_outblock = grepl("OUT", block_id, ignore.case = TRUE) |
+          grepl("OUT", block_label, ignore.case = TRUE),
+        genes_in_block = dplyr::coalesce(genes_in_block, ""),
+        gwas_hits_from_summary = dplyr::coalesce(gwas_hits_from_summary, ""),
         n_genes_in_block = dplyr::coalesce(n_genes_in_block, 0L),
         block_size_bp = dplyr::if_else(
           is.finite(block_start) & is.finite(block_end),
@@ -8281,12 +9485,39 @@ function(data, row, column, node){
       ) %>%
       dplyr::distinct(cluster_id, block_id, .keep_all = TRUE)
     
-    # ---------------------------
-    # 3) Assignar GWAS hits v2 als blocs per posició
-    # ---------------------------
-    block_hit_map <- gh %>%
+    gh_score_col <- intersect(
+      c("gwas_hit_score", "gwas_hit_priority_score", "priority_score"),
+      names(gh)
+    )
+    
+    validate(
+      need(length(gh_score_col) > 0, "No GWAS hit score column found in gwas_hit_priority_df_v2().")
+    )
+    
+    gh_score_col <- gh_score_col[1]
+    
+    gh_std <- gh %>%
+      dplyr::mutate(
+        cluster_id = as.character(cluster_id),
+        gwas_hit = as.character(gwas_hit),
+        gwas_pos = suppressWarnings(as.numeric(gwas_pos)),
+        gwas_hit_score = suppressWarnings(as.numeric(.data[[gh_score_col]])),
+        gwas_hit_apps = if ("gwas_hit_apps" %in% names(.)) as.character(gwas_hit_apps) else ""
+      ) %>%
+      dplyr::filter(
+        !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(gwas_hit), nzchar(gwas_hit)
+      )
+    
+    real_blocks <- blocks_std %>%
+      dplyr::filter(!is_outblock)
+    
+    out_blocks <- blocks_std %>%
+      dplyr::filter(is_outblock)
+    
+    real_block_hit_map <- gh_std %>%
       dplyr::inner_join(
-        blocks_std %>%
+        real_blocks %>%
           dplyr::select(cluster_id, block_id, block_start, block_end) %>%
           dplyr::distinct(),
         by = "cluster_id",
@@ -8301,70 +9532,124 @@ function(data, row, column, node){
       ) %>%
       dplyr::distinct(cluster_id, block_id, gwas_hit, gwas_pos, .keep_all = TRUE)
     
-    validate(
-      need(nrow(block_hit_map) > 0, "No prioritized GWAS hits mapped to global LD blocks.")
+    outblock_hit_map <- if (nrow(out_blocks)) {
+      out_blocks %>%
+        dplyr::rowwise() %>%
+        dplyr::mutate(gwas_hit = list(split_semicolon_local(gwas_hits_from_summary))) %>%
+        tidyr::unnest(gwas_hit) %>%
+        dplyr::ungroup() %>%
+        dplyr::filter(!is.na(gwas_hit), nzchar(gwas_hit)) %>%
+        dplyr::select(cluster_id, block_id, gwas_hit) %>%
+        dplyr::left_join(
+          gh_std,
+          by = c("cluster_id", "gwas_hit"),
+          relationship = "many-to-many"
+        ) %>%
+        dplyr::distinct(cluster_id, block_id, gwas_hit, gwas_pos, .keep_all = TRUE)
+    } else {
+      tibble::tibble()
+    }
+    
+    block_hit_map <- dplyr::bind_rows(
+      real_block_hit_map,
+      outblock_hit_map
     )
     
-    # ---------------------------
-    # 4) Score canònic del bloc:
-    #    top_gwas_hit_score + 0.05 * other_gwas_hit_score_sum
-    # ---------------------------
-    block_support_summary <- block_hit_map %>%
-      dplyr::group_by(cluster_id, block_id) %>%
-      dplyr::summarise(
-        n_gwas_hits = dplyr::n_distinct(paste(gwas_hit, gwas_pos, sep = "||")),
-        gwas_hits = paste(sort(unique(gwas_hit[!is.na(gwas_hit) & nzchar(gwas_hit)])), collapse = "; "),
-        apps_supported = collapse_unique_semicolon(gwas_hit_apps),
-        
-        hit_scores_desc = list(sort(as.numeric(gwas_hit_score), decreasing = TRUE)),
-        .groups = "drop"
-      ) %>%
-      dplyr::rowwise() %>%
-      dplyr::mutate(
-        top_gwas_hit_score = {
-          s <- unlist(hit_scores_desc)
-          s <- s[is.finite(s)]
-          if (!length(s)) 0 else s[1]
-        },
-        other_gwas_hit_score = {
-          s <- unlist(hit_scores_desc)
-          s <- s[is.finite(s)]
-          if (length(s) <= 1) 0 else sum(s[-1], na.rm = TRUE)
-        },
-        block_score_from_hits = top_gwas_hit_score + 0.05 * other_gwas_hit_score
-      ) %>%
-      dplyr::ungroup() %>%
-      dplyr::mutate(
-        n_apps_supported = vapply(apps_supported, count_semicolon_items, integer(1))
-      ) %>%
-      dplyr::select(
-        -hit_scores_desc
+    block_support_summary <- if (is.data.frame(block_hit_map) && nrow(block_hit_map)) {
+      block_hit_map %>%
+        dplyr::group_by(cluster_id, block_id) %>%
+        dplyr::summarise(
+          n_gwas_hits = dplyr::n_distinct(paste(gwas_hit, gwas_pos, sep = "||")),
+          gwas_hits = paste(sort(unique(gwas_hit[!is.na(gwas_hit) & nzchar(gwas_hit)])), collapse = "; "),
+          apps_supported = collapse_unique_semicolon(gwas_hit_apps),
+          hit_scores_desc = list(sort(as.numeric(gwas_hit_score), decreasing = TRUE)),
+          .groups = "drop"
+        ) %>%
+        dplyr::rowwise() %>%
+        dplyr::mutate(
+          top_gwas_hit_score = {
+            s <- unlist(hit_scores_desc)
+            s <- s[is.finite(s)]
+            if (!length(s)) 0 else s[1]
+          },
+          other_gwas_hit_score = {
+            s <- unlist(hit_scores_desc)
+            s <- s[is.finite(s)]
+            if (length(s) <= 1) 0 else sum(s[-1], na.rm = TRUE)
+          }
+        ) %>%
+        dplyr::ungroup() %>%
+        dplyr::left_join(
+          blocks_std %>% dplyr::select(cluster_id, block_id, is_outblock),
+          by = c("cluster_id", "block_id")
+        ) %>%
+        dplyr::mutate(
+          block_score_from_hits = dplyr::if_else(
+            is_outblock,
+            top_gwas_hit_score,
+            top_gwas_hit_score + 0.05 * other_gwas_hit_score
+          ),
+          n_apps_supported = vapply(apps_supported, count_semicolon_items, integer(1))
+        ) %>%
+        dplyr::select(-hit_scores_desc)
+    } else {
+      tibble::tibble(
+        cluster_id = character(),
+        block_id = character(),
+        n_gwas_hits = integer(),
+        gwas_hits = character(),
+        apps_supported = character(),
+        top_gwas_hit_score = numeric(),
+        other_gwas_hit_score = numeric(),
+        is_outblock = logical(),
+        block_score_from_hits = numeric(),
+        n_apps_supported = integer()
       )
+    }
     
-    # ---------------------------
-    # 5) Unir info estructural del bloc i afegir bonus per gene content
-    # ---------------------------
-    out <- block_support_summary %>%
+    out <- blocks_std %>%
       dplyr::left_join(
-        blocks_std,
+        block_support_summary %>%
+          dplyr::select(
+            cluster_id,
+            block_id,
+            n_gwas_hits,
+            gwas_hits,
+            apps_supported,
+            top_gwas_hit_score,
+            other_gwas_hit_score,
+            block_score_from_hits,
+            n_apps_supported
+          ),
         by = c("cluster_id", "block_id")
       ) %>%
       dplyr::mutate(
-        block_gene_content_bonus = round(
-          1.50 * as.numeric(dplyr::coalesce(n_genes_in_block, 0L) > 0) +
-            0.75 * log1p(dplyr::coalesce(n_genes_in_block, 0L)),
-          2
+        n_gwas_hits = dplyr::coalesce(as.integer(n_gwas_hits), 0L),
+        gwas_hits = dplyr::coalesce(as.character(gwas_hits), gwas_hits_from_summary, ""),
+        apps_supported = dplyr::coalesce(as.character(apps_supported), ""),
+        top_gwas_hit_score = dplyr::coalesce(as.numeric(top_gwas_hit_score), 0),
+        other_gwas_hit_score = dplyr::coalesce(as.numeric(other_gwas_hit_score), 0),
+        block_score_from_hits = dplyr::coalesce(as.numeric(block_score_from_hits), 0),
+        n_apps_supported = dplyr::coalesce(as.integer(n_apps_supported), 0L),
+        
+        block_gene_content_bonus = dplyr::if_else(
+          is_outblock,
+          0,
+          round(
+            1.50 * as.numeric(dplyr::coalesce(n_genes_in_block, 0L) > 0) +
+              0.75 * log1p(dplyr::coalesce(n_genes_in_block, 0L)),
+            2
+          )
         ),
         
-        # Àlies per compatibilitat amb codi antic
         block_bio_bonus = block_gene_content_bonus,
-        
         block_score = block_score_from_hits + block_gene_content_bonus,
         
         priority_class = dplyr::case_when(
           block_score >= 25 ~ "High",
           block_score >= 10 ~ "Medium",
-          TRUE              ~ "Low"
+          block_score > 0   ~ "Low",
+          TRUE             ~ "No score"
         ),
         
         priority_class_relative = classify_priority_tertiles(block_score)
@@ -8372,6 +9657,7 @@ function(data, row, column, node){
       dplyr::select(
         cluster_id,
         block_id,
+        is_outblock,
         block_score_from_hits,
         top_gwas_hit_score,
         other_gwas_hit_score,
@@ -8414,11 +9700,7 @@ function(data, row, column, node){
     df <- gwas_hit_priority_mod$gwas_hit_gene_support_long_df()
     
     validate(
-      need(is.data.frame(df) && nrow(df) > 0, "No GWAS hit gene-support data available."),
-      need(all(c(
-        "cluster_id", "chr", "gwas_hit", "gwas_pos",
-        "source_app", "link_state", "gene"
-      ) %in% names(df)), "Required columns missing in GWAS hit gene-support data.")
+      need(is.data.frame(df), "No GWAS hit gene-support data available.")
     )
     
     app_weights <- c(
@@ -8469,131 +9751,693 @@ function(data, row, column, node){
       as.integer(length(unique(vals)))
     }
     
+    normalize_chr_label <- function(x) {
+      x <- as.character(x)
+      x <- trimws(x)
+      x <- sub("^chr", "", x, ignore.case = TRUE)
+      x
+    }
+    
+    parse_matched_positions <- function(x) {
+      x <- as.character(x)
+      x <- trimws(x)
+      
+      if (!length(x) || is.na(x) || !nzchar(x)) {
+        return(numeric(0))
+      }
+      
+      parts <- unlist(
+        strsplit(x, "\\s*;\\s*|\\s*,\\s*|\\s*\\|\\s*", perl = TRUE),
+        use.names = FALSE
+      )
+      
+      parts <- trimws(parts)
+      parts <- parts[!is.na(parts) & nzchar(parts)]
+      
+      if (!length(parts)) {
+        return(numeric(0))
+      }
+      
+      out <- suppressWarnings(readr::parse_number(parts))
+      out <- out[is.finite(out)]
+      unique(out)
+    }
+    
     # ------------------------------------------------------------
-    # GWAS significance bridge
+    # 1) GWAS significance bridge = BASE CANÒNICA
+    #    Aquí han d'entrar tots els GWAS hits prioritzables,
+    #    encara que no tinguin cap suport MATCH/MARKER.
     # ------------------------------------------------------------
+    
     sig_path <- file.path(selected_session_dir(), "gwas_significance_bridge.rds")
     sig_bridge <- tryCatch(readRDS(sig_path), error = function(e) NULL)
     
-    if (!is.data.frame(sig_bridge) || !nrow(sig_bridge)) {
-      sig_bridge <- tibble::tibble(
-        cluster_id = character(),
-        chr = character(),
-        gwas_pos = numeric(),
-        gwas_hit = character(),
-        gwas_p = numeric(),
-        gwas_logp = numeric()
+    validate(
+      need(
+        is.data.frame(sig_bridge) && nrow(sig_bridge) > 0,
+        "No GWAS significance bridge available."
       )
-    } else {
-      sig_bridge <- sig_bridge %>%
-        dplyr::transmute(
-          cluster_id = trimws(as.character(cluster_id)),
-          chr = as.character(chr),
-          gwas_pos = suppressWarnings(as.numeric(position)),
-          gwas_hit = trimws(as.character(rsid)),
-          gwas_p = suppressWarnings(as.numeric(p_value)),
-          gwas_logp = suppressWarnings(as.numeric(logp))
-        ) %>%
-        dplyr::filter(
-          !is.na(cluster_id), nzchar(cluster_id),
-          !is.na(gwas_pos),
-          !is.na(gwas_p)
-        ) %>%
-        dplyr::distinct(cluster_id, chr, gwas_pos, gwas_hit, .keep_all = TRUE)
-    }
+    )
     
-    hit_app_support <- df %>%
-      dplyr::mutate(
+    sig_bridge <- sig_bridge %>%
+      dplyr::transmute(
         cluster_id = trimws(as.character(cluster_id)),
-        chr = as.character(chr),
-        gwas_hit = trimws(as.character(gwas_hit)),
-        gwas_pos = suppressWarnings(as.numeric(gwas_pos)),
-        source_app = tolower(trimws(as.character(source_app))),
-        link_state = trimws(as.character(link_state)),
-        gene = trimws(as.character(gene)),
-        state_rank = dplyr::case_when(
-          link_state == "MATCH"  ~ 2L,
-          link_state == "MARKER" ~ 1L,
-          TRUE ~ 0L
-        ),
-        app_weight = dplyr::coalesce(unname(app_weights[source_app]), 0),
-        state_weight = dplyr::coalesce(unname(state_weights[link_state]), 0),
-        support_score = app_weight * state_weight
+        chr = normalize_chr_label(chr),
+        gwas_pos = suppressWarnings(as.numeric(position)),
+        gwas_hit = trimws(as.character(rsid)),
+        gwas_p = suppressWarnings(as.numeric(p_value)),
+        gwas_logp = suppressWarnings(as.numeric(logp))
       ) %>%
       dplyr::filter(
-        source_app %in% app_levels,
-        link_state %in% state_levels,
         !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(chr), nzchar(chr),
+        !is.na(gwas_pos),
         !is.na(gwas_hit), nzchar(gwas_hit),
-        !is.na(source_app), nzchar(source_app)
+        !is.na(gwas_p)
       ) %>%
-      dplyr::group_by(cluster_id, chr, gwas_hit, gwas_pos, source_app) %>%
-      dplyr::summarise(
-        best_link_state = dplyr::case_when(
-          max(state_rank, na.rm = TRUE) >= 2 ~ "MATCH",
-          max(state_rank, na.rm = TRUE) == 1 ~ "MARKER",
-          TRUE ~ ""
-        ),
-        best_state_rank = max(state_rank, na.rm = TRUE),
-        app_weight = dplyr::first(app_weight),
-        state_weight = max(state_weight, na.rm = TRUE),
-        support_score = max(support_score, na.rm = TRUE),
-        genes = collapse_unique_semicolon(gene),
-        n_genes = dplyr::n_distinct(gene[!is.na(gene) & nzchar(gene)]),
-        .groups = "drop"
-      ) %>%
-      dplyr::mutate(
-        genes = dplyr::coalesce(as.character(genes), ""),
-        n_genes = dplyr::coalesce(as.integer(n_genes), 0L),
-        app_state_label = paste0(source_app, ":", best_link_state),
-        app_score_label = paste0(source_app, "=", format(round(support_score, 2), nsmall = 2)),
-        app_gene_label = dplyr::if_else(
-          nzchar(genes),
-          paste0(source_app, ": ", genes),
-          paste0(source_app, ": -")
+      dplyr::distinct(cluster_id, chr, gwas_hit, gwas_pos, .keep_all = TRUE)
+    
+    validate(
+      need(nrow(sig_bridge) > 0, "No valid GWAS hits found in significance bridge.")
+    )
+    
+    manifest_path <- file.path(selected_session_dir(), "manifest.rds")
+    manifest <- tryCatch(readRDS(manifest_path), error = function(e) NULL)
+    
+    p_threshold <- suppressWarnings(as.numeric(
+      manifest$p_value_threshold %||%
+        manifest$pvalue_threshold %||%
+        manifest$gwas_p_threshold %||%
+        manifest$threshold_used %||%
+        NA_real_
+    ))
+    
+    if (is.na(p_threshold) || p_threshold <= 0 || p_threshold >= 1) {
+      p_threshold <- 5e-8
+    }
+    
+    logp_threshold <- -log10(p_threshold)
+    
+    # ------------------------------------------------------------
+    # 2) Si no hi ha df de suport app, retornem GWAS-only
+    # ------------------------------------------------------------
+    
+    required_support_cols <- c(
+      "cluster_id", "chr", "gwas_hit", "gwas_pos",
+      "source_app", "link_state", "gene"
+    )
+    
+    if (!is.data.frame(df) || !nrow(df) || !all(required_support_cols %in% names(df))) {
+      hit_level_base <- tibble::tibble(
+        cluster_id = character(),
+        chr = character(),
+        gwas_hit = character(),
+        gwas_pos = numeric(),
+        raw_evidence_score = numeric(),
+        gwas_hit_n_apps = integer(),
+        gwas_hit_n_match_apps = integer(),
+        gwas_hit_n_marker_apps = integer(),
+        gwas_hit_has_nonsyn_match = logical(),
+        gwas_hit_has_catalog_match = logical(),
+        gwas_hit_has_gtex_match = logical(),
+        gwas_hit_has_ewasdis_match = logical(),
+        gwas_hit_has_ewastum_match = logical(),
+        gwas_hit_apps = character(),
+        gwas_hit_match_apps = character(),
+        gwas_hit_marker_apps = character(),
+        linked_genes = character(),
+        linked_gene_n = integer(),
+        support_signature = character(),
+        score_breakdown_core = character(),
+        genes_by_app = character()
+      )
+    } else {
+      
+      # ------------------------------------------------------------
+      # 3) Validació MARKER per LD block
+      # ------------------------------------------------------------
+      
+      block_ranges_df <- global_block_ranges_r()
+      
+      if (!is.data.frame(block_ranges_df) || !nrow(block_ranges_df)) {
+        
+        df_valid <- df %>%
+          dplyr::mutate(
+            link_state = trimws(as.character(link_state))
+          ) %>%
+          dplyr::filter(link_state != "MARKER")
+        
+      } else {
+        
+        df_marker_base <- df %>%
+          dplyr::mutate(
+            marker_row_id = dplyr::row_number(),
+            cluster_id = trimws(as.character(cluster_id)),
+            chr = normalize_chr_label(chr),
+            gwas_hit = trimws(as.character(gwas_hit)),
+            gwas_pos = suppressWarnings(as.numeric(gwas_pos)),
+            source_app = tolower(trimws(as.character(source_app))),
+            link_state = trimws(as.character(link_state)),
+            gene = trimws(as.character(gene)),
+            matched_pos = if ("matched_pos" %in% names(.)) {
+              dplyr::coalesce(as.character(matched_pos), "")
+            } else {
+              ""
+            }
+          )
+        
+        block_dt <- block_ranges_df %>%
+          dplyr::transmute(
+            cluster_id = trimws(as.character(cluster_id)),
+            chr = normalize_chr_label(chr),
+            block_id = trimws(as.character(block_id)),
+            block_start = suppressWarnings(as.numeric(block_start)),
+            block_end = suppressWarnings(as.numeric(block_end))
+          ) %>%
+          dplyr::filter(
+            !is.na(cluster_id), nzchar(cluster_id),
+            !is.na(chr), nzchar(chr),
+            !is.na(block_id), nzchar(block_id),
+            is.finite(block_start),
+            is.finite(block_end)
+          ) %>%
+          data.table::as.data.table()
+        
+        if (!nrow(block_dt)) {
+          
+          df_valid <- df_marker_base %>%
+            dplyr::filter(link_state != "MARKER") %>%
+            dplyr::select(-marker_row_id)
+          
+        } else {
+          
+          gwas_dt <- df_marker_base %>%
+            dplyr::transmute(
+              marker_row_id,
+              cluster_id,
+              chr,
+              gwas_start = gwas_pos,
+              gwas_end = gwas_pos
+            ) %>%
+            dplyr::filter(
+              is.finite(gwas_start),
+              is.finite(gwas_end),
+              !is.na(cluster_id), nzchar(cluster_id),
+              !is.na(chr), nzchar(chr)
+            ) %>%
+            data.table::as.data.table()
+          
+          data.table::setkey(gwas_dt, cluster_id, chr, gwas_start, gwas_end)
+          data.table::setkey(block_dt, cluster_id, chr, block_start, block_end)
+          
+          gwas_block_map <- data.table::foverlaps(
+            x = gwas_dt,
+            y = block_dt,
+            by.x = c("cluster_id", "chr", "gwas_start", "gwas_end"),
+            by.y = c("cluster_id", "chr", "block_start", "block_end"),
+            type = "within",
+            nomatch = NA
+          ) %>%
+            tibble::as_tibble() %>%
+            dplyr::transmute(
+              marker_row_id,
+              gwas_block_id = dplyr::coalesce(as.character(block_id), "")
+            ) %>%
+            dplyr::filter(!is.na(marker_row_id)) %>%
+            dplyr::group_by(marker_row_id) %>%
+            dplyr::summarise(
+              gwas_block_id = {
+                vals <- unique(trimws(gwas_block_id))
+                vals <- vals[!is.na(vals) & nzchar(vals)]
+                paste(sort(vals), collapse = "; ")
+              },
+              .groups = "drop"
+            )
+          
+          matched_long <- df_marker_base %>%
+            dplyr::select(
+              marker_row_id,
+              cluster_id,
+              chr,
+              matched_pos
+            ) %>%
+            dplyr::rowwise() %>%
+            dplyr::mutate(
+              matched_pos_list = list(parse_matched_positions(matched_pos))
+            ) %>%
+            dplyr::ungroup() %>%
+            tidyr::unnest_longer(
+              matched_pos_list,
+              values_to = "matched_pos_num",
+              keep_empty = FALSE
+            ) %>%
+            dplyr::mutate(
+              matched_pos_num = suppressWarnings(as.numeric(matched_pos_num)),
+              matched_start = matched_pos_num,
+              matched_end = matched_pos_num
+            ) %>%
+            dplyr::filter(
+              is.finite(matched_pos_num),
+              !is.na(cluster_id), nzchar(cluster_id),
+              !is.na(chr), nzchar(chr)
+            )
+          
+          if (nrow(matched_long) > 0) {
+            
+            matched_dt <- matched_long %>%
+              data.table::as.data.table()
+            
+            data.table::setkey(matched_dt, cluster_id, chr, matched_start, matched_end)
+            
+            matched_block_map <- data.table::foverlaps(
+              x = matched_dt,
+              y = block_dt,
+              by.x = c("cluster_id", "chr", "matched_start", "matched_end"),
+              by.y = c("cluster_id", "chr", "block_start", "block_end"),
+              type = "within",
+              nomatch = NA
+            ) %>%
+              tibble::as_tibble() %>%
+              dplyr::transmute(
+                marker_row_id,
+                matched_block_id = dplyr::coalesce(as.character(block_id), "")
+              ) %>%
+              dplyr::filter(!is.na(marker_row_id)) %>%
+              dplyr::group_by(marker_row_id) %>%
+              dplyr::summarise(
+                matched_block_ids = {
+                  vals <- unique(trimws(matched_block_id))
+                  vals <- vals[!is.na(vals) & nzchar(vals)]
+                  paste(sort(vals), collapse = "; ")
+                },
+                .groups = "drop"
+              )
+            
+          } else {
+            
+            matched_block_map <- tibble::tibble(
+              marker_row_id = integer(),
+              matched_block_ids = character()
+            )
+          }
+          
+          df_valid <- df_marker_base %>%
+            dplyr::left_join(gwas_block_map, by = "marker_row_id") %>%
+            dplyr::left_join(matched_block_map, by = "marker_row_id") %>%
+            dplyr::mutate(
+              gwas_block_id = dplyr::coalesce(as.character(gwas_block_id), ""),
+              matched_block_ids = dplyr::coalesce(as.character(matched_block_ids), ""),
+              matched_block_vec = strsplit(matched_block_ids, "\\s*;\\s*", perl = TRUE),
+              valid_marker_by_block = purrr::map2_lgl(
+                matched_block_vec,
+                gwas_block_id,
+                function(mb, gb) {
+                  gb <- trimws(as.character(gb))
+                  mb <- trimws(as.character(mb))
+                  mb <- mb[!is.na(mb) & nzchar(mb)]
+                  
+                  nzchar(gb) && length(mb) > 0 && gb %in% mb
+                }
+              )
+            ) %>%
+            dplyr::filter(
+              link_state != "MARKER" |
+                valid_marker_by_block
+            ) %>%
+            dplyr::select(
+              -marker_row_id,
+              -matched_block_vec
+            )
+        }
+      }
+      
+      # ------------------------------------------------------------
+      # 3b) Canonical MARKER inference from LD blocks
+      #     MATCH > MARKER > GWAS only
+      # ------------------------------------------------------------
+      
+      ld_details_obj <- tryCatch(ld_details_rds(), error = function(e) NULL)
+      
+      block_hits_df <- if (is.list(ld_details_obj) && length(ld_details_obj)) {
+        dplyr::bind_rows(lapply(ld_details_obj, function(z) {
+          if (!is.list(z)) return(NULL)
+          if (!is.data.frame(z$block_hits) || !nrow(z$block_hits)) return(NULL)
+          z$block_hits
+        }))
+      } else {
+        tibble::tibble()
+      }
+      
+   #   cat("\n[DBG MARKER 3b]\n")
+   #   cat("block_ranges_df rows:", if (is.data.frame(block_ranges_df)) nrow(block_ranges_df) else NA, "\n")
+   #   cat("block_hits_df rows:", if (is.data.frame(block_hits_df)) nrow(block_hits_df) else NA, "\n")
+      
+      if (is.data.frame(block_ranges_df) && nrow(block_ranges_df)) {
+        cat("block_ranges_df names:", paste(names(block_ranges_df), collapse = ", "), "\n")
+        print(
+          block_ranges_df %>%
+            dplyr::filter(as.character(cluster_id) == "4") %>%
+            dplyr::select(dplyr::any_of(c(
+              "cluster_id", "chr", "block_id",
+              "block_start", "block_end", "start", "end"
+            ))) %>%
+            utils::head(20)
         )
-      )
+      }
+      
+      if (is.data.frame(block_hits_df) && nrow(block_hits_df)) {
+        cat("block_hits_df names:", paste(names(block_hits_df), collapse = ", "), "\n")
+        print(
+          block_hits_df %>%
+            dplyr::filter(as.character(cluster_id) == "4") %>%
+            dplyr::select(dplyr::any_of(c(
+              "cluster_id", "chr", "block_id",
+              "source_app", "classe", "hit_id",
+              "hit_rsid", "hit_pos"
+            ))) %>%
+            utils::head(30)
+        )
+      }
+      
+      if (is.data.frame(block_hits_df) && nrow(block_hits_df) &&
+          is.data.frame(block_ranges_df) && nrow(block_ranges_df)) {
+        
+        block_ranges_clean <- block_ranges_df %>%
+          dplyr::transmute(
+            cluster_id = trimws(as.character(cluster_id)),
+            chr = normalize_chr_label(chr),
+            block_id = trimws(as.character(block_id)),
+            block_start = suppressWarnings(as.numeric(block_start)),
+            block_end = suppressWarnings(as.numeric(block_end))
+          ) %>%
+          dplyr::filter(
+            !is.na(cluster_id), nzchar(cluster_id),
+            !is.na(chr), nzchar(chr),
+            !is.na(block_id), nzchar(block_id),
+            !grepl("OUT", block_id, ignore.case = TRUE),
+            is.finite(block_start),
+            is.finite(block_end)
+          ) %>%
+          dplyr::distinct(cluster_id, chr, block_id, block_start, block_end)
+        
+        
+        # GWAS hit -> LD block real
+        gwas_hits_for_blocks <- sig_bridge %>%
+          dplyr::transmute(
+            gwas_cluster_id = trimws(as.character(cluster_id)),
+            chr = normalize_chr_label(chr),
+            gwas_hit = trimws(as.character(gwas_hit)),
+            gwas_pos = suppressWarnings(as.numeric(gwas_pos))
+          ) %>%
+          dplyr::filter(
+            !is.na(chr), nzchar(chr),
+            !is.na(gwas_hit), nzchar(gwas_hit),
+            is.finite(gwas_pos)
+          ) %>%
+          dplyr::distinct(chr, gwas_hit, gwas_pos, .keep_all = TRUE)
+        
+        block_ranges_for_join <- block_ranges_clean
+        
+        # Garantir chr robustament
+        if (!"chr" %in% names(block_ranges_for_join)) {
+          
+          if ("chromosome" %in% names(block_ranges_for_join)) {
+            block_ranges_for_join$chr <- block_ranges_for_join$chromosome
+            
+          } else if ("CHR" %in% names(block_ranges_for_join)) {
+            block_ranges_for_join$chr <- block_ranges_for_join$CHR
+            
+          } else {
+            block_ranges_for_join$chr <- sub(
+              "^chr([0-9XYM]+).*",
+              "\\1",
+              trimws(as.character(block_ranges_for_join$cluster_id)),
+              ignore.case = TRUE
+            )
+          }
+        }
+        
+        if (all(is.na(block_ranges_for_join$chr) | !nzchar(block_ranges_for_join$chr))) {
+          block_ranges_for_join$chr <- sub(
+            "^([0-9XYM]+).*",
+            "\\1",
+            trimws(as.character(block_ranges_for_join$cluster_id)),
+            ignore.case = TRUE
+          )
+        }
+        
+        block_ranges_for_join <- block_ranges_for_join %>%
+          dplyr::mutate(
+            cluster_id = trimws(as.character(cluster_id)),
+            chr = normalize_chr_label(as.character(chr)),
+            block_id = trimws(as.character(block_id)),
+            block_start = suppressWarnings(as.numeric(block_start)),
+            block_end = suppressWarnings(as.numeric(block_end))
+          ) %>%
+          dplyr::filter(
+            !is.na(cluster_id), nzchar(cluster_id),
+            !is.na(chr), nzchar(chr),
+            !is.na(block_id), nzchar(block_id),
+            !grepl("OUT", block_id, ignore.case = TRUE),
+            is.finite(block_start),
+            is.finite(block_end)
+          ) %>%
+          dplyr::distinct(cluster_id, chr, block_id, block_start, block_end)
+        
+        gwas_block_hits <- gwas_hits_for_blocks %>%
+          dplyr::inner_join(
+            block_ranges_for_join,
+            by = "chr",
+            relationship = "many-to-many"
+          )  %>%
+          dplyr::filter(
+            gwas_pos >= block_start,
+            gwas_pos <= block_end
+          ) %>%
+          dplyr::transmute(
+            cluster_id,
+            chr,
+            gwas_hit,
+            gwas_pos,
+            block_id
+          ) %>%
+          dplyr::distinct(cluster_id, chr, gwas_hit, gwas_pos, block_id)
+        
+        # app hits per block
+        block_app_support <- block_hits_df %>%
+          dplyr::transmute(
+            cluster_id = trimws(as.character(cluster_id)),
+            block_id = trimws(as.character(block_id)),
+            source_app = tolower(trimws(as.character(source_app)))
+          ) %>%
+          dplyr::filter(
+            !is.na(cluster_id), nzchar(cluster_id),
+            !is.na(block_id), nzchar(block_id),
+            !grepl("OUT", block_id, ignore.case = TRUE),
+            !is.na(source_app),
+            nzchar(source_app),
+            source_app %in% app_levels
+          ) %>%
+          dplyr::distinct()
+        
+        cat("\n[DBG MARKER 3b block_app_support]\n")
+        print(
+          block_app_support %>%
+            dplyr::filter(cluster_id == "4") %>%
+            dplyr::select(cluster_id, block_id, source_app) %>%
+            utils::head(50)
+        )
+        
+        inferred_marker_df <- gwas_block_hits %>%
+          dplyr::inner_join(
+            block_app_support,
+            by = c("cluster_id", "block_id")
+          ) %>%
+          dplyr::transmute(
+            cluster_id,
+            chr,
+            gwas_hit,
+            gwas_pos,
+            source_app,
+            link_state = "MARKER",
+            gene = ""
+          )
+        
+        cat("\n[DBG MARKER 3b inferred_marker_df BEFORE anti_join]\n")
+        print(
+          inferred_marker_df %>%
+            dplyr::filter(cluster_id == "4") %>%
+            dplyr::select(cluster_id, chr, gwas_hit, gwas_pos, source_app, link_state) %>%
+            utils::head(50)
+        )
+        
+        # MATCH preval sobre MARKER
+        existing_match_keys <- df_valid %>%
+          dplyr::mutate(
+            cluster_id = trimws(as.character(cluster_id)),
+            chr = normalize_chr_label(chr),
+            gwas_hit = trimws(as.character(gwas_hit)),
+            gwas_pos = suppressWarnings(as.numeric(gwas_pos)),
+            source_app = tolower(trimws(as.character(source_app))),
+            link_state = trimws(as.character(link_state))
+          ) %>%
+          dplyr::filter(link_state == "MATCH") %>%
+          dplyr::transmute(
+            cluster_id,
+            chr,
+            gwas_hit,
+            gwas_pos,
+            source_app
+          ) %>%
+          dplyr::distinct()
+        
+        inferred_marker_df <- inferred_marker_df %>%
+          dplyr::anti_join(
+            existing_match_keys,
+            by = c(
+              "cluster_id",
+              "chr",
+              "gwas_hit",
+              "gwas_pos",
+              "source_app"
+            )
+          )
+        
+        cat("\n[DBG MARKER 3b inferred_marker_df AFTER anti_join]\n")
+        print(
+          inferred_marker_df %>%
+            dplyr::filter(cluster_id == "4") %>%
+            dplyr::select(cluster_id, chr, gwas_hit, gwas_pos, source_app, link_state) %>%
+            utils::head(50)
+        )
+        
+        df_valid <- dplyr::bind_rows(
+          df_valid,
+          inferred_marker_df
+        )
+      }
+      # ------------------------------------------------------------
+      # 4) Suport per app: MATCH supera MARKER
+      # ------------------------------------------------------------
+      
+      hit_app_support <- df_valid %>%
+        dplyr::mutate(
+          cluster_id = trimws(as.character(cluster_id)),
+          chr = normalize_chr_label(chr),
+          gwas_hit = trimws(as.character(gwas_hit)),
+          gwas_pos = suppressWarnings(as.numeric(gwas_pos)),
+          source_app = tolower(trimws(as.character(source_app))),
+          link_state = trimws(as.character(link_state)),
+          gene = trimws(as.character(gene)),
+          state_rank = dplyr::case_when(
+            link_state == "MATCH"  ~ 2L,
+            link_state == "MARKER" ~ 1L,
+            TRUE ~ 0L
+          ),
+          app_weight = dplyr::coalesce(unname(app_weights[source_app]), 0),
+          state_weight = dplyr::coalesce(unname(state_weights[link_state]), 0),
+          support_score = app_weight * state_weight
+        ) %>%
+        dplyr::filter(
+          source_app %in% app_levels,
+          link_state %in% state_levels,
+          !is.na(cluster_id), nzchar(cluster_id),
+          !is.na(gwas_hit), nzchar(gwas_hit),
+          !is.na(source_app), nzchar(source_app)
+        ) %>%
+        dplyr::group_by(cluster_id, chr, gwas_hit, gwas_pos, source_app) %>%
+        dplyr::summarise(
+          best_link_state = dplyr::case_when(
+            max(state_rank, na.rm = TRUE) >= 2 ~ "MATCH",
+            max(state_rank, na.rm = TRUE) == 1 ~ "MARKER",
+            TRUE ~ ""
+          ),
+          best_state_rank = max(state_rank, na.rm = TRUE),
+          app_weight = dplyr::first(app_weight),
+          state_weight = max(state_weight, na.rm = TRUE),
+          support_score = max(support_score, na.rm = TRUE),
+          genes = collapse_unique_semicolon(gene),
+          n_genes = dplyr::n_distinct(gene[!is.na(gene) & nzchar(gene)]),
+          .groups = "drop"
+        ) %>%
+        dplyr::mutate(
+          genes = dplyr::coalesce(as.character(genes), ""),
+          n_genes = dplyr::coalesce(as.integer(n_genes), 0L),
+          app_state_label = paste0(source_app, ":", best_link_state),
+          app_score_label = paste0(source_app, "=", format(round(support_score, 2), nsmall = 2)),
+          app_gene_label = dplyr::if_else(
+            nzchar(genes),
+            paste0(source_app, ": ", genes),
+            paste0(source_app, ": -")
+          )
+        )
+      
+      hit_level_base <- hit_app_support %>%
+        dplyr::group_by(cluster_id, chr, gwas_hit, gwas_pos) %>%
+        dplyr::summarise(
+          raw_evidence_score = sum(support_score, na.rm = TRUE),
+          
+          gwas_hit_n_apps = dplyr::n_distinct(source_app),
+          gwas_hit_n_match_apps = sum(best_link_state == "MATCH", na.rm = TRUE),
+          gwas_hit_n_marker_apps = sum(best_link_state == "MARKER", na.rm = TRUE),
+          
+          gwas_hit_has_nonsyn_match = any(source_app == "nonsyn" & best_link_state == "MATCH", na.rm = TRUE),
+          gwas_hit_has_catalog_match = any(source_app == "catalog" & best_link_state == "MATCH", na.rm = TRUE),
+          gwas_hit_has_gtex_match = any(source_app == "gtex" & best_link_state == "MATCH", na.rm = TRUE),
+          gwas_hit_has_ewasdis_match = any(source_app == "ewasdis" & best_link_state == "MATCH", na.rm = TRUE),
+          gwas_hit_has_ewastum_match = any(source_app == "ewastum" & best_link_state == "MATCH", na.rm = TRUE),
+          
+          gwas_hit_apps = paste(sort(unique(source_app[!is.na(source_app) & nzchar(source_app)])), collapse = "; "),
+          gwas_hit_match_apps = paste(sort(unique(source_app[best_link_state == "MATCH"])), collapse = "; "),
+          gwas_hit_marker_apps = paste(sort(unique(source_app[best_link_state == "MARKER"])), collapse = "; "),
+          
+          linked_genes = collapse_unique_semicolon(genes),
+          linked_gene_n = sum(vapply(unique(genes), count_semicolon_items, integer(1))),
+          
+          support_signature = collapse_unique_pipe(app_state_label[order(match(source_app, app_levels, nomatch = 999))]),
+          score_breakdown_core = collapse_unique_pipe(app_score_label[order(match(source_app, app_levels, nomatch = 999))]),
+          genes_by_app = collapse_unique_pipe(app_gene_label[order(match(source_app, app_levels, nomatch = 999))]),
+          
+          .groups = "drop"
+        )
+    }
     
-    hit_level_base <- hit_app_support %>%
-      dplyr::group_by(cluster_id, chr, gwas_hit, gwas_pos) %>%
-      dplyr::summarise(
-        raw_evidence_score = sum(support_score, na.rm = TRUE),
-        
-        gwas_hit_n_apps = dplyr::n_distinct(source_app),
-        gwas_hit_n_match_apps = sum(best_link_state == "MATCH", na.rm = TRUE),
-        gwas_hit_n_marker_apps = sum(best_link_state == "MARKER", na.rm = TRUE),
-        
-        gwas_hit_has_nonsyn_match = any(source_app == "nonsyn" & best_link_state == "MATCH", na.rm = TRUE),
-        gwas_hit_has_catalog_match = any(source_app == "catalog" & best_link_state == "MATCH", na.rm = TRUE),
-        gwas_hit_has_gtex_match = any(source_app == "gtex" & best_link_state == "MATCH", na.rm = TRUE),
-        gwas_hit_has_ewasdis_match = any(source_app == "ewasdis" & best_link_state == "MATCH", na.rm = TRUE),
-        gwas_hit_has_ewastum_match = any(source_app == "ewastum" & best_link_state == "MATCH", na.rm = TRUE),
-        
-        gwas_hit_apps = paste(sort(unique(source_app[!is.na(source_app) & nzchar(source_app)])), collapse = "; "),
-        gwas_hit_match_apps = paste(sort(unique(source_app[best_link_state == "MATCH"])), collapse = "; "),
-        gwas_hit_marker_apps = paste(sort(unique(source_app[best_link_state == "MARKER"])), collapse = "; "),
-        
-        linked_genes = collapse_unique_semicolon(genes),
-        linked_gene_n = sum(vapply(unique(genes), count_semicolon_items, integer(1))),
-        
-        support_signature = collapse_unique_pipe(app_state_label[order(match(source_app, app_levels, nomatch = 999))]),
-        score_breakdown_core = collapse_unique_pipe(app_score_label[order(match(source_app, app_levels, nomatch = 999))]),
-        genes_by_app = collapse_unique_pipe(app_gene_label[order(match(source_app, app_levels, nomatch = 999))]),
-        
-        .groups = "drop"
-      )
+    # ------------------------------------------------------------
+    # 5) FINAL: partir de tots els GWAS hits i afegir suport app
+    # ------------------------------------------------------------
     
-    out <- hit_level_base %>%
+    out <- sig_bridge %>%
       dplyr::left_join(
-        sig_bridge,
+        hit_level_base,
         by = c("cluster_id", "chr", "gwas_hit", "gwas_pos")
       ) %>%
       dplyr::mutate(
+        raw_evidence_score = dplyr::coalesce(raw_evidence_score, 0),
+        
+        gwas_hit_n_apps = dplyr::coalesce(as.integer(gwas_hit_n_apps), 0L),
+        gwas_hit_n_match_apps = dplyr::coalesce(as.integer(gwas_hit_n_match_apps), 0L),
+        gwas_hit_n_marker_apps = dplyr::coalesce(as.integer(gwas_hit_n_marker_apps), 0L),
+        
+        gwas_hit_has_nonsyn_match = dplyr::coalesce(gwas_hit_has_nonsyn_match, FALSE),
+        gwas_hit_has_catalog_match = dplyr::coalesce(gwas_hit_has_catalog_match, FALSE),
+        gwas_hit_has_gtex_match = dplyr::coalesce(gwas_hit_has_gtex_match, FALSE),
+        gwas_hit_has_ewasdis_match = dplyr::coalesce(gwas_hit_has_ewasdis_match, FALSE),
+        gwas_hit_has_ewastum_match = dplyr::coalesce(gwas_hit_has_ewastum_match, FALSE),
+        
+        gwas_hit_apps = dplyr::coalesce(gwas_hit_apps, ""),
+        gwas_hit_match_apps = dplyr::coalesce(gwas_hit_match_apps, ""),
+        gwas_hit_marker_apps = dplyr::coalesce(gwas_hit_marker_apps, ""),
+        
+        linked_genes = dplyr::coalesce(linked_genes, ""),
         linked_gene_n = dplyr::coalesce(as.integer(linked_gene_n), 0L),
+        
+        support_signature = dplyr::coalesce(support_signature, ""),
+        score_breakdown_core = dplyr::coalesce(score_breakdown_core, ""),
+        genes_by_app = dplyr::coalesce(genes_by_app, ""),
         
         gwas_significance_bonus = dplyr::case_when(
           is.na(gwas_p) | gwas_p <= 0 ~ 0,
-          TRUE ~ pmax(0, pmin(-log10(gwas_p), 20) - 6) / 3.5
+          TRUE ~ pmax(0, pmin(-log10(gwas_p), 20) / logp_threshold)
         ),
         
         gwas_hit_score_old = raw_evidence_score,
@@ -8620,7 +10464,7 @@ function(data, row, column, node){
           ),
           gwas_hit_n_match_apps > 0 ~ paste0(gwas_hit_n_match_apps, " MATCH"),
           gwas_hit_n_marker_apps > 0 ~ paste0(gwas_hit_n_marker_apps, " MARKER"),
-          TRUE ~ "No support"
+          TRUE ~ "GWAS only"
         ),
         
         priority_class = dplyr::case_when(
@@ -8629,7 +10473,7 @@ function(data, row, column, node){
           gwas_hit_n_match_apps >= 1 & gwas_hit_n_apps >= 2 ~ "Medium",
           gwas_hit_n_match_apps >= 1 ~ "Medium",
           gwas_hit_n_marker_apps >= 1 ~ "Low",
-          TRUE ~ "Low"
+          TRUE ~ "GWAS only"
         ),
         
         priority_class_relative = classify_priority_tertiles(gwas_hit_priority_score),
@@ -8693,14 +10537,7 @@ function(data, row, column, node){
     
     out
   })
-  
-# observe({
-#   req(gwas_hit_priority_df_v2())
-#   cat("\n[gwas_hit_priority_df_v2] column names:\n")
-#   print(names(gwas_hit_priority_df_v2()))
-#   cat("\n")
-# })
-  
+
   output[[ns_gwas("gwas_hit_priority_dt")]] <- DT::renderDT({
     df <- gwas_hit_priority_df_v2()
     
@@ -8871,11 +10708,41 @@ function(data, row, column, node){
           n_apps_supported, " apps"
         ),
         
-        support_signature = dplyr::case_when(
-          nzchar(gene_link_mode) & nzchar(apps_supported) ~ paste0(gene_link_mode, " | ", apps_supported),
-          nzchar(gene_link_mode) ~ gene_link_mode,
-          nzchar(apps_supported) ~ apps_supported,
-          TRUE ~ ""
+        support_signature = mapply(
+          function(gene_evidence_types, apps_supported) {
+            
+            split_vals <- function(x) {
+              x <- as.character(x)
+              x <- trimws(x)
+              x <- x[!is.na(x) & nzchar(x)]
+              if (!length(x)) return(character(0))
+              out <- unlist(strsplit(x, "\\s*;\\s*"))
+              out <- trimws(out)
+              out[!is.na(out) & nzchar(out)]
+            }
+            
+            tt <- split_vals(gene_evidence_types)
+            aa <- split_vals(apps_supported)
+            sig <- character(0)
+            
+            if ("nonsyn_gene" %in% tt) sig <- c(sig, "functional")
+            
+            if (any(c("gtex_gene", "ewas_nearby_gene") %in% tt) ||
+                any(aa %in% c("gtex", "ewas", "ewasdis", "ewastum"))) {
+              sig <- c(sig, "regulatory")
+            }
+            
+            if ("physical_overlap" %in% tt) sig <- c(sig, "physical")
+            
+            if ("catalog_gene" %in% tt || "catalog" %in% aa) {
+              sig <- c(sig, "literature")
+            }
+            
+            paste(unique(sig), collapse = "; ")
+          },
+          gene_evidence_types,
+          apps_supported,
+          USE.NAMES = FALSE
         ),
         
         score_breakdown = paste0(
@@ -8894,6 +10761,7 @@ function(data, row, column, node){
         `priority_class (REL)` = priority_class_relative,
         evidence_summary,
         support_signature,
+        structural_support,
         score_breakdown,
         gene_evidence_types,
         apps_supported,
@@ -8906,6 +10774,22 @@ function(data, row, column, node){
         match_support,
         marker_support
       )
+    
+    long_cols <- c(
+      "cluster_ids",
+      "evidence_summary",
+      "support_signature",
+      "structural_support",
+      "gene_evidence_types",
+      "apps_supported",
+      "gene_source_apps",
+      "match_support",
+      "marker_support"
+    )
+    
+    for (cc in intersect(long_cols, names(show_df))) {
+      show_df[[cc]] <- collapse_long_cell(show_df[[cc]], max_lines = 5)
+    }
     
     hidden_cols <- which(names(show_df) %in% c(
       "top_gwas_hit_score",
@@ -9113,10 +10997,31 @@ function(data, row, column, node){
           as.integer(n_genes_from_label)
         ),
         
+        is_outblock = dplyr::coalesce(as.logical(is_outblock), FALSE),
+        
+        block_type = dplyr::if_else(
+          is_outblock,
+          "OUT-BLOCK",
+          "LD block"
+        ),
+        
+        outblock_elements = dplyr::case_when(
+          is_outblock & nzchar(gwas_hits) & nzchar(genes_in_block) ~ paste0(
+            "GWAS: ", gwas_hits,
+            " | Genes: ", genes_in_block
+          ),
+          is_outblock & nzchar(gwas_hits) ~ paste0("GWAS: ", gwas_hits),
+          is_outblock & nzchar(genes_in_block) ~ paste0("Genes: ", genes_in_block),
+          is_outblock ~ "No out-block elements detected",
+          TRUE ~ ""
+        ),
+        
         evidence_summary = paste0(
+          block_type,
+          " | ",
           n_gwas_hits, " GWAS hits",
           " | ",
-          n_genes, " genes",
+          n_genes_in_block, " genes",
           " | ",
           n_apps_supported, " apps"
         ),
@@ -9152,6 +11057,8 @@ function(data, row, column, node){
         gwas_hits,
         top_gwas_hit_score,
         block_size_kb,
+        block_type,
+        outblock_elements,
         n_gwas_hits,
         n_genes,
         n_apps_supported,
@@ -10075,8 +11982,15 @@ function(data, row, column, node){
       size_kb_vec <- (end_vec - start_vec + 1) / 1000
     }
     
-    block_mean_ld_vec <- get_num_col(df, c("block_mean_ld", "block_mean_ld_value", "mean_ld"))
-    block_max_ld_vec  <- get_num_col(df, c("block_max_ld", "block_max_ld_value", "max_ld"))
+    block_mean_ld_vec <- get_num_col(
+      df,
+      c("block_mean_ld", "block_mean_ld_value", "mean_ld", "ld_mean", "mean_r2")
+    )
+    
+    block_max_ld_vec <- get_num_col(
+      df,
+      c("block_max_ld", "block_max_ld_value", "max_ld", "ld_max", "max_r2")
+    )
     n_ld_proxy_hits_vec <- get_num_col(df, c("n_ld_proxy_hits"))
     n_genes_vec <- get_num_col(df, c("n_genes", "n_genes_in_block"))
     block_priority_score_vec <- get_num_col(df, c("block_priority_score"))
@@ -10088,7 +12002,8 @@ function(data, row, column, node){
         cluster_id = as.character(cluster_id),
         block_id   = as.character(block_id),
         
-        chr_num = extract_chr_num(cluster_id),
+        chr = if ("chr" %in% names(df)) as.character(df$chr) else as.character(extract_chr_num(cluster_id)),
+        chr_num = extract_chr_num(chr),
         block_index = extract_block_index(block_id),
         
         block_label = dplyr::if_else(
@@ -10103,6 +12018,8 @@ function(data, row, column, node){
         
         block_mean_ld = block_mean_ld_vec,
         block_max_ld = block_max_ld_vec,
+        block_mean_ld_value = block_mean_ld_vec,
+        block_max_ld_value = block_max_ld_vec,
         n_ld_proxy_hits = n_ld_proxy_hits_vec,
         n_genes = n_genes_vec,
         genes_name = genes_name_vec,
@@ -10131,6 +12048,13 @@ function(data, row, column, node){
     
     plot_df <- df %>%
       dplyr::mutate(
+        cluster_id = as.character(cluster_id),
+        block_id = as.character(block_id),
+        block_label = as.character(block_label),
+        
+        chr_num = suppressWarnings(as.numeric(chr_num)),
+        start = suppressWarnings(as.numeric(start)),
+        end = suppressWarnings(as.numeric(end)),
         size_kb = suppressWarnings(as.numeric(size_kb)),
         block_mean_ld = suppressWarnings(as.numeric(block_mean_ld)),
         block_max_ld = suppressWarnings(as.numeric(block_max_ld)),
@@ -10139,7 +12063,9 @@ function(data, row, column, node){
         block_priority_score = suppressWarnings(as.numeric(block_priority_score)),
         support_apps = suppressWarnings(as.numeric(support_apps)),
         
-        size_kb = dplyr::if_else(is.finite(size_kb), size_kb, 0),
+        size_kb = dplyr::if_else(is.finite(size_kb) & size_kb > 0, size_kb, 0),
+        genes_name = dplyr::coalesce(as.character(genes_name), ""),
+        gwas_hits = if ("gwas_hits" %in% names(.)) dplyr::coalesce(as.character(gwas_hits), "") else "",
         
         size_kb_txt = dplyr::if_else(
           is.finite(size_kb),
@@ -10177,8 +12103,13 @@ function(data, row, column, node){
           "NA"
         ),
         genes_txt = dplyr::if_else(
-          !is.na(genes_name) & nzchar(genes_name),
+          nzchar(genes_name),
           genes_name,
+          "-"
+        ),
+        gwas_txt = dplyr::if_else(
+          nzchar(gwas_hits),
+          gwas_hits,
           "-"
         ),
         hover_txt = paste0(
@@ -10193,11 +12124,43 @@ function(data, row, column, node){
           "Gene list: ", genes_txt, "<br>",
           "Priority score: ", score_txt
         )
+      ) %>%
+      dplyr::filter(
+        !grepl("OUT", as.character(block_id), ignore.case = TRUE),
+        !grepl("OUT", as.character(block_label), ignore.case = TRUE)
       )
     
     validate(
-      need(any(plot_df$size_kb > 0, na.rm = TRUE), "No valid block sizes available for plotting.")
+      need(nrow(plot_df) > 0, "No valid block sizes available for plotting.")
     )
+    
+    cluster_order <- plot_df %>%
+      dplyr::group_by(cluster_id) %>%
+      dplyr::summarise(
+        chr_num = suppressWarnings(min(chr_num, na.rm = TRUE)),
+        cluster_start = suppressWarnings(min(start, na.rm = TRUE)),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        chr_num = dplyr::if_else(is.finite(chr_num), chr_num, 999),
+        cluster_start = dplyr::if_else(is.finite(cluster_start), cluster_start, 0)
+      ) %>%
+      dplyr::arrange(chr_num, cluster_start, cluster_id) %>%
+      dplyr::pull(cluster_id)
+    
+    plot_df <- plot_df %>%
+      dplyr::mutate(
+        cluster_id = factor(cluster_id, levels = cluster_order)
+      ) %>%
+      dplyr::arrange(cluster_id, start, block_id)
+    
+    cat("\n[DEBUG LD COLORS]\n")
+    print(summary(plot_df$block_mean_ld))
+    print(utils::head(
+      plot_df[, c("cluster_id", "block_id", "block_mean_ld", "block_max_ld")],
+      20
+    ))
+    
     
     vals <- plot_df$block_mean_ld
     vals_ok <- vals[is.finite(vals)]
@@ -10209,11 +12172,9 @@ function(data, row, column, node){
     } else {
       vmin <- min(vals_ok, na.rm = TRUE)
       vmax <- max(vals_ok, na.rm = TRUE)
-      
       if (!is.finite(vmin)) vmin <- 0
       if (!is.finite(vmax)) vmax <- 1
       if (identical(vmin, vmax)) vmax <- vmin + 1e-6
-      
       vals[!is.finite(vals)] <- vmin
     }
     
@@ -10222,16 +12183,14 @@ function(data, row, column, node){
     
     plot_df$fill_col <- grDevices::rgb(
       grDevices::colorRamp(c(
-        "#d9d9d9",  # gris clar
-        "#a6bddb",  # blau grisós
-        "#3690c0",  # blau
-        "#756bb1",  # violeta
-        "#54278f"   # morat fosc
+        "#d9d9d9",
+        "#a6bddb",
+        "#3690c0",
+        "#756bb1",
+        "#54278f"
       ))(norm_vals),
       maxColorValue = 255
     )
-    
-    cluster_levels <- levels(plot_df$cluster_id)
     
     p <- plotly::plot_ly()
     
@@ -10246,7 +12205,6 @@ function(data, row, column, node){
           name = as.character(plot_df$block_id[i]),
           hovertext = ~hover_txt,
           hoverinfo = "text",
-          text = NULL,
           marker = list(
             color = plot_df$fill_col[i],
             line = list(width = 0.4, color = "rgba(80,80,80,0.6)")
@@ -10267,9 +12225,9 @@ function(data, row, column, node){
           title = "",
           automargin = TRUE,
           categoryorder = "array",
-          categoryarray = rev(cluster_levels)
+          categoryarray = rev(cluster_order)
         ),
-        margin = list(l = 100, r = 30, t = 50, b = 60),
+        margin = list(l = 120, r = 30, t = 50, b = 60),
         hoverlabel = list(align = "left")
       )
   })
@@ -11273,7 +13231,8 @@ function(data, row, column, node){
         label = gene,
         node_type = "gene",
         score = gene_score,
-        gene_link_mode = dplyr::coalesce(as.character(gene_link_mode), ""),
+        support_signature = dplyr::coalesce(as.character(support_signature), ""),
+        structural_support = dplyr::coalesce(as.character(structural_support), ""),
         gene_evidence_types = dplyr::coalesce(as.character(gene_evidence_types), ""),
         gene_source_apps = dplyr::coalesce(as.character(gene_source_apps), ""),
         apps_supported = dplyr::coalesce(as.character(apps_supported), "")
@@ -11288,7 +13247,9 @@ function(data, row, column, node){
         gene_link_mode = "",
         gene_evidence_types = "",
         gene_source_apps = "",
-        apps_supported = ""
+        apps_supported = "",
+        support_signature = "",
+        structural_support = ""
       )
     
     list(
@@ -11441,20 +13402,27 @@ function(data, row, column, node){
       gene_evidence_types = if ("gene_evidence_types" %in% names(nodes)) igraph::V(g)$gene_evidence_types else NA_character_,
       gene_source_apps = if ("gene_source_apps" %in% names(nodes)) igraph::V(g)$gene_source_apps else NA_character_,
       apps_supported = if ("apps_supported" %in% names(nodes)) igraph::V(g)$apps_supported else NA_character_,
+      support_signature = if ("support_signature" %in% names(nodes)) igraph::V(g)$support_signature else NA_character_,
+      structural_support = if ("structural_support" %in% names(nodes)) igraph::V(g)$structural_support else NA_character_,
       stringsAsFactors = FALSE
     )
     
     vdf <- vdf %>%
       dplyr::mutate(
-        gene_link_mode = dplyr::coalesce(as.character(gene_link_mode), ""),
+        support_signature = dplyr::coalesce(as.character(support_signature), ""),
+        structural_support = dplyr::coalesce(as.character(structural_support), ""),
         gene_evidence_types = dplyr::coalesce(as.character(gene_evidence_types), ""),
         gene_source_apps = dplyr::coalesce(as.character(gene_source_apps), ""),
         apps_supported = dplyr::coalesce(as.character(apps_supported), ""),
         link_class = dplyr::case_when(
           node_type != "gene" ~ "pathway",
-          grepl("physical", gene_link_mode) & grepl("effect", gene_link_mode) ~ "position+effect",
-          grepl("physical", gene_link_mode) ~ "position",
-          grepl("effect", gene_link_mode) ~ "effect",
+          grepl("regulatory", support_signature) & grepl("functional", support_signature) & grepl("physical", support_signature) ~ "functional+regulatory+physical",
+          grepl("regulatory", support_signature) & grepl("physical", support_signature) ~ "regulatory+physical",
+          grepl("functional", support_signature) & grepl("physical", support_signature) ~ "functional+physical",
+          grepl("regulatory", support_signature) ~ "regulatory",
+          grepl("functional", support_signature) ~ "functional",
+          grepl("physical", support_signature) ~ "physical",
+          grepl("literature", support_signature) ~ "literature",
           TRUE ~ "gene"
         ),
         marker_symbol = dplyr::case_when(
@@ -11467,7 +13435,8 @@ function(data, row, column, node){
           node_type == "gene" ~ paste0(
             label,
             "<br>gene_score = ", round(score, 2),
-            ifelse(nzchar(gene_link_mode), paste0("<br>link mode = ", gene_link_mode), ""),
+            ifelse(nzchar(support_signature), paste0("<br>support = ", support_signature), ""),
+            ifelse(nzchar(structural_support), paste0("<br>structural = ", structural_support), ""),
             ifelse(nzchar(gene_evidence_types), paste0("<br>evidence = ", gene_evidence_types), ""),
             ifelse(nzchar(gene_source_apps), paste0("<br>gene apps = ", gene_source_apps), ""),
             ifelse(nzchar(apps_supported), paste0("<br>hit-supported apps = ", apps_supported), "")
@@ -11526,43 +13495,66 @@ function(data, row, column, node){
         )
     }
     
-    gene_position_df <- gene_df %>% dplyr::filter(link_class == "position")
-    gene_effect_df <- gene_df %>% dplyr::filter(link_class == "effect")
-    gene_both_df <- gene_df %>% dplyr::filter(link_class == "position+effect")
-    gene_other_df <- gene_df %>% dplyr::filter(!link_class %in% c("position", "effect", "position+effect"))
+    gene_physical_df <- gene_df %>% dplyr::filter(link_class == "physical")
+    gene_functional_df <- gene_df %>% dplyr::filter(link_class == "functional")
+    gene_regulatory_df <- gene_df %>% dplyr::filter(link_class == "regulatory")
+    gene_combo_df <- gene_df %>% dplyr::filter(grepl("\\+", link_class))
+    gene_other_df <- gene_df %>% dplyr::filter(!link_class %in% c("physical", "functional", "regulatory") & !grepl("\\+", link_class))
     
-    if (nrow(gene_position_df) > 0) {
+    gene_physical_df <- gene_df %>% dplyr::filter(link_class == "physical")
+    gene_functional_df <- gene_df %>% dplyr::filter(link_class == "functional")
+    gene_regulatory_df <- gene_df %>% dplyr::filter(link_class == "regulatory")
+    gene_combo_df <- gene_df %>% dplyr::filter(grepl("\\+", link_class))
+    gene_other_df <- gene_df %>%
+      dplyr::filter(
+        !link_class %in% c("physical", "functional", "regulatory") &
+          !grepl("\\+", link_class)
+      )
+    
+    if (nrow(gene_physical_df) > 0) {
       p <- p %>%
         plotly::add_markers(
-          data = gene_position_df,
+          data = gene_physical_df,
           x = ~x, y = ~y,
           text = ~hover_txt,
           hoverinfo = "text",
-          name = "Genes: position-linked",
+          name = "Genes: physical",
           marker = list(size = 12, symbol = "circle")
         )
     }
     
-    if (nrow(gene_effect_df) > 0) {
+    if (nrow(gene_functional_df) > 0) {
       p <- p %>%
         plotly::add_markers(
-          data = gene_effect_df,
+          data = gene_functional_df,
           x = ~x, y = ~y,
           text = ~hover_txt,
           hoverinfo = "text",
-          name = "Genes: effect-linked",
+          name = "Genes: functional",
           marker = list(size = 12, symbol = "diamond")
         )
     }
     
-    if (nrow(gene_both_df) > 0) {
+    if (nrow(gene_regulatory_df) > 0) {
       p <- p %>%
         plotly::add_markers(
-          data = gene_both_df,
+          data = gene_regulatory_df,
           x = ~x, y = ~y,
           text = ~hover_txt,
           hoverinfo = "text",
-          name = "Genes: position + effect",
+          name = "Genes: regulatory",
+          marker = list(size = 12, symbol = "square")
+        )
+    }
+    
+    if (nrow(gene_combo_df) > 0) {
+      p <- p %>%
+        plotly::add_markers(
+          data = gene_combo_df,
+          x = ~x, y = ~y,
+          text = ~hover_txt,
+          hoverinfo = "text",
+          name = "Genes: combined support",
           marker = list(size = 12, symbol = "circle-open")
         )
     }
@@ -11574,7 +13566,7 @@ function(data, row, column, node){
           x = ~x, y = ~y,
           text = ~hover_txt,
           hoverinfo = "text",
-          name = "Genes",
+          name = "Genes: other/literature",
           marker = list(size = 12, symbol = "circle")
         )
     }
@@ -11930,16 +13922,21 @@ function(data, row, column, node){
       gene = igraph::V(g)$name,
       degree = as.integer(igraph::degree(g)),
       gene_score = round(as.numeric(igraph::V(g)$score), 3),
-      gene_link_mode = dplyr::coalesce(as.character(igraph::V(g)$gene_link_mode), ""),
+      support_signature = dplyr::coalesce(as.character(igraph::V(g)$support_signature), ""),
+      structural_support = dplyr::coalesce(as.character(igraph::V(g)$structural_support), ""),
       gene_evidence_types = dplyr::coalesce(as.character(igraph::V(g)$gene_evidence_types), ""),
       gene_source_apps = dplyr::coalesce(as.character(igraph::V(g)$gene_source_apps), ""),
       apps_supported = dplyr::coalesce(as.character(igraph::V(g)$apps_supported), "")
     ) %>%
       dplyr::mutate(
         node_class = dplyr::case_when(
-          grepl("physical", gene_link_mode) & grepl("effect", gene_link_mode) ~ "position+effect",
-          grepl("physical", gene_link_mode) ~ "position",
-          grepl("effect", gene_link_mode) ~ "effect",
+          grepl("regulatory", support_signature) & grepl("functional", support_signature) & grepl("physical", support_signature) ~ "functional+regulatory+physical",
+          grepl("regulatory", support_signature) & grepl("physical", support_signature) ~ "regulatory+physical",
+          grepl("functional", support_signature) & grepl("physical", support_signature) ~ "functional+physical",
+          grepl("regulatory", support_signature) ~ "regulatory",
+          grepl("functional", support_signature) ~ "functional",
+          grepl("physical", support_signature) ~ "physical",
+          grepl("literature", support_signature) ~ "literature",
           TRUE ~ "gene"
         )
       ) %>%
@@ -11974,7 +13971,8 @@ function(data, row, column, node){
       dplyr::transmute(
         gene = trimws(as.character(gene)),
         gene_score = round(dplyr::coalesce(as.numeric(gene_score), 0), 3),
-        gene_link_mode = dplyr::coalesce(as.character(gene_link_mode), ""),
+        support_signature = dplyr::coalesce(as.character(support_signature), ""),
+        structural_support = dplyr::coalesce(as.character(structural_support), ""),
         gene_evidence_types = dplyr::coalesce(as.character(gene_evidence_types), ""),
         gene_source_apps = dplyr::coalesce(as.character(gene_source_apps), ""),
         apps_supported = dplyr::coalesce(as.character(apps_supported), "")
@@ -13424,205 +15422,366 @@ function(data, row, column, node){
   # ============================================================
   # BLOCK ↔ GENE AUDIT
   # ============================================================
-  block_gene_audit_df <- reactive({
-    blk <- prioritized_block_df_v2()
-    gen <- prioritized_gene_audit_base_df()
+  
+  audit_block_scores_df <- reactive({
     
-    validate(
-      need(is.data.frame(blk) && nrow(blk) > 0, "No prioritized blocks available for audit."),
-      need(is.data.frame(gen) && nrow(gen) > 0, "No prioritized genes available for audit.")
-    )
-    
-    blk_std <- blk %>%
-      dplyr::transmute(
-        cluster_id = as.character(cluster_id),
-        block_id = as.character(block_id),
-        block_score = dplyr::coalesce(as.numeric(block_score), 0),
-        block_score_from_hits = dplyr::coalesce(as.numeric(block_score_from_hits), 0),
-        top_gwas_hit_score = dplyr::coalesce(as.numeric(top_gwas_hit_score), 0),
-        n_gwas_hits = dplyr::coalesce(as.integer(n_gwas_hits), 0L),
-        genes_in_block = dplyr::coalesce(as.character(genes_in_block), ""),
-        n_genes_in_block = dplyr::coalesce(as.integer(n_genes_in_block), 0L),
-        apps_supported = dplyr::coalesce(as.character(apps_supported), ""),
-        priority_class = dplyr::coalesce(as.character(priority_class), ""),
-        priority_class_relative = dplyr::coalesce(as.character(priority_class_relative), "")
-      ) %>%
-      dplyr::filter(!is.na(cluster_id), nzchar(cluster_id), !is.na(block_id), nzchar(block_id))
-    
-    block_gene_map <- blk_std %>%
-      dplyr::select(cluster_id, block_id, block_score, block_score_from_hits, top_gwas_hit_score,
-                    n_gwas_hits, genes_in_block, n_genes_in_block, apps_supported,
-                    priority_class, priority_class_relative) %>%
-      tidyr::separate_rows(genes_in_block, sep = "\\s*;\\s*") %>%
-      dplyr::rename(gene = genes_in_block) %>%
-      dplyr::mutate(
-        gene = trimws(as.character(gene))
-      ) %>%
-      dplyr::filter(!is.na(gene), nzchar(gene)) %>%
-      dplyr::distinct(cluster_id, block_id, gene, .keep_all = TRUE)
-    
-    audit <- block_gene_map %>%
-      dplyr::left_join(
-        gen,
-        by = c("cluster_id", "gene")
-      ) %>%
-      dplyr::mutate(
-        gene_score = dplyr::coalesce(as.numeric(gene_score), 0),
-        gene_block_ratio = dplyr::if_else(
-          is.finite(block_score) & block_score > 0,
-          gene_score / block_score,
-          NA_real_
-        ),
-        audit_flag = dplyr::case_when(
-          block_score >= 20 & gene_score < 3 ~ "BLOCK_STRONG_GENE_WEAK",
-          gene_score >= 15 & block_score < 10 ~ "GENE_STRONG_BLOCK_WEAK",
-          n_genes_in_block == 0 ~ "BLOCK_WITHOUT_GENE_CONTENT",
-          TRUE ~ "CONSISTENT"
-        ),
-        audit_comment = dplyr::case_when(
-          audit_flag == "BLOCK_STRONG_GENE_WEAK" ~ "Strong block score but weak prioritized gene score inside the block.",
-          audit_flag == "GENE_STRONG_BLOCK_WEAK" ~ "Strong prioritized gene score inside a relatively weak block.",
-          audit_flag == "BLOCK_WITHOUT_GENE_CONTENT" ~ "Block has no annotated genes in genes_in_block.",
-          TRUE ~ "Block and gene scores are broadly coherent."
-        )
+    empty_out <- function() {
+      tibble::tibble(
+        cluster_id = character(),
+        block_id = character(),
+        block_score = numeric(),
+        top_gwas_hit_score = numeric(),
+        n_gwas_hits = integer(),
+        genes_in_block_from_score = character()
       )
+    }
     
-    # Resum per bloc
-    audit %>%
+    safe_chr <- function(df, col, default = "") {
+      if (col %in% names(df)) as.character(df[[col]]) else rep(default, nrow(df))
+    }
+    
+    safe_num <- function(df, col, default = 0) {
+      if (col %in% names(df)) suppressWarnings(as.numeric(df[[col]])) else rep(default, nrow(df))
+    }
+    
+    safe_int <- function(df, col, default = 0L) {
+      if (col %in% names(df)) suppressWarnings(as.integer(df[[col]])) else rep(default, nrow(df))
+    }
+    
+    session_dir <- tryCatch(selected_session_dir(), error = function(e) NULL)
+    saved <- empty_out()
+    
+    if (!is.null(session_dir) && dir.exists(session_dir)) {
+      
+      global_summary_file <- file.path(session_dir, "ld_global_block_summary.rds")
+      global_details_file <- file.path(session_dir, "ld_global_details.rds")
+      
+      x <- tryCatch(readRDS(global_summary_file), error = function(e) NULL)
+      
+      if (!is.data.frame(x) || !nrow(x)) {
+        dd <- tryCatch(readRDS(global_details_file), error = function(e) NULL)
+        
+        if (is.list(dd) && length(dd)) {
+          x <- dplyr::bind_rows(lapply(dd, function(z) {
+            if (!is.list(z)) return(NULL)
+            if (!is.data.frame(z$block_summary) || !nrow(z$block_summary)) return(NULL)
+            z$block_summary
+          }))
+        }
+      }
+      
+      if (is.data.frame(x) && nrow(x)) {
+        
+        block_col <- intersect(
+          c("block_id", "ld_block_id", "block", "block_label"),
+          names(x)
+        )[1]
+        
+        if (!is.na(block_col)) {
+          saved <- tibble::tibble(
+            cluster_id = safe_chr(x, "cluster_id"),
+            block_id = safe_chr(x, block_col),
+            block_score = safe_num(x, "block_score", 0),
+            top_gwas_hit_score = safe_num(x, "top_gwas_hit_score", 0),
+            n_gwas_hits = safe_int(x, "n_gwas_hits", 0L),
+            genes_in_block_from_score = safe_chr(x, "genes_in_block", "")
+          )
+        }
+      }
+    }
+    
+    live <- tryCatch(prioritized_block_df_v2(), error = function(e) NULL)
+    
+    live <- if (is.data.frame(live) && nrow(live)) {
+      tibble::tibble(
+        cluster_id = safe_chr(live, "cluster_id"),
+        block_id = safe_chr(live, "block_id"),
+        block_score = safe_num(live, "block_score", 0),
+        top_gwas_hit_score = safe_num(live, "top_gwas_hit_score", 0),
+        n_gwas_hits = safe_int(live, "n_gwas_hits", 0L),
+        genes_in_block_from_score = safe_chr(live, "genes_in_block", "")
+      )
+    } else {
+      empty_out()
+    }
+    
+    dplyr::bind_rows(saved, live) %>%
+      dplyr::filter(
+        !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(block_id), nzchar(block_id)
+      ) %>%
       dplyr::group_by(cluster_id, block_id) %>%
       dplyr::summarise(
-        block_score = dplyr::first(block_score),
-        block_score_from_hits = dplyr::first(block_score_from_hits),
-        top_gwas_hit_score = dplyr::first(top_gwas_hit_score),
-        n_gwas_hits = dplyr::first(n_gwas_hits),
-        n_genes_in_block = dplyr::first(n_genes_in_block),
-        apps_supported = dplyr::first(apps_supported),
-        priority_class = dplyr::first(priority_class),
-        priority_class_relative = dplyr::first(priority_class_relative),
-        
-        genes_in_block = paste(sort(unique(gene[!is.na(gene) & nzchar(gene)])), collapse = "; "),
-        n_prioritized_genes_in_block = sum(is.finite(gene_score) & gene_score > 0, na.rm = TRUE),
-        top_gene_score_in_block = suppressWarnings(max(gene_score, na.rm = TRUE)),
-        sum_gene_score_in_block = round(sum(gene_score, na.rm = TRUE), 2),
-        top_gene_in_block = gene[which.max(dplyr::coalesce(gene_score, 0))[1]],
-        
-        block_gene_ratio = dplyr::if_else(
-          is.finite(block_score) & block_score > 0,
-          suppressWarnings(max(gene_score, na.rm = TRUE)) / block_score,
-          NA_real_
+        block_score = max(block_score, na.rm = TRUE),
+        top_gwas_hit_score = max(top_gwas_hit_score, na.rm = TRUE),
+        n_gwas_hits = max(n_gwas_hits, na.rm = TRUE),
+        genes_in_block_from_score = paste(
+          sort(unique(genes_in_block_from_score[nzchar(genes_in_block_from_score)])),
+          collapse = "; "
         ),
-        
-        audit_flag = dplyr::case_when(
-          block_score >= 20 & suppressWarnings(max(gene_score, na.rm = TRUE)) < 3 ~ "BLOCK_DOMINANT_WITH_WEAK_GENES",
-          block_score < 10 & suppressWarnings(max(gene_score, na.rm = TRUE)) >= 12 ~ "GENE_STRONG_IN_WEAK_BLOCK",
-          n_genes_in_block == 0 ~ "TOP_BLOCK_WITHOUT_GENE_CONTENT",
-          TRUE ~ "CONSISTENT"
-        ),
-        
-        audit_comment = dplyr::case_when(
-          audit_flag == "BLOCK_DOMINANT_WITH_WEAK_GENES" ~ "High-scoring block but no strong prioritized gene inside it.",
-          audit_flag == "GENE_STRONG_IN_WEAK_BLOCK" ~ "A strong prioritized gene is placed inside a relatively weak block.",
-          audit_flag == "TOP_BLOCK_WITHOUT_GENE_CONTENT" ~ "Block is prioritized but has no genes in genes_in_block.",
-          TRUE ~ "Block-level and gene-level signals are broadly coherent."
-        ),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        block_score = dplyr::if_else(is.finite(block_score), block_score, 0),
+        top_gwas_hit_score = dplyr::if_else(is.finite(top_gwas_hit_score), top_gwas_hit_score, 0),
+        n_gwas_hits = dplyr::if_else(is.finite(n_gwas_hits), as.integer(n_gwas_hits), 0L)
+      )
+  })
+  
+  block_gene_audit_df <- reactive({
+    all_blocks <- get_all_audit_blocks_df()
+    blk <- prioritized_block_df_v2()
+    gha <- tryCatch(gene_hit_audit_df(), error = function(e) NULL)
+    
+    block_scores <- audit_block_scores_df()
+    
+    gene_support <- if (is.data.frame(gha) && nrow(gha)) {
+      blk %>%
+        dplyr::transmute(
+          cluster_id = as.character(cluster_id),
+          block_id = as.character(block_id),
+          block_score = dplyr::coalesce(as.numeric(block_score), 0),
+          top_gwas_hit_score = dplyr::coalesce(as.numeric(top_gwas_hit_score), 0),
+          n_gwas_hits = dplyr::coalesce(as.integer(n_gwas_hits), 0L),
+          genes_in_block_from_score = dplyr::coalesce(as.character(genes_in_block), "")
+        )
+    } else {
+      tibble::tibble(
+        cluster_id = character(),
+        block_id = character(),
+        block_score = numeric(),
+        top_gwas_hit_score = numeric(),
+        n_gwas_hits = integer(),
+        genes_in_block_from_score = character()
+      )
+    }
+    
+    gene_support <- if (is.data.frame(gha) && nrow(gha)) {
+      gha %>%
+        dplyr::filter(nzchar(as.character(block_id))) %>%
+        dplyr::group_by(cluster_id, block_id, gene) %>%
+        dplyr::summarise(
+          gene_score_in_block = sum(gene_score_contribution, na.rm = TRUE),
+          .groups = "drop"
+        )
+    } else {
+      tibble::tibble(
+        cluster_id = character(),
+        block_id = character(),
+        gene = character(),
+        gene_score_in_block = numeric()
+      )
+    }
+    
+    genes_by_block <- gene_support %>%
+      dplyr::group_by(cluster_id, block_id) %>%
+      dplyr::summarise(
+        genes_in_block_from_hits = paste(sort(unique(gene)), collapse = "; "),
+        n_prioritized_genes_in_block = dplyr::n_distinct(gene[gene_score_in_block > 0]),
+        top_gene_score_in_block = max(gene_score_in_block, na.rm = TRUE),
+        sum_gene_score_in_block = sum(gene_score_in_block, na.rm = TRUE),
+        top_gene_in_block = gene[which.max(gene_score_in_block)[1]],
         .groups = "drop"
       ) %>%
       dplyr::mutate(
         top_gene_score_in_block = dplyr::if_else(is.finite(top_gene_score_in_block), top_gene_score_in_block, 0),
         top_gene_in_block = dplyr::coalesce(as.character(top_gene_in_block), "")
-      ) %>%
-      dplyr::arrange(dplyr::desc(block_score), cluster_id, block_id)
+      )
+    
+    all_blocks %>%
+      dplyr::left_join(block_scores, by = c("cluster_id", "block_id")) %>%
+      dplyr::left_join(genes_by_block, by = c("cluster_id", "block_id")) %>%
+      dplyr::mutate(
+        block_score = dplyr::coalesce(block_score, 0),
+        top_gwas_hit_score = dplyr::coalesce(top_gwas_hit_score, 0),
+        n_gwas_hits = dplyr::coalesce(n_gwas_hits, 0L),
+        genes_in_block = dplyr::case_when(
+          nzchar(dplyr::coalesce(genes_in_block_from_hits, "")) ~ genes_in_block_from_hits,
+          nzchar(dplyr::coalesce(genes_in_block_from_score, "")) ~ genes_in_block_from_score,
+          TRUE ~ ""
+        ),
+        n_genes_in_block = vapply(strsplit(genes_in_block, "\\s*;\\s*"), function(x) {
+          x <- x[nzchar(x)]
+          length(unique(x))
+        }, integer(1)),
+        n_prioritized_genes_in_block = dplyr::coalesce(n_prioritized_genes_in_block, 0L),
+        top_gene_score_in_block = dplyr::coalesce(top_gene_score_in_block, 0),
+        sum_gene_score_in_block = dplyr::coalesce(sum_gene_score_in_block, 0),
+        top_gene_in_block = dplyr::coalesce(top_gene_in_block, ""),
+        block_gene_ratio = dplyr::if_else(
+          sum_gene_score_in_block > 0,
+          block_score / sum_gene_score_in_block,
+          0
+        ),
+        priority_class = dplyr::case_when(
+          block_score >= 20 ~ "High",
+          block_score >= 5 ~ "Medium",
+          block_score > 0 ~ "Low",
+          TRUE ~ "No score"
+        ),
+        priority_class_relative = classify_priority_tertiles(block_score),
+        audit_flag = dplyr::case_when(
+          block_score > 0 & sum_gene_score_in_block == 0 ~ "TOP_BLOCK_WITHOUT_GENE_CONTENT",
+          block_score >= 10 & top_gene_score_in_block < 3 ~ "BLOCK_DOMINANT_WITH_WEAK_GENES",
+          top_gene_score_in_block >= 10 & block_score < 3 ~ "GENE_STRONG_IN_WEAK_BLOCK",
+          TRUE ~ "CONSISTENT"
+        ),
+        audit_comment = dplyr::case_when(
+          audit_flag == "TOP_BLOCK_WITHOUT_GENE_CONTENT" ~ "Block has priority signal but no gene-level support.",
+          audit_flag == "BLOCK_DOMINANT_WITH_WEAK_GENES" ~ "Block-level signal is stronger than linked gene support.",
+          audit_flag == "GENE_STRONG_IN_WEAK_BLOCK" ~ "Gene-level signal is strong relative to block score.",
+          TRUE ~ "Block-level and gene-level signals are broadly coherent."
+        )
+      )
   })
   
   # ============================================================
   # CLUSTER ↔ BLOCK AUDIT
   # ============================================================
-  cluster_block_audit_df <- reactive({
-    cl <- prioritized_cluster_df_v2()
-    blk <- prioritized_block_df_v2()
+  get_all_audit_blocks_df <- reactive({
+    
+    get_blocks_from_df <- function(df) {
+      if (!is.data.frame(df) || !nrow(df)) {
+        return(tibble::tibble(cluster_id = character(), block_id = character()))
+      }
+      
+      cluster_col <- intersect(c("cluster_id", "cluster"), names(df))[1]
+      block_col   <- intersect(c("block_id", "ld_block_id", "block", "block_label"), names(df))[1]
+      
+      if (is.na(cluster_col) || is.na(block_col)) {
+        return(tibble::tibble(cluster_id = character(), block_id = character()))
+      }
+      
+      df %>%
+        dplyr::transmute(
+          cluster_id = as.character(.data[[cluster_col]]),
+          block_id = as.character(.data[[block_col]])
+        ) %>%
+        dplyr::filter(
+          !is.na(cluster_id), nzchar(cluster_id),
+          !is.na(block_id), nzchar(block_id)
+        ) %>%
+        dplyr::distinct(cluster_id, block_id)
+    }
+    
+    br1 <- tryCatch(priority_source_block_ranges(), error = function(e) NULL)
+    br2 <- tryCatch(block_ranges_selected(), error = function(e) NULL)
+    br3 <- tryCatch(prioritized_block_df_v2(), error = function(e) NULL)
+    br4 <- tryCatch(gene_hit_audit_df(), error = function(e) NULL)
+    br5 <- tryCatch(ld_block_hits_selected(), error = function(e) NULL)
+    
+    out <- dplyr::bind_rows(
+      get_blocks_from_df(br1),
+      get_blocks_from_df(br2),
+      get_blocks_from_df(br3),
+      get_blocks_from_df(br4),
+      get_blocks_from_df(br5)
+    ) %>%
+      dplyr::distinct(cluster_id, block_id)
     
     validate(
-      need(is.data.frame(cl) && nrow(cl) > 0, "No prioritized clusters available for audit."),
-      need(is.data.frame(blk) && nrow(blk) > 0, "No prioritized blocks available for audit.")
+      need(nrow(out) > 0, "No LD/block ranges available for audit.")
     )
     
-    blk_sum <- blk %>%
-      dplyr::transmute(
-        cluster_id = as.character(cluster_id),
-        block_id = as.character(block_id),
-        block_score = dplyr::coalesce(as.numeric(block_score), 0),
-        block_score_from_hits = dplyr::coalesce(as.numeric(block_score_from_hits), 0),
-        n_genes_in_block = dplyr::coalesce(as.integer(n_genes_in_block), 0L),
-        genes_in_block = dplyr::coalesce(as.character(genes_in_block), "")
-      ) %>%
-      dplyr::filter(!is.na(cluster_id), nzchar(cluster_id)) %>%
+    out
+  })
+  ######## temporal
+  
+#  observe({
+#    cat("\n[DBG AUDIT BLOCK SOURCES]\n")
+#    
+#    for (nm in c(
+#      "priority_source_block_ranges",
+#      "block_ranges_selected",
+#      "prioritized_block_df_v2",
+#      "gene_hit_audit_df"
+#    )) {
+#      obj <- tryCatch(get(nm)(), error = function(e) e)
+#      
+#      cat("\n---", nm, "---\n")
+#      
+#      if (inherits(obj, "error")) {
+#        cat("ERROR:", conditionMessage(obj), "\n")
+#      } else if (!is.data.frame(obj)) {
+#        cat("Not a data.frame\n")
+#      } else {
+#        cat("nrow:", nrow(obj), "\n")
+#        cat("cols:", paste(names(obj), collapse = ", "), "\n")
+#        if ("block_id" %in% names(obj)) {
+#          print(unique(obj$block_id))
+#        }
+#      }
+#    }
+#  })
+  
+  ############
+  cluster_block_audit_df <- reactive({
+    cl <- prioritized_cluster_df_v2()
+    bg <- block_gene_audit_df()
+    
+    validate(
+      need(is.data.frame(cl) && nrow(cl) > 0, "No prioritized clusters available."),
+      need(is.data.frame(bg) && nrow(bg) > 0, "No block-gene audit available.")
+    )
+    
+    bg_sum <- bg %>%
       dplyr::group_by(cluster_id) %>%
       dplyr::summarise(
-        n_blocks = dplyr::n_distinct(block_id[!is.na(block_id) & nzchar(block_id)]),
-        top_block_score_in_cluster = suppressWarnings(max(block_score, na.rm = TRUE)),
-        sum_block_score_in_cluster = round(sum(block_score, na.rm = TRUE), 2),
-        top_block_id = block_id[which.max(dplyr::coalesce(block_score, 0))[1]],
-        blocks_in_cluster = paste(sort(unique(block_id[!is.na(block_id) & nzchar(block_id)])), collapse = "; "),
-        genes_in_blocks = collapse_unique_semicolon(genes_in_block),
+        n_blocks = dplyr::n_distinct(block_id),
+        top_block_id = block_id[which.max(block_score)[1]],
+        top_block_score_in_cluster = max(block_score, na.rm = TRUE),
+        sum_block_score_in_cluster = sum(block_score, na.rm = TRUE),
+        n_unique_genes_in_blocks = length(unique(unlist(strsplit(paste(genes_in_block, collapse = "; "), "\\s*;\\s*")))),
+        genes_in_blocks = paste(sort(unique(unlist(strsplit(paste(genes_in_block, collapse = "; "), "\\s*;\\s*")))), collapse = "; "),
         .groups = "drop"
       ) %>%
       dplyr::mutate(
-        n_unique_genes_in_blocks = vapply(genes_in_blocks, count_semicolon_items, integer(1)),
-        top_block_score_in_cluster = dplyr::if_else(
-          is.finite(top_block_score_in_cluster),
-          top_block_score_in_cluster,
-          0
-        ),
-        cluster_block_ratio = dplyr::if_else(
-          is.finite(sum_block_score_in_cluster) & sum_block_score_in_cluster > 0,
-          top_block_score_in_cluster / sum_block_score_in_cluster,
-          NA_real_
-        )
+        top_block_score_in_cluster = dplyr::if_else(is.finite(top_block_score_in_cluster), top_block_score_in_cluster, 0),
+        top_block_id = dplyr::coalesce(as.character(top_block_id), ""),
+        genes_in_blocks = trimws(gsub("^;|;$", "", genes_in_blocks))
       )
     
     cl %>%
       dplyr::transmute(
         cluster_id = as.character(cluster_id),
         cluster_score = dplyr::coalesce(as.numeric(cluster_score), 0),
-        cluster_score_from_blocks = dplyr::coalesce(as.numeric(cluster_score_from_blocks), 0),
-        top_block_score = dplyr::coalesce(as.numeric(top_block_score), 0),
-        other_block_score = dplyr::coalesce(as.numeric(other_block_score), 0),
         cluster_gene_bonus = dplyr::coalesce(as.numeric(cluster_gene_bonus), 0),
-        cluster_fragmentation_bonus = dplyr::coalesce(as.numeric(cluster_fragmentation_bonus), 0),
-        n_gwas_hits = dplyr::coalesce(as.integer(n_gwas_hits), 0L),
-        top_gwas_hit_score = dplyr::coalesce(as.numeric(top_gwas_hit_score), 0),
-        n_apps_supported = dplyr::coalesce(as.integer(n_apps_supported), 0L),
-        priority_class = dplyr::coalesce(as.character(priority_class), ""),
-        priority_class_relative = dplyr::coalesce(as.character(priority_class_relative), "")
+        cluster_fragmentation_bonus = dplyr::coalesce(as.numeric(cluster_fragmentation_bonus), 0)
       ) %>%
-      dplyr::left_join(blk_sum, by = "cluster_id") %>%
+      dplyr::left_join(bg_sum, by = "cluster_id") %>%
       dplyr::mutate(
-        n_blocks = dplyr::coalesce(as.integer(n_blocks), 0L),
-        top_block_score_in_cluster = dplyr::coalesce(as.numeric(top_block_score_in_cluster), 0),
-        sum_block_score_in_cluster = dplyr::coalesce(as.numeric(sum_block_score_in_cluster), 0),
-        top_block_id = dplyr::coalesce(as.character(top_block_id), ""),
-        blocks_in_cluster = dplyr::coalesce(as.character(blocks_in_cluster), ""),
-        genes_in_blocks = dplyr::coalesce(as.character(genes_in_blocks), ""),
-        n_unique_genes_in_blocks = dplyr::coalesce(as.integer(n_unique_genes_in_blocks), 0L),
+        n_blocks = dplyr::coalesce(n_blocks, 0L),
+        top_block_id = dplyr::coalesce(top_block_id, ""),
+        top_block_score_in_cluster = dplyr::coalesce(top_block_score_in_cluster, 0),
+        sum_block_score_in_cluster = dplyr::coalesce(sum_block_score_in_cluster, 0),
+        n_unique_genes_in_blocks = dplyr::coalesce(n_unique_genes_in_blocks, 0L),
+        genes_in_blocks = dplyr::coalesce(genes_in_blocks, ""),
         cluster_block_ratio = dplyr::if_else(
-          is.finite(cluster_score) & cluster_score > 0,
+          cluster_score > 0,
           top_block_score_in_cluster / cluster_score,
-          NA_real_
+          0
         ),
+        cluster_score_from_blocks = sum_block_score_in_cluster,
+        priority_class = dplyr::case_when(
+          cluster_score >= 40 ~ "High",
+          cluster_score >= 10 ~ "Medium",
+          cluster_score > 0 ~ "Low",
+          TRUE ~ "No score"
+        ),
+        priority_class_relative = classify_priority_tertiles(cluster_score),
         audit_flag = dplyr::case_when(
-          cluster_score >= 25 & top_block_score_in_cluster < 10 ~ "CLUSTER_STRONG_WITHOUT_STRONG_BLOCKS",
-          is.finite(cluster_block_ratio) & cluster_block_ratio >= 0.80 ~ "CLUSTER_DOMINATED_BY_ONE_BLOCK",
-          n_blocks >= 4 & top_block_score_in_cluster < 12 ~ "MULTI_BLOCK_DIFFUSE_SIGNAL",
+          cluster_score > 0 & sum_block_score_in_cluster == 0 ~ "CLUSTER_STRONG_WITHOUT_STRONG_BLOCKS",
+          cluster_block_ratio >= 0.8 & n_blocks > 1 ~ "CLUSTER_DOMINATED_BY_ONE_BLOCK",
+          n_blocks >= 3 & cluster_block_ratio < 0.3 ~ "MULTI_BLOCK_DIFFUSE_SIGNAL",
           TRUE ~ "CONSISTENT"
         ),
         audit_comment = dplyr::case_when(
-          audit_flag == "CLUSTER_STRONG_WITHOUT_STRONG_BLOCKS" ~ "High cluster score but no clearly strong supporting block.",
-          audit_flag == "CLUSTER_DOMINATED_BY_ONE_BLOCK" ~ "Cluster score is largely driven by a single block.",
-          audit_flag == "MULTI_BLOCK_DIFFUSE_SIGNAL" ~ "Cluster contains several blocks but no clearly dominant high-scoring block.",
+          audit_flag == "CLUSTER_STRONG_WITHOUT_STRONG_BLOCKS" ~ "Cluster has priority score but no scored LD block support.",
+          audit_flag == "CLUSTER_DOMINATED_BY_ONE_BLOCK" ~ "Cluster priority is mainly driven by one LD block.",
+          audit_flag == "MULTI_BLOCK_DIFFUSE_SIGNAL" ~ "Cluster signal is distributed across multiple weak blocks.",
           TRUE ~ "Cluster-level and block-level signals are broadly coherent."
         )
-      ) %>%
-      dplyr::arrange(dplyr::desc(cluster_score), cluster_id)
+      )
   })
   
   # ============================================================
@@ -13713,96 +15872,36 @@ function(data, row, column, node){
         audit_comment
       )
     
-    hit_summary <- if (is.data.frame(gha) && nrow(gha) > 0) {
+    hit_summary <- {
+      gha_audit <- tryCatch(gene_hit_audit_df(), error = function(e) NULL)
       
-      find_col <- function(cands) {
-        hit <- intersect(cands, names(gha))
-        if (length(hit)) hit[1] else NULL
-      }
-      
-      gene_col <- find_col(c("gene", "gene_name"))
-      gwas_col <- find_col(c("gwas_hit", "id_hit", "matched_ids"))
-      cluster_col <- find_col(c("cluster_id"))
-      block_col <- find_col(c("block_id"))
-      gwas_score_col <- find_col(c("gwas_hit_priority_score", "gwas_hit_score", "priority_score"))
-      gene_component_col <- find_col(c("gene_score_component", "score_component"))
-      app_col <- find_col(c("source_app", "score_app"))
-      link_col <- find_col(c("link_state"))
-      
-      validate(
-        need(!is.null(gene_col), "gene column not available in gene_gwas_hit_score_audit_df()."),
-        need(!is.null(gwas_col), "gwas_hit column not available in gene_gwas_hit_score_audit_df()."),
-        need(!is.null(cluster_col), "cluster_id column not available in gene_gwas_hit_score_audit_df()."),
-        need(!is.null(gwas_score_col), paste0(
-          "No usable GWAS-hit score column found in gene_gwas_hit_score_audit_df(). Available columns: ",
-          paste(names(gha), collapse = ", ")
-        )),
-        need(!is.null(gene_component_col), paste0(
-          "No usable gene-score component column found in gene_gwas_hit_score_audit_df(). Available columns: ",
-          paste(names(gha), collapse = ", ")
-        ))
-      )
-      
-      gha %>%
-        dplyr::transmute(
-          cluster_id = as.character(.data[[cluster_col]]),
-          block_id = if (!is.null(block_col)) as.character(.data[[block_col]]) else "",
-          gene = as.character(.data[[gene_col]]),
-          gwas_hit = as.character(.data[[gwas_col]]),
-          gene_score_component = dplyr::coalesce(as.numeric(.data[[gene_component_col]]), 0),
-          gwas_hit_priority_score = dplyr::coalesce(as.numeric(.data[[gwas_score_col]]), 0),
-          source_app = if (!is.null(app_col)) as.character(.data[[app_col]]) else "",
-          link_state = if (!is.null(link_col)) as.character(.data[[link_col]]) else ""
-        ) %>%
-        dplyr::mutate(
-          cluster_id = trimws(cluster_id),
-          block_id = trimws(block_id),
-          gene = trimws(gene),
-          gwas_hit = trimws(gwas_hit),
-          source_app = trimws(source_app),
-          link_state = trimws(link_state),
-          hit_support_score = gene_score_component * gwas_hit_priority_score
-        ) %>%
-        dplyr::filter(
-          !is.na(cluster_id), nzchar(cluster_id),
-          !is.na(gene), nzchar(gene),
-          !is.na(gwas_hit), nzchar(gwas_hit)
-        ) %>%
-        dplyr::mutate(
-          audit_flag = dplyr::case_when(
-            hit_support_score >= 10 & gwas_hit_priority_score < 4 ~ "HIT_SUPPORT_HIGH_WITH_WEAK_GWAS",
-            hit_support_score <= 1 & gwas_hit_priority_score >= 10 ~ "GWAS_STRONG_WITH_WEAK_HIT_SUPPORT",
-            TRUE ~ "CONSISTENT"
-          ),
-          audit_comment = dplyr::case_when(
-            audit_flag == "HIT_SUPPORT_HIGH_WITH_WEAK_GWAS" ~ "Hit-level support is high relative to the underlying GWAS-hit priority score.",
-            audit_flag == "GWAS_STRONG_WITH_WEAK_HIT_SUPPORT" ~ "Strong GWAS-hit priority but weak contribution to the gene support score.",
-            TRUE ~ "Gene-hit contribution is broadly coherent."
-          ),
-          entity_id = paste0(gene, " ← ", gwas_hit)
-        ) %>%
-        dplyr::transmute(
-          entity_type = "hit",
-          cluster_id,
-          block_id,
-          entity_id,
-          entity_score = round(hit_support_score, 2),
-          supporting_score = round(gwas_hit_priority_score, 2),
-          audit_flag,
-          audit_comment
+      if (is.data.frame(gha_audit) && nrow(gha_audit) > 0) {
+        gha_audit %>%
+          dplyr::mutate(
+            entity_id = paste0(gene, " ← ", support_unit_label, " ← ", gwas_hit)
+          ) %>%
+          dplyr::transmute(
+            entity_type = "hit",
+            cluster_id,
+            block_id,
+            entity_id,
+            entity_score = round(dplyr::coalesce(as.numeric(gene_score_contribution), 0), 2),
+            supporting_score = round(dplyr::coalesce(as.numeric(unit_gene_score), 0), 2),
+            audit_flag,
+            audit_comment
+          )
+      } else {
+        tibble::tibble(
+          entity_type = character(),
+          cluster_id = character(),
+          block_id = character(),
+          entity_id = character(),
+          entity_score = numeric(),
+          supporting_score = numeric(),
+          audit_flag = character(),
+          audit_comment = character()
         )
-      
-    } else {
-      tibble::tibble(
-        entity_type = character(),
-        cluster_id = character(),
-        block_id = character(),
-        entity_id = character(),
-        entity_score = numeric(),
-        supporting_score = numeric(),
-        audit_flag = character(),
-        audit_comment = character()
-      )
+      }
     }
     
     dplyr::bind_rows(
@@ -13921,39 +16020,154 @@ function(data, row, column, node){
   # audit block - gene
   
   output$block_gene_audit_dt <- DT::renderDT({
-    df <- block_gene_audit_df()
+    bg  <- block_gene_audit_df()
+    gha <- tryCatch(gene_hit_audit_df(), error = function(e) NULL)
+    gen <- tryCatch(prioritized_gene_df_v2(), error = function(e) NULL)
     
     validate(
-      need(is.data.frame(df) && nrow(df) > 0, "No block-gene audit available.")
+      need(is.data.frame(bg) && nrow(bg) > 0, "No block-gene audit available.")
     )
     
-    show_df <- df %>%
+    block_gene_long <- bg %>%
+      dplyr::transmute(
+        cluster_id = as.character(cluster_id),
+        block_id = as.character(block_id),
+        block_score = dplyr::coalesce(as.numeric(block_score), 0),
+        top_gwas_hit_score = dplyr::coalesce(as.numeric(top_gwas_hit_score), 0),
+        n_gwas_hits = dplyr::coalesce(as.integer(n_gwas_hits), 0L),
+        genes_in_block = dplyr::coalesce(as.character(genes_in_block), ""),
+        audit_flag = dplyr::coalesce(as.character(audit_flag), "CONSISTENT"),
+        audit_comment = dplyr::coalesce(as.character(audit_comment), "")
+      ) %>%
+      tidyr::separate_rows(genes_in_block, sep = "\\s*;\\s*") %>%
+      dplyr::rename(gene = genes_in_block) %>%
       dplyr::mutate(
-        block_score = round(dplyr::coalesce(as.numeric(block_score), 0), 2),
-        block_score_from_hits = round(dplyr::coalesce(as.numeric(block_score_from_hits), 0), 2),
-        top_gwas_hit_score = round(dplyr::coalesce(as.numeric(top_gwas_hit_score), 0), 2),
-        top_gene_score_in_block = round(dplyr::coalesce(as.numeric(top_gene_score_in_block), 0), 2),
-        sum_gene_score_in_block = round(dplyr::coalesce(as.numeric(sum_gene_score_in_block), 0), 2),
-        block_gene_ratio = round(dplyr::coalesce(as.numeric(block_gene_ratio), 0), 2),
-        genes_in_block = make_genecards_links(genes_in_block),
-        top_gene_in_block = make_genecards_links(top_gene_in_block),
-        audit_flag_badge = make_priority_badge(audit_flag)
+        gene = trimws(as.character(gene))
+      ) %>%
+      dplyr::filter(!is.na(gene), nzchar(gene))
+    
+    gene_total_map <- if (is.data.frame(gen) && nrow(gen) > 0) {
+      gene_col <- intersect(c("gene", "gene_name"), names(gen))[1]
+      score_col <- intersect(c("gene_score", "priority_score", "score"), names(gen))[1]
+      class_col <- intersect(c("priority_class", "priority_class_relative"), names(gen))[1]
+      
+      gen %>%
+        dplyr::transmute(
+          gene = as.character(.data[[gene_col]]),
+          total_gene_score = dplyr::coalesce(as.numeric(.data[[score_col]]), 0),
+          gene_priority_class = if (!is.na(class_col)) as.character(.data[[class_col]]) else ""
+        ) %>%
+        dplyr::distinct(gene, .keep_all = TRUE)
+    } else {
+      tibble::tibble(
+        gene = character(),
+        total_gene_score = numeric(),
+        gene_priority_class = character()
+      )
+    }
+    
+    gene_block_support <- if (is.data.frame(gha) && nrow(gha) > 0) {
+      gha %>%
+        dplyr::transmute(
+          cluster_id = as.character(cluster_id),
+          block_id = as.character(block_id),
+          gene = as.character(gene),
+          gwas_hit = as.character(gwas_hit),
+          source_app = dplyr::coalesce(as.character(source_app), ""),
+          score_app = dplyr::coalesce(as.character(score_app), ""),
+          link_state = dplyr::coalesce(as.character(link_state), ""),
+          support_unit_label = dplyr::coalesce(as.character(support_unit_label), ""),
+          hit_support_score = dplyr::coalesce(as.numeric(hit_support_score), 0),
+          gene_score_contribution = dplyr::coalesce(as.numeric(gene_score_contribution), 0),
+          unit_gene_score = dplyr::coalesce(as.numeric(unit_gene_score), 0),
+          gwas_hit_priority_score = dplyr::coalesce(as.numeric(gwas_hit_priority_score), 0)
+        ) %>%
+        dplyr::filter(
+          !is.na(cluster_id), nzchar(cluster_id),
+          !is.na(block_id), nzchar(block_id),
+          !is.na(gene), nzchar(gene)
+        ) %>%
+        dplyr::group_by(cluster_id, block_id, gene) %>%
+        dplyr::summarise(
+          gene_score_in_block = sum(gene_score_contribution, na.rm = TRUE),
+          raw_support_in_block = sum(hit_support_score, na.rm = TRUE),
+          top_unit_gene_score = max(unit_gene_score, na.rm = TRUE),
+          top_gwas_hit_score_for_gene = max(gwas_hit_priority_score, na.rm = TRUE),
+          n_linked_hits = dplyr::n_distinct(gwas_hit),
+          linked_gwas_hits = paste(sort(unique(gwas_hit[nzchar(gwas_hit)])), collapse = "; "),
+          source_apps = paste(sort(unique(source_app[nzchar(source_app)])), collapse = "; "),
+          score_apps = paste(sort(unique(score_app[nzchar(score_app)])), collapse = "; "),
+          link_states = paste(sort(unique(link_state[nzchar(link_state)])), collapse = "; "),
+          support_units = paste(sort(unique(support_unit_label[nzchar(support_unit_label)])), collapse = "; "),
+          .groups = "drop"
+        ) %>%
+        dplyr::mutate(
+          top_unit_gene_score = dplyr::if_else(is.finite(top_unit_gene_score), top_unit_gene_score, 0),
+          top_gwas_hit_score_for_gene = dplyr::if_else(is.finite(top_gwas_hit_score_for_gene), top_gwas_hit_score_for_gene, 0)
+        )
+    } else {
+      tibble::tibble(
+        cluster_id = character(),
+        block_id = character(),
+        gene = character(),
+        gene_score_in_block = numeric(),
+        raw_support_in_block = numeric(),
+        top_unit_gene_score = numeric(),
+        top_gwas_hit_score_for_gene = numeric(),
+        n_linked_hits = integer(),
+        linked_gwas_hits = character(),
+        source_apps = character(),
+        score_apps = character(),
+        link_states = character(),
+        support_units = character()
+      )
+    }
+    
+    show_df <- block_gene_long %>%
+      dplyr::left_join(gene_block_support, by = c("cluster_id", "block_id", "gene")) %>%
+      dplyr::left_join(gene_total_map, by = "gene") %>%
+      dplyr::mutate(
+        gene_score_in_block = round(dplyr::coalesce(as.numeric(gene_score_in_block), 0), 2),
+        raw_support_in_block = round(dplyr::coalesce(as.numeric(raw_support_in_block), 0), 2),
+        top_unit_gene_score = round(dplyr::coalesce(as.numeric(top_unit_gene_score), 0), 2),
+        total_gene_score = round(dplyr::coalesce(as.numeric(total_gene_score), 0), 2),
+        top_gwas_hit_score_for_gene = round(dplyr::coalesce(as.numeric(top_gwas_hit_score_for_gene), 0), 2),
+        n_linked_hits = dplyr::coalesce(as.integer(n_linked_hits), 0L),
+        linked_gwas_hits = dplyr::coalesce(as.character(linked_gwas_hits), ""),
+        source_apps = dplyr::coalesce(as.character(source_apps), ""),
+        score_apps = dplyr::coalesce(as.character(score_apps), ""),
+        link_states = dplyr::coalesce(as.character(link_states), ""),
+        support_units = dplyr::coalesce(as.character(support_units), ""),
+        gene_priority_class = dplyr::coalesce(as.character(gene_priority_class), ""),
+        audit_flag_badge = make_priority_badge(audit_flag),
+        gene = make_genecards_links(gene)
       ) %>%
       dplyr::select(
         cluster_id,
         block_id,
+        gene,
+        gene_score_in_block,
+        total_gene_score,
+        gene_priority_class,
+        n_linked_hits,
+        linked_gwas_hits,
+        source_apps,
+        score_apps,
+        link_states,
+        support_units,
+        raw_support_in_block,
+        top_unit_gene_score,
+        top_gwas_hit_score_for_gene,
         block_score,
-        top_gwas_hit_score,
         n_gwas_hits,
-        n_genes_in_block,
-        n_prioritized_genes_in_block,
-        top_gene_in_block,
-        top_gene_score_in_block,
-        sum_gene_score_in_block,
-        block_gene_ratio,
         audit_flag = audit_flag_badge,
-        audit_comment,
-        genes_in_block
+        audit_comment
+      ) %>%
+      dplyr::arrange(
+        cluster_id,
+        block_id,
+        dplyr::desc(gene_score_in_block),
+        dplyr::desc(total_gene_score)
       )
     
     DT::datatable(
@@ -13962,11 +16176,12 @@ function(data, row, column, node){
       escape = FALSE,
       filter = "top",
       extensions = "Buttons",
-      options = list(
-        scrollX = TRUE,
-        pageLength = 10,
-        dom = "Bfrtip",
-        buttons = list("copyHtml5", "csvHtml5", "excelHtml5")
+      options = modifyList(
+        dt_buttons_all(),
+        list(
+          scrollX = TRUE,
+          pageLength = 20
+        )
       )
     )
   }, server = FALSE)
@@ -13985,6 +16200,7 @@ function(data, row, column, node){
     
     gene_col <- find_col(c("gene", "gene_name"))
     gwas_col <- find_col(c("gwas_hit", "id_hit", "matched_ids"))
+    gwas_pos_col <- find_col(c("gwas_pos", "pos", "BP", "position"))
     cluster_col <- find_col(c("cluster_id"))
     block_col <- find_col(c("block_id"))
     gwas_score_col <- find_col(c(
@@ -13996,7 +16212,8 @@ function(data, row, column, node){
       "gene_score_component",
       "score_component"
     ))
-    app_col <- find_col(c("source_app", "score_app"))
+    source_app_col <- find_col(c("source_app"))
+    score_app_col <- find_col(c("score_app"))
     link_col <- find_col(c("link_state"))
     
     validate(
@@ -14019,49 +16236,80 @@ function(data, row, column, node){
         block_id = if (!is.null(block_col)) as.character(.data[[block_col]]) else "",
         gene = as.character(.data[[gene_col]]),
         gwas_hit = as.character(.data[[gwas_col]]),
+        gwas_pos = if (!is.null(gwas_pos_col)) suppressWarnings(as.numeric(.data[[gwas_pos_col]])) else NA_real_,
         gene_score_component = dplyr::coalesce(as.numeric(.data[[gene_component_col]]), 0),
         gwas_hit_priority_score = dplyr::coalesce(as.numeric(.data[[gwas_score_col]]), 0),
-        source_app = if (!is.null(app_col)) as.character(.data[[app_col]]) else "",
+        source_app = if (!is.null(source_app_col)) as.character(.data[[source_app_col]]) else "",
+        score_app = if (!is.null(score_app_col)) as.character(.data[[score_app_col]]) else "",
         link_state = if (!is.null(link_col)) as.character(.data[[link_col]]) else ""
       ) %>%
       dplyr::mutate(
         cluster_id = trimws(cluster_id),
-        block_id = trimws(block_id),
+        block_id = trimws(dplyr::coalesce(block_id, "")),
         gene = trimws(gene),
         gwas_hit = trimws(gwas_hit),
         source_app = trimws(source_app),
-        link_state = trimws(link_state)
+        score_app = trimws(score_app),
+        link_state = trimws(link_state),
+        hit_support_score = gene_score_component * gwas_hit_priority_score,
+        
+        support_unit_key = dplyr::case_when(
+          nzchar(block_id) ~ paste(cluster_id, block_id, sep = "||"),
+          nzchar(gwas_hit) ~ paste(cluster_id, "NO_BLOCK", gwas_hit, gwas_pos, sep = "||"),
+          TRUE ~ paste(cluster_id, "NO_BLOCK", dplyr::row_number(), sep = "||")
+        ),
+        support_unit_label = dplyr::case_when(
+          nzchar(block_id) ~ block_id,
+          nzchar(gwas_hit) ~ paste0("NO_BLOCK:", gwas_hit),
+          TRUE ~ "NO_BLOCK"
+        )
       ) %>%
       dplyr::filter(
         !is.na(cluster_id), nzchar(cluster_id),
         !is.na(gene), nzchar(gene),
         !is.na(gwas_hit), nzchar(gwas_hit)
       ) %>%
+      dplyr::group_by(cluster_id, gene, support_unit_key) %>%
+      dplyr::arrange(
+        dplyr::desc(hit_support_score),
+        dplyr::desc(gwas_hit_priority_score),
+        gwas_hit,
+        .by_group = TRUE
+      ) %>%
       dplyr::mutate(
-        hit_support_score = gene_score_component * gwas_hit_priority_score,
+        support_rank = dplyr::row_number(),
+        contribution_weight = dplyr::if_else(support_rank == 1L, 1, 0.05),
+        gene_score_contribution = hit_support_score * contribution_weight,
+        unit_gene_score = sum(gene_score_contribution, na.rm = TRUE),
+        unit_raw_support_score = sum(hit_support_score, na.rm = TRUE),
         hit_vs_gwas_ratio = dplyr::if_else(
           is.finite(gwas_hit_priority_score) & gwas_hit_priority_score > 0,
-          hit_support_score / gwas_hit_priority_score,
+          gene_score_contribution / gwas_hit_priority_score,
           NA_real_
-        ),
+        )
+      ) %>%
+      dplyr::ungroup() %>%
+      dplyr::mutate(
         audit_flag = dplyr::case_when(
-          hit_support_score >= 10 & gwas_hit_priority_score < 4 ~ "HIT_SUPPORT_HIGH_WITH_WEAK_GWAS",
-          hit_support_score <= 1 & gwas_hit_priority_score >= 10 ~ "GWAS_STRONG_WITH_WEAK_HIT_SUPPORT",
+          gene_score_contribution >= 10 & gwas_hit_priority_score < 4 ~ "HIT_SUPPORT_HIGH_WITH_WEAK_GWAS",
+          gene_score_contribution <= 1 & gwas_hit_priority_score >= 10 ~ "GWAS_STRONG_WITH_WEAK_HIT_SUPPORT",
           link_state %in% c("NOHIT", "NOLINK") ~ "LINK_STATE_REVIEW",
           TRUE ~ "CONSISTENT"
         ),
         audit_comment = dplyr::case_when(
-          audit_flag == "HIT_SUPPORT_HIGH_WITH_WEAK_GWAS" ~ "Hit-level support is high relative to the GWAS-hit priority score.",
-          audit_flag == "GWAS_STRONG_WITH_WEAK_HIT_SUPPORT" ~ "Strong GWAS-hit priority but weak contribution to the gene support score.",
+          audit_flag == "HIT_SUPPORT_HIGH_WITH_WEAK_GWAS" ~ "Weighted gene-score contribution is high relative to the GWAS-hit priority score.",
+          audit_flag == "GWAS_STRONG_WITH_WEAK_HIT_SUPPORT" ~ "Strong GWAS-hit priority but weak weighted contribution to the gene score.",
           audit_flag == "LINK_STATE_REVIEW" ~ "The gene-hit contribution should be reviewed in light of the link state.",
-          TRUE ~ "Gene-hit contribution is broadly coherent."
+          TRUE ~ "Gene-hit contribution is broadly coherent under the block-centric support-unit model."
         )
       ) %>%
       dplyr::arrange(
+        dplyr::desc(gene_score_contribution),
         dplyr::desc(hit_support_score),
         dplyr::desc(gwas_hit_priority_score),
         cluster_id,
         gene,
+        support_unit_key,
         gwas_hit
       )
   })
@@ -14076,10 +16324,17 @@ function(data, row, column, node){
     show_df <- df %>%
       dplyr::mutate(
         hit_support_score = round(dplyr::coalesce(as.numeric(hit_support_score), 0), 2),
+        gene_score_contribution = round(dplyr::coalesce(as.numeric(gene_score_contribution), 0), 2),
+        unit_gene_score = round(dplyr::coalesce(as.numeric(unit_gene_score), 0), 2),
+        unit_raw_support_score = round(dplyr::coalesce(as.numeric(unit_raw_support_score), 0), 2),
         gwas_hit_priority_score = round(dplyr::coalesce(as.numeric(gwas_hit_priority_score), 0), 2),
         hit_vs_gwas_ratio = round(dplyr::coalesce(as.numeric(hit_vs_gwas_ratio), 0), 2),
+        support_rank = dplyr::coalesce(as.integer(support_rank), 0L),
+        contribution_weight = round(dplyr::coalesce(as.numeric(contribution_weight), 0), 2),
         source_app = dplyr::coalesce(as.character(source_app), ""),
+        score_app = dplyr::coalesce(as.character(score_app), ""),
         link_state = dplyr::coalesce(as.character(link_state), ""),
+        support_unit_label = dplyr::coalesce(as.character(support_unit_label), ""),
         audit_comment = dplyr::coalesce(as.character(audit_comment), ""),
         audit_flag_badge = make_priority_badge(audit_flag),
         gene = make_genecards_links(gene)
@@ -14087,15 +16342,23 @@ function(data, row, column, node){
       dplyr::select(
         cluster_id,
         block_id,
+        support_unit_label,
         gene,
         gwas_hit,
         source_app,
+        score_app,
         link_state,
+        support_rank,
+        contribution_weight,
+        gene_score_contribution,
+        unit_gene_score,
         hit_support_score,
+        unit_raw_support_score,
         gwas_hit_priority_score,
         hit_vs_gwas_ratio,
         audit_flag = audit_flag_badge,
-        audit_comment
+        audit_comment,
+        support_unit_key
       )
     
     DT::datatable(
@@ -14104,11 +16367,15 @@ function(data, row, column, node){
       escape = FALSE,
       filter = "top",
       extensions = "Buttons",
-      options = list(
-        scrollX = TRUE,
-        pageLength = 10,
-        dom = "Bfrtip",
-        buttons = list("copyHtml5", "csvHtml5", "excelHtml5")
+      options = modifyList(
+        dt_buttons_all(),
+        list(
+          scrollX = TRUE,
+          pageLength = 10,
+          columnDefs = list(
+            list(visible = FALSE, targets = which(names(show_df) == "support_unit_key") - 1L)
+          )
+        )
       )
     )
   }, server = FALSE)
@@ -14336,11 +16603,48 @@ function(data, row, column, node){
       )
   })
   
+  observe({
+    cl <- prioritized_cluster_df_v2()
+    
+    if (!is.data.frame(cl) || !nrow(cl) || !"cluster_id" %in% names(cl)) {
+      updateSelectInput(
+        session,
+        "priority_audit_sankey_cluster_filter",
+        choices = "All",
+        selected = "All"
+      )
+      return()
+    }
+    
+    choices <- c("All", sort(unique(as.character(cl$cluster_id))))
+    current <- isolate(input$priority_audit_sankey_cluster_filter)
+    
+    if (is.null(current) || !nzchar(current) || !current %in% choices) {
+      current <- "All"
+    }
+    
+    updateSelectInput(
+      session,
+      "priority_audit_sankey_cluster_filter",
+      choices = choices,
+      selected = current
+    )
+  })
+  
   priority_audit_sankey_data <- reactive({
     cl  <- prioritized_cluster_df_v2()
     blk <- prioritized_block_df_v2()
     gen <- prioritized_gene_audit_base_df()
     gha <- gene_hit_audit_df()
+   
+    selected_cluster <- input$priority_audit_sankey_cluster_filter %||% "All"
+    
+    if (!identical(selected_cluster, "All")) {
+      cl <- cl %>% dplyr::filter(as.character(cluster_id) == selected_cluster)
+      blk <- blk %>% dplyr::filter(as.character(cluster_id) == selected_cluster)
+      gen <- gen %>% dplyr::filter(as.character(cluster_id) == selected_cluster)
+      gha <- gha %>% dplyr::filter(as.character(cluster_id) == selected_cluster)
+    }
     
     validate(
       need(is.data.frame(cl) && nrow(cl) > 0, "No prioritized clusters available for Sankey."),
@@ -14404,8 +16708,10 @@ function(data, row, column, node){
     
     # ------------------------------------------------------------
     # 3) Block -> Gene
+    # Inclou gens de genes_in_block + gens amb suport real a gene_hit_audit_df()
     # ------------------------------------------------------------
-    block_gene_candidates <- block_edges %>%
+    
+    block_gene_from_blocks <- block_edges %>%
       dplyr::select(cluster_id, block_id, genes_in_block) %>%
       tidyr::separate_rows(genes_in_block, sep = "\\s*;\\s*") %>%
       dplyr::rename(gene = genes_in_block) %>%
@@ -14414,7 +16720,32 @@ function(data, row, column, node){
       ) %>%
       dplyr::filter(!is.na(gene), nzchar(gene))
     
-    block_gene_edges <- block_gene_candidates %>%
+    block_gene_from_hits <- gha %>%
+      dplyr::transmute(
+        cluster_id = as.character(cluster_id),
+        block_id = dplyr::coalesce(as.character(block_id), as.character(support_unit_label), ""),
+        gene = as.character(gene),
+        hit_gene_score = dplyr::coalesce(as.numeric(gene_score_contribution), 0)
+      ) %>%
+      dplyr::filter(
+        !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(block_id), nzchar(block_id),
+        !is.na(gene), nzchar(gene),
+        is.finite(hit_gene_score),
+        hit_gene_score > 0
+      ) %>%
+      dplyr::semi_join(
+        block_edges %>% dplyr::select(cluster_id, block_id) %>% dplyr::distinct(),
+        by = c("cluster_id", "block_id")
+      ) %>%
+      dplyr::distinct(cluster_id, block_id, gene, .keep_all = TRUE)
+    
+    block_gene_edges <- dplyr::bind_rows(
+      block_gene_from_blocks %>%
+        dplyr::mutate(hit_gene_score = 0),
+      block_gene_from_hits
+    ) %>%
+      dplyr::distinct(cluster_id, block_id, gene, .keep_all = TRUE) %>%
       dplyr::left_join(
         gen %>%
           dplyr::transmute(
@@ -14425,10 +16756,15 @@ function(data, row, column, node){
         by = c("cluster_id", "gene")
       ) %>%
       dplyr::mutate(
-        gene_score = dplyr::coalesce(gene_score, 0)
+        gene_score = dplyr::coalesce(gene_score, hit_gene_score, 0)
       ) %>%
       dplyr::group_by(cluster_id, block_id) %>%
-      dplyr::arrange(dplyr::desc(gene_score), gene, .by_group = TRUE)
+      dplyr::arrange(
+        dplyr::desc(hit_gene_score),
+        dplyr::desc(gene_score),
+        gene,
+        .by_group = TRUE
+      )
     
     if (is.finite(top_n_genes_per_block)) {
       block_gene_edges <- block_gene_edges %>% dplyr::slice_head(n = top_n_genes_per_block)
@@ -14436,7 +16772,6 @@ function(data, row, column, node){
     
     block_gene_edges <- block_gene_edges %>%
       dplyr::ungroup() %>%
-      dplyr::filter(gene_score > 0) %>%
       dplyr::distinct(cluster_id, block_id, gene, .keep_all = TRUE)
     
     validate(
@@ -14446,27 +16781,40 @@ function(data, row, column, node){
     # ------------------------------------------------------------
     # 4) Gene -> Hit
     # ------------------------------------------------------------
+    
     gene_hit_edges <- gha %>%
       dplyr::transmute(
         cluster_id = as.character(cluster_id),
-        block_id = dplyr::coalesce(as.character(block_id), ""),
+        block_id = dplyr::coalesce(as.character(block_id), as.character(support_unit_label), ""),
+        support_unit_key = dplyr::coalesce(as.character(support_unit_key), ""),
+        support_unit_label = dplyr::coalesce(as.character(support_unit_label), ""),
         gene = as.character(gene),
         gwas_hit = as.character(gwas_hit),
         hit_support_score = dplyr::coalesce(as.numeric(hit_support_score), 0),
-        gwas_hit_priority_score = dplyr::coalesce(as.numeric(gwas_hit_priority_score), 0)
+        gene_score_contribution = dplyr::coalesce(as.numeric(gene_score_contribution), 0),
+        unit_gene_score = dplyr::coalesce(as.numeric(unit_gene_score), 0),
+        gwas_hit_priority_score = dplyr::coalesce(as.numeric(gwas_hit_priority_score), 0),
+        support_rank = dplyr::coalesce(as.integer(support_rank), 0L),
+        contribution_weight = dplyr::coalesce(as.numeric(contribution_weight), 0),
+        sankey_hit_value = dplyr::coalesce(as.numeric(gwas_hit_priority_score), 0)
       ) %>%
       dplyr::filter(
         !is.na(cluster_id), nzchar(cluster_id),
+        !is.na(block_id), nzchar(block_id),
         !is.na(gene), nzchar(gene),
         !is.na(gwas_hit), nzchar(gwas_hit),
-        is.finite(hit_support_score), hit_support_score > 0
+        is.finite(gene_score_contribution),
+        gene_score_contribution > 0
       ) %>%
       dplyr::semi_join(
-        block_gene_edges %>% dplyr::select(cluster_id, gene) %>% dplyr::distinct(),
-        by = c("cluster_id", "gene")
+        block_gene_edges %>%
+          dplyr::select(cluster_id, block_id, gene) %>%
+          dplyr::distinct(),
+        by = c("cluster_id", "block_id", "gene")
       ) %>%
-      dplyr::group_by(cluster_id, gene) %>%
+      dplyr::group_by(cluster_id, block_id, gene) %>%
       dplyr::arrange(
+        dplyr::desc(gene_score_contribution),
         dplyr::desc(hit_support_score),
         dplyr::desc(gwas_hit_priority_score),
         gwas_hit,
@@ -14479,11 +16827,24 @@ function(data, row, column, node){
     
     gene_hit_edges <- gene_hit_edges %>%
       dplyr::ungroup() %>%
-      dplyr::distinct(cluster_id, gene, gwas_hit, .keep_all = TRUE)
-    
-    validate(
-      need(nrow(gene_hit_edges) > 0, "No gene → hit relationships available for Sankey.")
-    )
+      dplyr::group_by(cluster_id, block_id, gene, gwas_hit) %>%
+      dplyr::summarise(
+        support_unit_key = dplyr::first(support_unit_key),
+        support_unit_label = dplyr::first(support_unit_label),
+        hit_support_score = max(hit_support_score, na.rm = TRUE),
+        gene_score_contribution = max(gene_score_contribution, na.rm = TRUE),
+        unit_gene_score = max(unit_gene_score, na.rm = TRUE),
+        gwas_hit_priority_score = max(gwas_hit_priority_score, na.rm = TRUE),
+        sankey_hit_value = max(sankey_hit_value, na.rm = TRUE),
+        support_rank = min(support_rank, na.rm = TRUE),
+        contribution_weight = max(contribution_weight, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        support_unit_key = dplyr::coalesce(as.character(support_unit_key), paste0(block_id, "::", gene)),
+        support_unit_label = dplyr::coalesce(as.character(support_unit_label), block_id),
+        sankey_hit_value = dplyr::coalesce(as.numeric(sankey_hit_value), 0)
+      )
     
     # ------------------------------------------------------------
     # 5) Lookup block per cluster + gene
@@ -14554,26 +16915,28 @@ function(data, row, column, node){
       dplyr::arrange(cluster_id, block_id, dplyr::desc(node_score), gene)
     
     hit_nodes <- gene_hit_edges %>%
-      dplyr::left_join(
-        gene_block_lookup,
-        by = c("cluster_id", "gene")
-      ) %>%
-      dplyr::filter(!is.na(block_id_final), nzchar(block_id_final)) %>%
+      dplyr::filter(!is.na(block_id), nzchar(block_id)) %>%
       dplyr::transmute(
         cluster_id = cluster_id,
-        block_id = block_id_final,
+        block_id = block_id,
         gene = gene,
         gwas_hit = gwas_hit,
-        node_key = paste0("hit::", cluster_id, "::", block_id_final, "::", gene, "::", gwas_hit),
+        support_unit_key = support_unit_key,
+        node_key = paste0("hit::", cluster_id, "::", block_id, "::", gene, "::", support_unit_key, "::", gwas_hit),
         label = paste0(gwas_hit, " [H]"),
         node_type = "GWAS hit",
         node_name = gwas_hit,
-        node_score = round(hit_support_score, 2),
+        node_score = round(gene_score_contribution, 2),
         node_extra = paste0(
           "Cluster: ", cluster_id,
-          "<br>Block: ", block_id_final,
+          "<br>Block: ", block_id,
           "<br>Gene: ", gene,
-          "<br>Hit support score: ", round(hit_support_score, 2),
+          "<br>Support unit: ", support_unit_label,
+          "<br>Support rank: ", support_rank,
+          "<br>Contribution weight: ", contribution_weight,
+          "<br>Gene-score contribution: ", round(gene_score_contribution, 2),
+          "<br>Unit gene score: ", round(unit_gene_score, 2),
+          "<br>Raw hit support score: ", round(hit_support_score, 2),
           "<br>GWAS-hit priority score: ", round(gwas_hit_priority_score, 2)
         )
       ) %>%
@@ -14594,8 +16957,21 @@ function(data, row, column, node){
     )
     
     # ------------------------------------------------------------
-    # 7) Hierarchical fixed node layout
+    # 7) Manual-like hierarchical fixed layout
+    # Cluster band → ordered blocks → genes close to block → hits outside
     # ------------------------------------------------------------
+    
+    nodes <- nodes %>%
+      dplyr::mutate(
+        x_pos = dplyr::case_when(
+          node_type == "Cluster" ~ 0.05,
+          node_type == "Block" ~ 0.30,
+          node_type == "Gene" ~ 0.58,
+          node_type == "GWAS hit" ~ 0.90,
+          TRUE ~ 0.50
+        ),
+        y_pos = NA_real_
+      )
     
     scale_positions <- function(n, y_min, y_max) {
       if (n <= 0) return(numeric(0))
@@ -14603,177 +16979,230 @@ function(data, row, column, node){
       seq(y_min, y_max, length.out = n)
     }
     
-    # x fixed by level
-    nodes <- nodes %>%
+    block_number <- function(x) {
+      suppressWarnings(as.numeric(stringr::str_extract(as.character(x), "(?<=_B)[0-9]+$")))
+    }
+    
+    cluster_order <- cluster_nodes %>%
+      dplyr::arrange(dplyr::desc(node_score), cluster_id) %>%
+      dplyr::pull(cluster_id) %>%
+      unique()
+    
+    cluster_edges_n <- block_edges %>%
+      dplyr::count(cluster_id, name = "n_blocks") %>%
+      dplyr::right_join(
+        tibble::tibble(cluster_id = cluster_order),
+        by = "cluster_id"
+      ) %>%
       dplyr::mutate(
-        x_pos = dplyr::case_when(
-          node_type == "Cluster" ~ 0.05,
-          node_type == "Block" ~ 0.32,
-          node_type == "Gene" ~ 0.60,
-          node_type == "GWAS hit" ~ 0.88,
-          TRUE ~ 0.50
-        ),
-        y_pos = NA_real_
+        n_blocks = dplyr::coalesce(n_blocks, 1L),
+        weight = pmax(n_blocks, 3)
       )
     
-    # ------------------------------------------------------------
-    # 7.1 clusters
-    # ------------------------------------------------------------
-    cluster_order <- cluster_nodes %>%
-      dplyr::distinct(cluster_id) %>%
-      dplyr::pull(cluster_id)
+    total_weight <- sum(cluster_edges_n$weight, na.rm = TRUE)
+    gap <- 0.035
+    usable <- 0.86 - gap * max(0, nrow(cluster_edges_n) - 1)
     
-    cluster_y <- stats::setNames(
-      scale_positions(length(cluster_order), 0.06, 0.94),
-      cluster_order
-    )
+    cluster_bands <- cluster_edges_n %>%
+      dplyr::mutate(
+        band_h = usable * weight / total_weight,
+        y_min = 0.07 + c(0, cumsum(head(band_h + gap, -1))),
+        y_max = y_min + band_h,
+        y_mid = (y_min + y_max) / 2
+      )
     
-    nodes$y_pos[nodes$node_type == "Cluster"] <- cluster_y[nodes$cluster_id[nodes$node_type == "Cluster"]]
+    # clusters
+    for (i in seq_len(nrow(cluster_bands))) {
+      cid <- cluster_bands$cluster_id[i]
+      nodes$y_pos[nodes$node_type == "Cluster" & nodes$cluster_id == cid] <- cluster_bands$y_mid[i]
+    }
     
-    # ------------------------------------------------------------
-    # 7.2 blocks within each cluster band
-    # ------------------------------------------------------------
-    cluster_half_span <- 0.055
-    
-    for (cid in cluster_order) {
-      y_c <- cluster_y[[cid]]
+    # blocks ordered B1, B2, ...
+    for (i in seq_len(nrow(cluster_bands))) {
+      cid <- cluster_bands$cluster_id[i]
+      ymin <- cluster_bands$y_min[i]
+      ymax <- cluster_bands$y_max[i]
       
       blk_sub <- block_nodes %>%
         dplyr::filter(cluster_id == cid) %>%
-        dplyr::arrange(dplyr::desc(node_score), block_id)
+        dplyr::mutate(.block_n = block_number(block_id)) %>%
+        dplyr::arrange(.block_n, block_id)
       
-      if (nrow(blk_sub) == 0) next
+      if (!nrow(blk_sub)) next
       
-      y_blk <- scale_positions(
-        nrow(blk_sub),
-        max(0.01, y_c - cluster_half_span),
-        min(0.99, y_c + cluster_half_span)
-      )
-      
+      y_blk <- scale_positions(nrow(blk_sub), ymin, ymax)
       idx <- match(blk_sub$node_key, nodes$node_key)
       nodes$y_pos[idx] <- y_blk
     }
     
-    # helper: lookup y of a node by key
-    node_y_lookup <- stats::setNames(nodes$y_pos, nodes$node_key)
-    
-    # ------------------------------------------------------------
-    # 7.3 genes within each block band
-    # ------------------------------------------------------------
-    block_half_span <- 0.030
-    
-    block_order_df <- block_nodes %>%
-      dplyr::select(cluster_id, block_id, node_key) %>%
-      dplyr::distinct()
-    
-    for (i in seq_len(nrow(block_order_df))) {
-      cid <- block_order_df$cluster_id[i]
-      bid <- block_order_df$block_id[i]
-      bkey <- block_order_df$node_key[i]
-      y_b <- node_y_lookup[[bkey]]
+    # genes centered around their own block
+    for (i in seq_len(nrow(block_nodes))) {
+      cid <- block_nodes$cluster_id[i]
+      bid <- block_nodes$block_id[i]
+      bkey <- block_nodes$node_key[i]
+      
+      y_b <- nodes$y_pos[match(bkey, nodes$node_key)]
+      if (!is.finite(y_b)) next
+      
+      band <- cluster_bands %>% dplyr::filter(cluster_id == cid)
+      if (!nrow(band)) next
       
       gene_sub <- gene_nodes %>%
         dplyr::filter(cluster_id == cid, block_id == bid) %>%
         dplyr::arrange(dplyr::desc(node_score), gene)
       
-      if (nrow(gene_sub) == 0) next
+      if (!nrow(gene_sub)) next
+      
+      local_span <- min(
+        0.035,
+        max(0.010, (band$y_max - band$y_min) / max(10, nrow(block_nodes %>% dplyr::filter(cluster_id == cid))))
+      )
       
       y_gene <- scale_positions(
         nrow(gene_sub),
-        max(0.01, y_b - block_half_span),
-        min(0.99, y_b + block_half_span)
+        max(band$y_min, y_b - local_span),
+        min(band$y_max, y_b + local_span)
       )
       
       idx <- match(gene_sub$node_key, nodes$node_key)
       nodes$y_pos[idx] <- y_gene
     }
     
-    node_y_lookup <- stats::setNames(nodes$y_pos, nodes$node_key)
-    
-    # ------------------------------------------------------------
-    # 7.4 hits within each gene band
-    # ------------------------------------------------------------
-    gene_half_span <- 0.018
-    
-    gene_order_df <- gene_nodes %>%
-      dplyr::select(cluster_id, block_id, gene, node_key) %>%
-      dplyr::distinct()
-    
-    for (i in seq_len(nrow(gene_order_df))) {
-      cid <- gene_order_df$cluster_id[i]
-      bid <- gene_order_df$block_id[i]
-      gid <- gene_order_df$gene[i]
-      gkey <- gene_order_df$node_key[i]
-      y_g <- node_y_lookup[[gkey]]
+    # hits centered around their own gene, slightly spread
+    for (i in seq_len(nrow(gene_nodes))) {
+      cid <- gene_nodes$cluster_id[i]
+      bid <- gene_nodes$block_id[i]
+      gid <- gene_nodes$gene[i]
+      gkey <- gene_nodes$node_key[i]
+      
+      y_g <- nodes$y_pos[match(gkey, nodes$node_key)]
+      if (!is.finite(y_g)) next
+      
+      band <- cluster_bands %>% dplyr::filter(cluster_id == cid)
+      if (!nrow(band)) next
       
       hit_sub <- hit_nodes %>%
         dplyr::filter(cluster_id == cid, block_id == bid, gene == gid) %>%
         dplyr::arrange(dplyr::desc(node_score), gwas_hit)
       
-      if (nrow(hit_sub) == 0) next
+      if (!nrow(hit_sub)) next
+      
+      hit_span <- min(0.025, max(0.010, (band$y_max - band$y_min) / 16))
       
       y_hit <- scale_positions(
         nrow(hit_sub),
-        max(0.01, y_g - gene_half_span),
-        min(0.99, y_g + gene_half_span)
+        max(band$y_min, y_g - hit_span),
+        min(band$y_max, y_g + hit_span)
       )
       
       idx <- match(hit_sub$node_key, nodes$node_key)
       nodes$y_pos[idx] <- y_hit
     }
     
+    nodes <- nodes %>%
+      dplyr::mutate(
+        y_pos = dplyr::coalesce(y_pos, 0.5),
+        y_pos = pmin(pmax(y_pos, 0.02), 0.98)
+      )
     # ------------------------------------------------------------
     # 8) Links
     # ------------------------------------------------------------
+    block_flow <- gene_hit_edges %>%
+      dplyr::group_by(cluster_id, block_id) %>%
+      dplyr::summarise(
+        flow_value = sum(sankey_hit_value, na.rm = TRUE),
+        .groups = "drop"
+      )
+    
     links_cb <- block_edges %>%
+      dplyr::left_join(block_flow, by = c("cluster_id", "block_id")) %>%
+      dplyr::mutate(
+        flow_value = dplyr::coalesce(flow_value, 0),
+        flow_value = dplyr::if_else(flow_value > 0, flow_value, 0.001)
+      ) %>%
       dplyr::transmute(
         source_key = paste0("cluster::", cluster_id),
         target_key = paste0("block::", cluster_id, "::", block_id),
-        value = pmax(block_score, 0.01),
+        value = flow_value,
         edge_type = "Cluster → Block",
         edge_info = paste0(
           "Cluster: ", cluster_id,
           "<br>Block: ", block_id,
-          "<br>Flow value: ", round(block_score, 2)
+          "<br>Propagated contribution: ", round(flow_value, 3)
         )
       )
     
+    gene_flow <- gene_hit_edges %>%
+      dplyr::group_by(cluster_id, block_id, gene) %>%
+      dplyr::summarise(
+        flow_value = sum(sankey_hit_value, na.rm = TRUE),
+        .groups = "drop"
+      )
+    
     links_bg <- block_gene_edges %>%
+      dplyr::left_join(gene_flow, by = c("cluster_id", "block_id", "gene")) %>%
+      dplyr::mutate(
+        flow_value = dplyr::coalesce(flow_value, 0),
+        flow_value = dplyr::if_else(flow_value > 0, flow_value, 0.001)
+      ) %>%
       dplyr::transmute(
         source_key = paste0("block::", cluster_id, "::", block_id),
         target_key = paste0("gene::", cluster_id, "::", block_id, "::", gene),
-        value = pmax(gene_score, 0.01),
+        value = flow_value,
         edge_type = "Block → Gene",
         edge_info = paste0(
           "Block: ", block_id,
           "<br>Gene: ", gene,
-          "<br>Flow value: ", round(gene_score, 2)
+          "<br>Propagated contribution: ", round(flow_value, 3)
         )
       )
     
     links_gh <- gene_hit_edges %>%
-      dplyr::left_join(
-        gene_block_lookup,
-        by = c("cluster_id", "gene")
-      ) %>%
-      dplyr::filter(!is.na(block_id_final), nzchar(block_id_final)) %>%
+      dplyr::filter(!is.na(block_id), nzchar(block_id)) %>%
       dplyr::transmute(
-        source_key = paste0("gene::", cluster_id, "::", block_id_final, "::", gene),
-        target_key = paste0("hit::", cluster_id, "::", block_id_final, "::", gene, "::", gwas_hit),
-        value = pmax(hit_support_score, 0.01),
+        source_key = paste0("gene::", cluster_id, "::", block_id, "::", gene),
+        target_key = paste0("hit::", cluster_id, "::", block_id, "::", gene, "::", support_unit_key, "::", gwas_hit),
+        value = pmax(sankey_hit_value, 0.001),
         edge_type = "Gene → Hit",
         edge_info = paste0(
           "Gene: ", gene,
           "<br>GWAS hit: ", gwas_hit,
-          "<br>Flow value: ", round(hit_support_score, 2)
+          "<br>Support unit: ", support_unit_label,
+          "<br>Weighted flow value: ", round(gene_score_contribution, 2),
+          "<br>Unit gene score: ", round(unit_gene_score, 2),
+          "<br>Raw hit support score: ", round(hit_support_score, 2)
         )
       )
     
-    links <- dplyr::bind_rows(
+  
+    extract_link_cluster <- function(x) {
+      x <- as.character(x)
+      
+      dplyr::case_when(
+        grepl("^cluster::", x) ~ sub("^cluster::([^:]+).*$", "\\1", x),
+        grepl("^block::", x)   ~ sub("^block::([^:]+)::.*$", "\\1", x),
+        grepl("^gene::", x)    ~ sub("^gene::([^:]+)::.*$", "\\1", x),
+        grepl("^hit::", x)     ~ sub("^hit::([^:]+)::.*$", "\\1", x),
+        TRUE ~ NA_character_
+      )
+    }
+    
+    links_raw <- dplyr::bind_rows(
       links_cb,
       links_bg,
       links_gh
     ) %>%
+      dplyr::mutate(
+        source_cluster_id = extract_link_cluster(source_key),
+        target_cluster_id = extract_link_cluster(target_key)
+      ) %>%
+      dplyr::filter(
+        !is.na(source_cluster_id),
+        !is.na(target_cluster_id),
+        source_cluster_id == target_cluster_id
+      )
+    
+    links <- links_raw %>%
       dplyr::left_join(
         nodes %>% dplyr::select(source_key = node_key, source = node_id),
         by = "source_key"
@@ -14815,9 +17244,12 @@ function(data, row, column, node){
     plotly::plot_ly(
       type = "sankey",
       orientation = "h",
+      arrangement = "fixed",
       node = list(
         label = node_labels,
-        pad = 14,
+        x = nodes$x_pos,
+        y = nodes$y_pos,
+        pad = 18,
         thickness = 14,
         line = list(color = "black", width = 0.3)
       ),
@@ -14872,7 +17304,8 @@ function(data, row, column, node){
     ) %>%
       plotly::layout(
         font = list(size = 11),
-        margin = list(l = 20, r = 20, t = 20, b = 20)
+       # margin = list(l = 20, r = 20, t = 20, b = 20)
+        margin = list(l = 40, r = 220, t = 60, b = 80)
       )
   })
   
@@ -16157,6 +18590,21 @@ function(data, row, column, node){
       )
   })
   
+  output$priority_audit_sankey_stats <- renderUI({
+    sank <- priority_audit_sankey_data()
+    nodes <- sank$nodes
+    links <- sank$links
+    
+    div(
+      style = "border:1px solid #ddd; border-radius:8px; padding:10px 14px; display:flex; gap:30px;",
+      tags$b(style = "color:#1f77b4;", paste0("Clusters: ", sum(nodes$node_type == "Cluster"))),
+      tags$b(style = "color:#ff7f0e;", paste0("Blocks: ", sum(nodes$node_type == "Block"))),
+      tags$b(style = "color:#2ca02c;", paste0("Genes: ", sum(nodes$node_type == "Gene"))),
+      tags$b(style = "color:#6a3d9a;", paste0("GWAS Hits: ", sum(nodes$node_type == "GWAS hit"))),
+      span(paste0("Total gene_score_contribution: ", round(sum(links$value, na.rm = TRUE), 2))),
+      span("ⓘ Widths proportional to gene_score_contribution")
+    )
+  })
   #############################################################
   
 }

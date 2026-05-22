@@ -42,33 +42,47 @@ chr_label_plink <- function(chr_num) {
 normalize_cluster_id <- function(x) {
   x <- as.character(x)
   x <- trimws(x)
-  x <- sub("^cluster_", "", x, ignore.case = TRUE)
   
+  x <- sub("^cluster_", "", x, ignore.case = TRUE)
+  x <- sub("^CHR", "chr", x, ignore.case = TRUE)
+  
+  # Casos tipus 3_1 -> chr3_1
   x <- ifelse(
     grepl("^[0-9XYM]+_[0-9]+$", x, ignore.case = TRUE),
     paste0("chr", x),
     x
   )
   
-  x <- sub("^CHR", "chr", x, ignore.case = TRUE)
   x <- sub("^chr23_", "chrX_", x, ignore.case = TRUE)
   x <- sub("^chr24_", "chrY_", x, ignore.case = TRUE)
   x <- sub("^chr26_", "chrMT_", x, ignore.case = TRUE)
+  
+  # Remapeig clau:
+  # chr3_1  -> 1
+  # chr11_4 -> 4
+  # chrX_2  -> 2
+  x <- ifelse(
+    grepl("^chr[0-9XYM]+_[0-9]+$", x, ignore.case = TRUE),
+    sub("^chr[0-9XYM]+_", "", x, ignore.case = TRUE),
+    x
+  )
   
   x
 }
 
 normalize_classe <- function(x) {
-  x <- trimws(as.character(x))
+  x0 <- trimws(as.character(x))
+  xl <- tolower(x0)
+  
   dplyr::case_when(
-    x %in% c("Catalog_hit", "catalog_hit") ~ "catalog_hit",
-    x %in% c("GTEx_hit", "gtex_hit") ~ "gtex_hit",
-    x %in% c("NonSyn_hit", "nonsyn_hit") ~ "nonsyn_hit",
-    x %in% c("EWASTum_hit", "ewastum_hit") ~ "ewastum_hit",
-    x %in% c("EWASDis_hit", "ewasdis_hit") ~ "ewasdis_hit",
-    x %in% c("LD_hit", "ld_hit") ~ "ld_hit",
-    x == "GWAS" ~ "GWAS",
-    TRUE ~ x
+    xl %in% c("catalog_hit", "catalog", "cataloghit") ~ "catalog_hit",
+    xl %in% c("gtex_hit", "gtex", "gtexhit", "eqtl_hit", "eqtl", "gtex_eqtl", "gtex_eqtl_hit") ~ "gtex_hit",
+    xl %in% c("nonsyn_hit", "nonsyn", "nonsynhit", "dbnsfp", "dbnsfp_hit") ~ "nonsyn_hit",
+    xl %in% c("ewastum_hit", "ewastum", "ewas_tumor", "tumor") ~ "ewastum_hit",
+    xl %in% c("ewasdis_hit", "ewasdis", "ewas_disease", "disease") ~ "ewasdis_hit",
+    xl %in% c("ld_hit", "ld") ~ "ld_hit",
+    xl == "gwas" ~ "GWAS",
+    TRUE ~ x0
   )
 }
 
@@ -1607,6 +1621,18 @@ compute_ld_bundle_common <- function(
   
   cand_sub <- select_candidates_for_cluster_common(candidates_df, cluster_row)
   
+  if (is.function(append_log)) {
+    append_log("[GTEX-CHECK] cand_sub n=", nrow(cand_sub))
+    append_log(
+      "[GTEX-CHECK] classes: ",
+      paste(names(table(cand_sub$classe)), as.integer(table(cand_sub$classe)), sep = "=", collapse = " | ")
+    )
+    append_log(
+      "[GTEX-CHECK] gtex_hit n=",
+      sum(cand_sub$classe == "gtex_hit", na.rm = TRUE)
+    )
+  }
+  
   thin_res <- thin_ld_subset_common(
     subset_prefix = subset_prefix,
     fl = fl,
@@ -1692,6 +1718,15 @@ compute_ld_bundle_common <- function(
   }
   
   proxy_tbl <- proxy_tbl %>%
+    dplyr::mutate(
+      cluster_id = as.character(cid),
+      chr = sub(
+        "^chr",
+        "",
+        trimws(as.character(cluster_row$chr[1])),
+        ignore.case = TRUE
+      )
+    ) %>%
     dplyr::filter(is.finite(ld_value), ld_value >= r2_min) %>%
     dplyr::arrange(query_hit, dplyr::desc(ld_value), proxy_pos, proxy_snp)
   
@@ -1706,7 +1741,12 @@ compute_ld_bundle_common <- function(
     blk_prefix <- file.path(workdir, paste0(ss$tag, "_blocks"))
     blk_args <- c(
       "--bfile", subset_prefix,
-      "--blocks", "no-pheno-req",
+      "--blocks", "no-pheno-req", "no-small-max-span",
+      "--blocks-inform-frac", "0.60",
+      "--blocks-max-kb", "1000",
+      "--blocks-min-maf", "0.05",
+      "--blocks-strong-highci", "0.90",
+      "--blocks-strong-lowci", "0.55",
       "--out", blk_prefix
     )
     
@@ -1810,12 +1850,348 @@ compute_ld_bundle_common <- function(
   )
 }
 
-# funcio integradora:
+# ------------------------------------------------------------------
+# funcio cque Global LD utilitzara per calcular
+# ------------------------------------------------------------------
+
+compute_ld_cluster_from_module_engine <- function(
+    cluster_row,
+    candidates_df,
+    gwas_bridge_df,
+    bfile_ref,
+    keep_path,
+    plink_bin,
+    workdir,
+    pop,
+    ld_metric = "R2",
+    r2_min = 0.6,
+    max_snps_interval = 800,
+    compute_blocks = TRUE,
+    x_mode = "bp",
+    append_log = NULL
+) {
+  
+  bundle <- compute_ld_bundle_common(
+    cluster_row = cluster_row,
+    candidates_df = candidates_df,
+    bfile_ref = bfile_ref,
+    keep_path = keep_path,
+    plink_bin = plink_bin,
+    workdir = workdir,
+    pop = pop,
+    ld_metric = ld_metric,
+    r2_min = r2_min,
+    max_snps_interval = max_snps_interval,
+    compute_blocks = compute_blocks,
+    append_log = append_log
+  )
+  
+  cl_for_rebuild <- tibble::tibble(
+    cluster_id = as.character(bundle$cluster_id),
+    chr = suppressWarnings(as.integer(bundle$chr)),
+    start = suppressWarnings(as.integer(bundle$start)),
+    end = suppressWarnings(as.integer(bundle$end))
+  )
+  
+  block_hits_for_summary <- rebuild_block_hits_from_components(
+    cl = cl_for_rebuild,
+    ca = if (is.data.frame(bundle$candidates)) bundle$candidates else NULL,
+    hits = if (is.data.frame(bundle$gwas_hits)) bundle$gwas_hits else NULL,
+    blk = if (is.data.frame(bundle$block_ranges)) bundle$block_ranges else NULL,
+    proxy_tbl = if (is.data.frame(bundle$proxies)) bundle$proxies else NULL
+  )
+  
+  if (!is.data.frame(block_hits_for_summary) || !nrow(block_hits_for_summary)) {
+    block_hits_for_summary <- bundle$block_hits
+  }
+  
+  fl <- bundle$fl
+  chr_sel <- bundle$chr
+  st <- bundle$start
+  en <- bundle$end
+  cid <- bundle$cluster_id
+  subset_prefix <- bundle$subset_prefix
+  
+  cand_sub <- bundle$candidates
+  hits_sub <- bundle$gwas_hits
+  
+  if (!is.data.frame(hits_sub) || !nrow(hits_sub)) {
+    stop("No GWAS hits available in selected integrated cluster.")
+  }
+  
+  ld_prefix <- file.path(
+    workdir,
+    paste0("ldint_", cid, "_", format(Sys.time(), "%Y%m%d_%H%M%S"), "_ld")
+  )
+  
+  r2_args <- c(
+    "--bfile", subset_prefix,
+    "--ld-window", "999999",
+    "--ld-window-kb", "999999",
+    "--ld-window-r2", "0"
+  )
+  
+  if (identical(ld_metric, "Dprime")) {
+    r2_args <- c(r2_args, "--r2", "dprime", "gz")
+  } else {
+    r2_args <- c(r2_args, "--r2", "gz")
+  }
+  
+  r2_args <- c(r2_args, "--out", ld_prefix)
+  
+  r2 <- run_plink(r2_args, ld_prefix, plink_bin)
+  if (is.function(append_log) && length(r2$stdout)) {
+    append_log(paste(r2$stdout, collapse = "\n"))
+  }
+  if (is.null(r2$status) || r2$status != 0) {
+    stop("PLINK LD failed.")
+  }
+  
+  ld_raw <- read_plink_ld(ld_prefix)
+  snpA <- pick_col(ld_raw, c("SNP_A", "SNP_A1", "SNP1"))
+  snpB <- pick_col(ld_raw, c("SNP_B", "SNP_B1", "SNP2"))
+  vcol <- if (identical(ld_metric, "Dprime")) {
+    pick_col(ld_raw, c("Dprime", "D'", "DP", "DPRIME"))
+  } else {
+    pick_col(ld_raw, c("R2", "r2"))
+  }
+  
+  if (is.null(snpA) || is.null(snpB) || is.null(vcol)) {
+    stop("LD file missing required columns.")
+  }
+  
+  fl_map <- fl %>% dplyr::select(SNP, BP, ix)
+  
+  ld2 <- ld_raw %>%
+    dplyr::transmute(
+      SNP_A = as.character(.data[[snpA]]),
+      SNP_B = as.character(.data[[snpB]]),
+      value = suppressWarnings(as.numeric(.data[[vcol]]))
+    ) %>%
+    dplyr::filter(!is.na(SNP_A), !is.na(SNP_B), is.finite(value)) %>%
+    dplyr::left_join(
+      fl_map %>% dplyr::rename(ixA = ix, BPA = BP),
+      by = c("SNP_A" = "SNP")
+    ) %>%
+    dplyr::left_join(
+      fl_map %>% dplyr::rename(ixB = ix, BPB = BP),
+      by = c("SNP_B" = "SNP")
+    ) %>%
+    dplyr::filter(is.finite(ixA), is.finite(ixB), ixA != ixB) %>%
+    dplyr::mutate(
+      i = pmax(ixA, ixB),
+      j = pmin(ixA, ixB)
+    ) %>%
+    dplyr::distinct(i, j, .keep_all = TRUE) %>%
+    dplyr::filter(i > j)
+  
+  cand_tracks <- tibble::tibble(
+    BP = integer(),
+    classe = character(),
+    label_id = character(),
+    source_app = character()
+  )
+  
+  if (is.data.frame(cand_sub) && nrow(cand_sub) > 0) {
+    cand_tracks <- cand_sub %>%
+      dplyr::transmute(
+        BP = suppressWarnings(as.integer(position)),
+        classe = normalize_classe(classe),
+        label_id = dplyr::coalesce(
+          as.character(rsid),
+          as.character(id_hit),
+          as.character(cluster_id)
+        ),
+        source_app = as.character(source_app)
+      ) %>%
+      dplyr::mutate(
+        label_id = trimws(label_id),
+        label_id = dplyr::if_else(!nzchar(label_id), paste0("pos_", BP), label_id)
+      ) %>%
+      dplyr::filter(is.finite(BP), !is.na(classe), nzchar(classe)) %>%
+      dplyr::distinct(BP, classe, label_id, source_app, .keep_all = TRUE) %>%
+      dplyr::arrange(BP, classe, label_id)
+  }
+  
+  fl2 <- fl %>%
+    dplyr::mutate(is_candidate = FALSE, classe = NA_character_) %>%
+    dplyr::select(SNP, BP, ix, is_candidate, classe)
+  
+  if (nrow(cand_tracks) > 0) {
+    fl2 <- fl2 %>%
+      dplyr::mutate(is_candidate = BP %in% cand_tracks$BP) %>%
+      dplyr::left_join(
+        cand_tracks %>%
+          dplyr::group_by(BP) %>%
+          dplyr::summarise(
+            classe_track = paste(sort(unique(classe)), collapse = "; "),
+            .groups = "drop"
+          ),
+        by = "BP"
+      ) %>%
+      dplyr::mutate(
+        classe = dplyr::coalesce(classe_track, classe)
+      ) %>%
+      dplyr::select(SNP, BP, ix, is_candidate, classe)
+  }
+  
+  session_dir <- getOption("gi_active_integrator_dir", "")
+  
+  if (!nzchar(session_dir) || !dir.exists(session_dir)) {
+    session_dir <- Sys.getenv("GI_ACTIVE_INTEGRATOR_DIR", "")
+  }
+  
+  if (!nzchar(session_dir) || !dir.exists(session_dir)) {
+    stop("GI active integrator dir not configured for compute_ld_cluster_from_module_engine().")
+  }
+  
+  gwas_bridge_for_summary <- NULL
+  
+  if (is.data.frame(bundle$gwas_hits) && nrow(bundle$gwas_hits)) {
+    gwas_bridge_for_summary <- bundle$gwas_hits
+  } else if (is.data.frame(gwas_bridge_df) && nrow(gwas_bridge_df)) {
+    gwas_bridge_for_summary <- gwas_bridge_df
+  }
+  
+  canonical_block_summary <- block_overlap_summary_df(
+    block_ranges   = bundle$block_ranges,
+    block_hits     = bundle$block_hits,
+    block_genes    = bundle$block_genes,
+    gwas_bridge_df = gwas_bridge_for_summary,
+    proxy_tbl      = bundle$proxies
+  )
+  
+  canonical_block_summary <- append_outblock_summary_rows(
+    block_summary = canonical_block_summary,
+    cluster_row = cl_for_rebuild,
+    candidates_df = bundle$candidates
+  )
+  
+  canonical_block_summary <- build_block_ld_summary(canonical_block_summary)
+  
+  ld_struct_df <- summarize_ld_structure_by_block(
+    block_df = bundle$block_ranges,
+    ld_pairs_df = ld2
+  )
+  
+  summary_one <- data.frame(
+    cluster_id = bundle$cluster_id,
+    chr = as.character(chr_sel),
+    start = as.integer(st),
+    end = as.integer(en),
+    population = as.character(pop),
+    ld_metric = as.character(ld_metric),
+    n_interval_snps = nrow(bundle$fl),
+    n_candidate_snps = nrow(bundle$candidates),
+    n_gwas_hits = nrow(bundle$gwas_hits),
+    gwas_hits = if (is.data.frame(bundle$gwas_hits) && nrow(bundle$gwas_hits) && "rsid" %in% names(bundle$gwas_hits)) {
+      paste(unique(stats::na.omit(bundle$gwas_hits$rsid)), collapse = "; ")
+    } else {
+      ""
+    },
+    n_seeds_exact = if (is.data.frame(bundle$seeds) && nrow(bundle$seeds) && "seed_type" %in% names(bundle$seeds)) {
+      sum(bundle$seeds$seed_type == "exact", na.rm = TRUE)
+    } else {
+      0L
+    },
+    n_seeds_nearest = if (is.data.frame(bundle$seeds) && nrow(bundle$seeds) && "seed_type" %in% names(bundle$seeds)) {
+      sum(bundle$seeds$seed_type == "nearest", na.rm = TRUE)
+    } else {
+      0L
+    },
+    seed_snps = if (is.data.frame(bundle$seeds) && nrow(bundle$seeds) && "seed_snp" %in% names(bundle$seeds)) {
+      paste(unique(stats::na.omit(bundle$seeds$seed_snp)), collapse = "; ")
+    } else {
+      ""
+    },
+    n_proxy_snps = if (is.data.frame(bundle$proxies) && nrow(bundle$proxies) && "proxy_snp" %in% names(bundle$proxies)) {
+      dplyr::n_distinct(bundle$proxies$proxy_snp)
+    } else {
+      0L
+    },
+    proxy_snps = if (is.data.frame(bundle$proxies) && nrow(bundle$proxies) && "proxy_snp" %in% names(bundle$proxies)) {
+      paste(unique(stats::na.omit(bundle$proxies$proxy_snp)), collapse = "; ")
+    } else {
+      ""
+    },
+    max_ld_value = if (is.data.frame(bundle$proxies) && nrow(bundle$proxies) && "ld_value" %in% names(bundle$proxies)) {
+      max(bundle$proxies$ld_value, na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    mean_ld_value = if (is.data.frame(bundle$proxies) && nrow(bundle$proxies) && "ld_value" %in% names(bundle$proxies)) {
+      mean(bundle$proxies$ld_value, na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    n_blocks = if (is.data.frame(bundle$block_ranges)) nrow(bundle$block_ranges) else 0L,
+    n_block_hits = if (is.data.frame(canonical_block_summary) && nrow(canonical_block_summary) && "block_support_hits" %in% names(canonical_block_summary)) {
+      sum(canonical_block_summary$block_support_hits, na.rm = TRUE)
+    } else {
+      0L
+    },
+    n_block_genes = if (is.data.frame(canonical_block_summary) && nrow(canonical_block_summary) && "n_genes_in_block" %in% names(canonical_block_summary)) {
+      sum(canonical_block_summary$n_genes_in_block, na.rm = TRUE)
+    } else {
+      0L
+    },
+    ld_has_signal = as.integer(is.data.frame(bundle$proxies) && nrow(bundle$proxies) > 0),
+    ld_computed = TRUE,
+    status = "ok",
+    stringsAsFactors = FALSE
+  )
+  
+  details_one <- list(
+    cluster_id = bundle$cluster_id,
+    chr = as.character(chr_sel),
+    start = as.integer(st),
+    end = as.integer(en),
+    population = as.character(pop),
+    ld_metric = as.character(ld_metric),
+    x_mode = as.character(x_mode),
+    
+    fl = bundle$fl,
+    bim = bundle$bim,
+    candidates = bundle$candidates,
+    gwas_hits = bundle$gwas_hits,
+    seeds = bundle$seeds,
+    proxies = bundle$proxies,
+    blocks = bundle$blocks,
+    blocks_ij = bundle$blocks_ij,
+    block_ranges = bundle$block_ranges,
+    block_hits = block_hits_for_summary,
+    block_genes = bundle$block_genes,
+    block_summary = canonical_block_summary,
+    
+    fl_plot = fl2,
+    ld_pairs = ld2,
+    cand_tracks = cand_tracks,
+    
+    plot_meta = list(
+      x_mode = as.character(x_mode),
+      ld_metric = as.character(ld_metric),
+      max_snps_interval = as.integer(max_snps_interval),
+      ld_proxy_r2_min = as.numeric(r2_min),
+      saved_at = as.character(Sys.time())
+    ),
+    
+    summary = summary_one
+  )
+  
+  list(
+    summary = summary_one,
+    details = details_one,
+    block_summary = canonical_block_summary
+  )
+}
+
+
+# funcio integradora (neutra):
 thin_ld_subset_common <- function(
     subset_prefix,
     fl,
-    cand_sub,
-    max_snps,
+    cand_sub = NULL,
+    max_snps = 400,
     workdir,
     tag,
     plink_bin,
@@ -1823,82 +2199,149 @@ thin_ld_subset_common <- function(
 ) {
   stopifnot(is.data.frame(fl), all(c("SNP", "BP") %in% names(fl)))
   
+  fl <- fl %>%
+    dplyr::arrange(BP, SNP) %>%
+    dplyr::distinct(SNP, BP, .keep_all = TRUE)
+  
+  max_snps <- suppressWarnings(as.integer(max_snps))
+  
   if (!is.finite(max_snps) || max_snps < 2 || nrow(fl) <= max_snps) {
-    return(list(
-      subset_prefix = subset_prefix,
-      fl = fl %>% dplyr::arrange(BP, SNP) %>% dplyr::mutate(ix = dplyr::row_number())
-    ))
+    fl <- fl %>% dplyr::mutate(ix = dplyr::row_number())
+    
+    if (is.function(append_log)) {
+      append_log(
+        "[LD-THIN] No thinning needed: reference SNPs=",
+        nrow(fl),
+        " | max_snps=",
+        max_snps
+      )
+    }
+    
+    return(list(subset_prefix = subset_prefix, fl = fl))
   }
   
   if (is.function(append_log)) {
-    append_log("[LD-THIN] Too many SNPs: ", nrow(fl), " > ", max_snps, ". Auto-thinning...")
+    append_log(
+      "[LD-THIN] Reference SNPs exceed max limit: ",
+      nrow(fl), " > ", max_snps,
+      ". Thinning with candidate/GWAS SNP protection..."
+    )
   }
   
-  keep_bp <- integer(0)
+  # --------------------------------------------------
+  # 1) Protect candidate SNPs by ID and nearest position
+  # --------------------------------------------------
+  protected_snps <- character(0)
   
   if (is.data.frame(cand_sub) && nrow(cand_sub) > 0) {
-    cand_keep <- cand_sub %>%
-      dplyr::mutate(
-        position = suppressWarnings(as.integer(position)),
-        classe = as.character(classe),
-        keep_rank = dplyr::case_when(
-          classe == "GWAS" ~ 1L,
-          classe == "catalog_hit" ~ 2L,
-          classe == "gtex_hit" ~ 3L,
-          classe == "nonsyn_hit" ~ 4L,
-          classe == "ewasdis_hit" ~ 5L,
-          classe == "ewastum_hit" ~ 6L,
-          TRUE ~ 99L
-        )
-      ) %>%
-      dplyr::filter(is.finite(position)) %>%
-      dplyr::distinct(position, .keep_all = TRUE) %>%
-      dplyr::arrange(keep_rank, position)
     
-    if (nrow(cand_keep) > max_snps) {
-      idx <- unique(round(seq(1, nrow(cand_keep), length.out = max_snps)))
-      cand_keep <- cand_keep[idx, , drop = FALSE] %>%
-        dplyr::arrange(keep_rank, position)
+    cand_ids <- character(0)
+    
+    if ("rsid" %in% names(cand_sub)) {
+      cand_ids <- c(cand_ids, as.character(cand_sub$rsid))
+    }
+    
+    if ("id_hit" %in% names(cand_sub)) {
+      cand_ids <- c(cand_ids, as.character(cand_sub$id_hit))
+    }
+    
+    cand_ids <- trimws(cand_ids)
+    cand_ids <- unique(cand_ids[!is.na(cand_ids) & nzchar(cand_ids)])
+    
+    protected_by_id <- intersect(cand_ids, fl$SNP)
+    
+    protected_by_pos <- character(0)
+    
+    if ("position" %in% names(cand_sub)) {
+      cand_pos <- suppressWarnings(as.integer(cand_sub$position))
+      cand_pos <- cand_pos[is.finite(cand_pos)]
       
-      if (is.function(append_log)) {
-        append_log("[LD-THIN] Candidate SNPs exceed max limit. Keeping prioritised subset n=", nrow(cand_keep))
+      if (length(cand_pos) > 0 && nrow(fl) > 0) {
+        nearest_idx <- vapply(
+          cand_pos,
+          function(pp) {
+            which.min(abs(fl$BP - pp))
+          },
+          integer(1)
+        )
+        
+        nearest_idx <- unique(nearest_idx[is.finite(nearest_idx)])
+        protected_by_pos <- fl$SNP[nearest_idx]
       }
     }
     
-    keep_bp <- unique(as.integer(cand_keep$position))
+    protected_snps <- unique(c(protected_by_id, protected_by_pos))
+    protected_snps <- protected_snps[protected_snps %in% fl$SNP]
   }
   
-  keep_snps <- fl %>%
-    dplyr::filter(BP %in% keep_bp) %>%
+  if (is.function(append_log)) {
+    append_log("[LD-THIN] Protected candidate/reference SNPs: ", length(protected_snps))
+  }
+  
+  # --------------------------------------------------
+  # 2) Select evenly spaced background SNPs
+  # --------------------------------------------------
+  n_background_target <- max(max_snps - length(protected_snps), 0L)
+  
+  fl_background <- fl %>%
+    dplyr::filter(!SNP %in% protected_snps)
+  
+  background_snps <- character(0)
+  
+  if (n_background_target > 0 && nrow(fl_background) > 0) {
+    idx_bg <- unique(pmax(
+      1,
+      pmin(
+        nrow(fl_background),
+        round(seq(1, nrow(fl_background), length.out = min(n_background_target, nrow(fl_background))))
+      )
+    ))
+    
+    background_snps <- fl_background %>%
+      dplyr::slice(idx_bg) %>%
+      dplyr::pull(SNP) %>%
+      unique()
+  }
+  
+  snps_final <- unique(c(protected_snps, background_snps))
+  snps_final <- snps_final[snps_final %in% fl$SNP]
+  
+  # Keep genomic order
+  snps_final <- fl %>%
+    dplyr::filter(SNP %in% snps_final) %>%
+    dplyr::arrange(BP, SNP) %>%
     dplyr::pull(SNP) %>%
     unique()
   
-  k <- max_snps - length(keep_snps)
+  if (length(snps_final) < 2) {
+    stop("LD thinning produced fewer than 2 SNPs.")
+  }
   
-  rest <- fl %>%
-    dplyr::filter(!(SNP %in% keep_snps)) %>%
-    dplyr::arrange(BP, SNP)
-  
-  if (k > 0 && nrow(rest) > 0) {
-    if (nrow(rest) <= k) {
-      fill_snps <- rest$SNP
-    } else {
-      idx <- unique(pmax(1, pmin(nrow(rest), round(seq(1, nrow(rest), length.out = k)))))
-      fill_snps <- rest$SNP[idx]
+  if (is.function(append_log)) {
+    append_log(
+      "[LD-THIN] Final SNPs selected: ",
+      length(snps_final),
+      " | protected=",
+      length(protected_snps),
+      " | background=",
+      length(background_snps)
+    )
+    
+    if (length(snps_final) > max_snps) {
+      append_log(
+        "[LD-THIN] Note: final SNP count exceeds max_snps because candidate/GWAS SNPs are protected."
+      )
     }
-  } else {
-    fill_snps <- character(0)
   }
   
-  snps_final <- unique(c(keep_snps, fill_snps))
-  if (length(snps_final) > max_snps) {
-    snps_final <- snps_final[seq_len(max_snps)]
-  }
-  
+  # --------------------------------------------------
+  # 3) Build thinned PLINK subset
+  # --------------------------------------------------
   extract_file <- file.path(workdir, paste0(tag, "_extract_snps.txt"))
   writeLines(snps_final, extract_file)
   
   subset2_prefix <- file.path(workdir, paste0(tag, "_subset_thin"))
+  
   args_thin <- c(
     "--bfile", subset_prefix,
     "--extract", extract_file,
@@ -1907,22 +2350,41 @@ thin_ld_subset_common <- function(
   )
   
   rthin <- run_plink(args_thin, subset2_prefix, plink_bin)
+  
+  if (length(rthin$stdout) && is.function(append_log)) {
+    append_log(paste(rthin$stdout, collapse = "\n"))
+  }
+  
   if (is.null(rthin$status) || rthin$status != 0) {
     stop("PLINK thinning subset failed.")
   }
   
-  bim2 <- utils::read.table(paste0(subset2_prefix, ".bim"), header = FALSE, stringsAsFactors = FALSE)
-  colnames(bim2) <- c("CHR","SNP","CM","BP","A1","A2")
+  bim2_file <- paste0(subset2_prefix, ".bim")
+  
+  if (!file.exists(bim2_file)) {
+    stop("PLINK thinning subset failed: missing .bim file.")
+  }
+  
+  bim2 <- utils::read.table(
+    bim2_file,
+    header = FALSE,
+    stringsAsFactors = FALSE
+  )
+  
+  colnames(bim2) <- c("CHR", "SNP", "CM", "BP", "A1", "A2")
   
   fl2 <- bim2 %>%
-    dplyr::transmute(SNP = as.character(SNP), BP = suppressWarnings(as.integer(BP))) %>%
+    dplyr::transmute(
+      SNP = as.character(SNP),
+      BP = suppressWarnings(as.integer(BP))
+    ) %>%
     dplyr::filter(!is.na(SNP), nzchar(SNP), is.finite(BP)) %>%
     dplyr::distinct(SNP, BP, .keep_all = TRUE) %>%
     dplyr::arrange(BP, SNP) %>%
     dplyr::mutate(ix = dplyr::row_number())
   
   if (is.function(append_log)) {
-    append_log("[LD-THIN] SNPs after thinning: ", nrow(fl2))
+    append_log("[LD-THIN] SNPs after protected thinning: ", nrow(fl2))
   }
   
   list(
@@ -1935,7 +2397,7 @@ thin_ld_subset_common <- function(
 select_candidates_for_cluster_common <- function(candidates_df, cluster_row) {
   stopifnot(is.data.frame(candidates_df), is.data.frame(cluster_row), nrow(cluster_row) > 0)
   
-  cid <- as.character(cluster_row$cluster_id[1])
+  cid <- normalize_cluster_id(cluster_row$cluster_id[1])
   chr_sel <- suppressWarnings(as.integer(cluster_row$chr[1]))
   st <- suppressWarnings(as.integer(cluster_row$start[1]))
   en <- suppressWarnings(as.integer(cluster_row$end[1]))
@@ -1945,7 +2407,17 @@ select_candidates_for_cluster_common <- function(candidates_df, cluster_row) {
       cluster_id = normalize_cluster_id(cluster_id),
       chr = suppressWarnings(as.integer(chr)),
       position = suppressWarnings(as.integer(position)),
-      classe = normalize_classe(classe)
+      classe = normalize_classe(classe),
+      source_app = dplyr::case_when(
+        "source_app" %in% names(.) ~ as.character(source_app),
+        classe == "catalog_hit" ~ "catalog",
+        classe == "gtex_hit" ~ "gtex",
+        classe == "nonsyn_hit" ~ "nonsyn",
+        classe == "ewasdis_hit" ~ "ewasdis",
+        classe == "ewastum_hit" ~ "ewastum",
+        classe == "GWAS" ~ "gwas",
+        TRUE ~ "unknown"
+      )
     ) %>%
     dplyr::filter(
       chr == chr_sel,
@@ -1953,8 +2425,11 @@ select_candidates_for_cluster_common <- function(candidates_df, cluster_row) {
       position <= en
     )
   
-  ca_sub2 <- ca_sub %>% dplyr::filter(cluster_id == cid)
-  if (nrow(ca_sub2) > 0) ca_sub <- ca_sub2
+  # IMPORTANT:
+  # For integrated LD, the genomic interval is the canonical selector.
+  # Do not restrict by cluster_id here because some apps encode IDs as chr11_1,
+  # while Integrator clusters may use global IDs such as 4.
+  ca_sub <- ca_sub
   
   ca_sub %>%
     dplyr::distinct(source_app, cluster_id, id_hit, rsid, chr, position, classe, .keep_all = TRUE) %>%
@@ -2674,6 +3149,11 @@ summarize_gwas_significance_by_block <- function(block_df, gwas_bridge_df) {
   bb <- block_df %>%
     dplyr::transmute(
       cluster_id = as.character(cluster_id),
+      chr = if ("chr" %in% names(block_df)) {
+        sub("^chr", "", trimws(as.character(.data$chr)), ignore.case = TRUE)
+      } else {
+        sub("^chr([0-9XYM]+).*", "\\1", trimws(as.character(.data$cluster_id)), ignore.case = TRUE)
+      },
       chr = suppressWarnings(as.integer(chr)),
       block_id = as.character(block_id),
       block_start = suppressWarnings(as.integer(block_start)),
@@ -2681,33 +3161,43 @@ summarize_gwas_significance_by_block <- function(block_df, gwas_bridge_df) {
     ) %>%
     dplyr::filter(
       !is.na(cluster_id), nzchar(cluster_id),
-      is.finite(chr), is.finite(block_start), is.finite(block_end)
+      !is.na(chr),
+      !is.na(block_id), nzchar(block_id),
+      is.finite(block_start), is.finite(block_end)
     )
   
-  gg <- gwas_bridge_df %>%
+  pp <- proxy_tbl %>%
     dplyr::transmute(
-      cluster_id = as.character(cluster_id),
+      proxy_cluster_id = as.character(cluster_id),
+      chr = if ("chr" %in% names(proxy_tbl)) {
+        sub("^chr", "", trimws(as.character(.data$chr)), ignore.case = TRUE)
+      } else {
+        sub("^chr([0-9XYM]+).*", "\\1", trimws(as.character(.data$cluster_id)), ignore.case = TRUE)
+      },
       chr = suppressWarnings(as.integer(chr)),
-      position = suppressWarnings(as.integer(position)),
-      rsid = as.character(rsid),
-      logp = suppressWarnings(as.numeric(logp))
+      proxy_snp = as.character(proxy_snp),
+      proxy_pos = suppressWarnings(as.integer(proxy_pos)),
+      ld_value = suppressWarnings(as.numeric(ld_value))
     ) %>%
     dplyr::filter(
-      !is.na(cluster_id), nzchar(cluster_id),
-      is.finite(chr), is.finite(position)
-    )
+      !is.na(chr),
+      !is.na(proxy_snp), nzchar(proxy_snp),
+      is.finite(proxy_pos),
+      is.finite(ld_value)
+    ) %>%
+    dplyr::distinct(chr, proxy_snp, proxy_pos, .keep_all = TRUE)
   
-  ov <- gg %>%
+  ov <- pp %>%
     dplyr::inner_join(
-      bb %>% dplyr::select(cluster_id, chr, block_id, block_start, block_end),
-      by = c("cluster_id", "chr"),
+      bb,
+      by = "chr",
       relationship = "many-to-many"
     ) %>%
     dplyr::filter(
-      position >= block_start,
-      position <= block_end
+      proxy_pos >= block_start,
+      proxy_pos <= block_end
     ) %>%
-    dplyr::distinct(cluster_id, block_id, rsid, position, .keep_all = TRUE)
+    dplyr::distinct(cluster_id, block_id, proxy_snp, proxy_pos, .keep_all = TRUE)
   
   if (!nrow(ov)) {
     return(tibble::tibble(
@@ -2908,6 +3398,12 @@ summarize_ld_by_block <- function(block_df, proxy_tbl) {
     ))
   }
   
+  cat("\n[DEBUG summarize_ld_by_block input]\n")
+  cat("block_df names:", paste(names(block_df), collapse = ", "), "\n")
+  cat("proxy_tbl names:", paste(names(proxy_tbl), collapse = ", "), "\n")
+  cat("proxy_tbl rows:", nrow(proxy_tbl), "\n")
+  print(utils::head(proxy_tbl, 10))
+  
   req_proxy_cols <- c("cluster_id", "proxy_snp", "proxy_pos", "ld_value")
   if (!all(req_proxy_cols %in% names(proxy_tbl))) {
     return(tibble::tibble(
@@ -2923,35 +3419,48 @@ summarize_ld_by_block <- function(block_df, proxy_tbl) {
   bb <- block_df %>%
     dplyr::transmute(
       cluster_id = as.character(cluster_id),
+      chr = if ("chr" %in% names(block_df)) {
+        sub("^chr", "", trimws(as.character(.data$chr)), ignore.case = TRUE)
+      } else {
+        sub("^chr([0-9XYM]+).*", "\\1", trimws(as.character(.data$cluster_id)), ignore.case = TRUE)
+      },
+      chr = suppressWarnings(as.integer(chr)),
       block_id = as.character(block_id),
       block_start = suppressWarnings(as.integer(block_start)),
       block_end = suppressWarnings(as.integer(block_end))
     ) %>%
     dplyr::filter(
       !is.na(cluster_id), nzchar(cluster_id),
+      is.finite(chr),
       !is.na(block_id), nzchar(block_id),
       is.finite(block_start), is.finite(block_end)
     )
   
   pp <- proxy_tbl %>%
     dplyr::transmute(
-      cluster_id = as.character(cluster_id),
+      proxy_cluster_id = as.character(cluster_id),
+      chr = if ("chr" %in% names(proxy_tbl)) {
+        sub("^chr", "", trimws(as.character(.data$chr)), ignore.case = TRUE)
+      } else {
+        sub("^chr([0-9XYM]+).*", "\\1", trimws(as.character(.data$cluster_id)), ignore.case = TRUE)
+      },
+      chr = suppressWarnings(as.integer(chr)),
       proxy_snp = as.character(proxy_snp),
       proxy_pos = suppressWarnings(as.integer(proxy_pos)),
       ld_value = suppressWarnings(as.numeric(ld_value))
     ) %>%
     dplyr::filter(
-      !is.na(cluster_id), nzchar(cluster_id),
+      is.finite(chr),
       !is.na(proxy_snp), nzchar(proxy_snp),
       is.finite(proxy_pos),
       is.finite(ld_value)
     ) %>%
-    dplyr::distinct(cluster_id, proxy_snp, proxy_pos, .keep_all = TRUE)
+    dplyr::distinct(chr, proxy_snp, proxy_pos, .keep_all = TRUE)
   
   ov <- pp %>%
     dplyr::inner_join(
       bb,
-      by = "cluster_id",
+      by = "chr",
       relationship = "many-to-many"
     ) %>%
     dplyr::filter(
@@ -3513,21 +4022,203 @@ block_overlap_summary_df <- function(
       genes_in_block = character()
     )
   }
+  
+ 
   # --------------------------------------------------
   # 4) GWAS significació per block
+  # Assignació independent del nom del cluster:
+  #   1) GWAS -> blocs reals per chr + posició
+  #   2) OUT-BLOCK només per GWAS que no cau en cap bloc real
   # --------------------------------------------------
-  gwas_sum <- tibble::tibble(
-    cluster_id = character(),
-    block_id = character(),
-    n_gwas_sig_hits = integer(),
-    max_gwas_logp = numeric(),
-    mean_gwas_logp = numeric(),
-    gwas_sig_hits = character()
-  )
   
+  gwas_sum <- if (is.data.frame(gwas_bridge_df) && nrow(gwas_bridge_df)) {
+    
+    pick_existing_col <- function(df, candidates) {
+      nm <- candidates[candidates %in% names(df)][1]
+      if (length(nm) == 0 || is.na(nm)) return(NA_character_)
+      nm
+    }
+    
+    chr_col  <- pick_existing_col(gwas_bridge_df, c("chr", "CHR", "chrom", "chromosome"))
+    pos_col  <- pick_existing_col(gwas_bridge_df, c("gwas_pos", "position", "BP", "pos", "bp"))
+    id_col   <- pick_existing_col(gwas_bridge_df, c("gwas_hit", "rsid", "SNP", "snp", "id"))
+    p_col    <- pick_existing_col(gwas_bridge_df, c("gwas_p", "p_value", "P", "Pval", "p"))
+    logp_col <- pick_existing_col(gwas_bridge_df, c("gwas_logp", "logp", "LOGP", "minus_log10_p"))
+    
+    if (is.na(chr_col) || is.na(pos_col) || is.na(id_col)) {
+      
+      tibble::tibble(
+        cluster_id = character(),
+        block_id = character(),
+        n_gwas_sig_hits = integer(),
+        max_gwas_logp = numeric(),
+        mean_gwas_logp = numeric(),
+        min_gwas_p = numeric(),
+        gwas_sig_hits = character()
+      )
+      
+    } else {
+      
+      gw <- gwas_bridge_df %>%
+        dplyr::transmute(
+          chr = sub("^chr", "", trimws(as.character(.data[[chr_col]])), ignore.case = TRUE),
+          chr = suppressWarnings(as.integer(chr)),
+          gwas_pos = suppressWarnings(as.numeric(.data[[pos_col]])),
+          gwas_hit = trimws(as.character(.data[[id_col]])),
+          gwas_p = if (!is.na(p_col)) {
+            suppressWarnings(as.numeric(.data[[p_col]]))
+          } else {
+            NA_real_
+          },
+          gwas_logp = if (!is.na(logp_col)) {
+            suppressWarnings(as.numeric(.data[[logp_col]]))
+          } else if (!is.na(p_col)) {
+            suppressWarnings(-log10(as.numeric(.data[[p_col]])))
+          } else {
+            NA_real_
+          }
+        ) %>%
+        dplyr::filter(
+          !is.na(chr),
+          is.finite(gwas_pos),
+          !is.na(gwas_hit),
+          nzchar(gwas_hit)
+        ) %>%
+        dplyr::distinct(chr, gwas_hit, gwas_pos, .keep_all = TRUE)
+      
+      br_real <- base_df %>%
+        dplyr::transmute(
+          cluster_id = as.character(cluster_id),
+          chr = suppressWarnings(as.integer(chr)),
+          block_id = as.character(block_id),
+          block_start = suppressWarnings(as.numeric(block_start)),
+          block_end = suppressWarnings(as.numeric(block_end))
+        ) %>%
+        dplyr::filter(
+          !is.na(cluster_id), nzchar(cluster_id),
+          !is.na(chr),
+          !is.na(block_id), nzchar(block_id),
+          !grepl("OUT", block_id, ignore.case = TRUE),
+          is.finite(block_start),
+          is.finite(block_end)
+        )
+      
+      br_out <- base_df %>%
+        dplyr::transmute(
+          cluster_id = as.character(cluster_id),
+          chr = suppressWarnings(as.integer(chr)),
+          block_id = as.character(block_id),
+          block_start = suppressWarnings(as.numeric(block_start)),
+          block_end = suppressWarnings(as.numeric(block_end))
+        ) %>%
+        dplyr::filter(
+          !is.na(cluster_id), nzchar(cluster_id),
+          !is.na(chr),
+          !is.na(block_id), nzchar(block_id),
+          grepl("OUT", block_id, ignore.case = TRUE),
+          is.finite(block_start),
+          is.finite(block_end)
+        )
+      
+      hits_real <- if (nrow(gw) && nrow(br_real)) {
+        br_real %>%
+          dplyr::inner_join(gw, by = "chr", relationship = "many-to-many") %>%
+          dplyr::filter(
+            gwas_pos >= block_start,
+            gwas_pos <= block_end
+          )
+      } else {
+        tibble::tibble()
+      }
+      
+      hits_out <- if (nrow(gw) && nrow(br_out)) {
+        br_out %>%
+          dplyr::inner_join(gw, by = "chr", relationship = "many-to-many") %>%
+          dplyr::filter(
+            gwas_pos >= block_start,
+            gwas_pos <= block_end
+          ) %>%
+          dplyr::anti_join(
+            hits_real %>%
+              dplyr::select(chr, gwas_hit, gwas_pos) %>%
+              dplyr::distinct(),
+            by = c("chr", "gwas_hit", "gwas_pos")
+          )
+      } else {
+        tibble::tibble()
+      }
+      
+      hits_by_block_df <- dplyr::bind_rows(hits_real, hits_out)
+      
+      if (!is.data.frame(hits_by_block_df) || !nrow(hits_by_block_df)) {
+        
+        tibble::tibble(
+          cluster_id = character(),
+          block_id = character(),
+          n_gwas_sig_hits = integer(),
+          max_gwas_logp = numeric(),
+          mean_gwas_logp = numeric(),
+          min_gwas_p = numeric(),
+          gwas_sig_hits = character()
+        )
+        
+      } else {
+        
+        hits_by_block_df %>%
+          dplyr::filter(
+            !is.na(cluster_id), nzchar(as.character(cluster_id)),
+            !is.na(block_id), nzchar(as.character(block_id)),
+            !is.na(gwas_hit), nzchar(as.character(gwas_hit))
+          ) %>%
+          dplyr::mutate(
+            cluster_id = as.character(cluster_id),
+            block_id = as.character(block_id),
+            gwas_hit = as.character(gwas_hit),
+            gwas_p = suppressWarnings(as.numeric(gwas_p)),
+            gwas_logp = suppressWarnings(as.numeric(gwas_logp))
+          ) %>%
+          dplyr::distinct(cluster_id, block_id, gwas_hit, gwas_pos, .keep_all = TRUE) %>%
+          dplyr::group_by(cluster_id, block_id) %>%
+          dplyr::summarise(
+            n_gwas_sig_hits = dplyr::n(),
+            max_gwas_logp = if (any(is.finite(gwas_logp))) max(gwas_logp, na.rm = TRUE) else NA_real_,
+            mean_gwas_logp = if (any(is.finite(gwas_logp))) mean(gwas_logp, na.rm = TRUE) else NA_real_,
+            min_gwas_p = if (any(is.finite(gwas_p))) min(gwas_p, na.rm = TRUE) else NA_real_,
+            gwas_sig_hits = {
+              vals <- unique(trimws(as.character(gwas_hit)))
+              vals <- vals[!is.na(vals) & nzchar(vals)]
+              paste(sort(vals), collapse = "; ")
+            },
+            .groups = "drop"
+          )
+      }
+    }
+    
+  } else {
+    
+    tibble::tibble(
+      cluster_id = character(),
+      block_id = character(),
+      n_gwas_sig_hits = integer(),
+      max_gwas_logp = numeric(),
+      mean_gwas_logp = numeric(),
+      min_gwas_p = numeric(),
+      gwas_sig_hits = character()
+    )
+  }
   # --------------------------------------------------
   # 4b) LD resum per block
   # --------------------------------------------------
+  cat("\n[DEBUG GLOBAL LD proxy input]\n")
+  cat("proxy_tbl is df:", is.data.frame(proxy_tbl), "\n")
+  cat("proxy_tbl rows:", if (is.data.frame(proxy_tbl)) nrow(proxy_tbl) else NA, "\n")
+  cat("proxy_tbl names:", if (is.data.frame(proxy_tbl)) paste(names(proxy_tbl), collapse = ", ") else "NULL", "\n")
+  
+  if (is.data.frame(proxy_tbl) && nrow(proxy_tbl)) {
+    print(utils::head(proxy_tbl, 10))
+  }
+  
+  
   ld_sum <- if (is.data.frame(proxy_tbl) && nrow(proxy_tbl)) {
     summarize_ld_by_block(
       block_df = base_df,
@@ -3577,6 +4268,7 @@ block_overlap_summary_df <- function(
   if (!"max_gwas_logp" %in% names(out0)) out0$max_gwas_logp <- NA_real_
   if (!"mean_gwas_logp" %in% names(out0)) out0$mean_gwas_logp <- NA_real_
   if (!"gwas_sig_hits" %in% names(out0)) out0$gwas_sig_hits <- ""
+  if (!"min_gwas_p" %in% names(out0)) out0$min_gwas_p <- NA_real_
   
   if (!"n_ld_proxy_hits" %in% names(out0)) out0$n_ld_proxy_hits <- 0L
   if (!"block_max_ld_value" %in% names(out0)) out0$block_max_ld_value <- NA_real_
@@ -3597,6 +4289,7 @@ block_overlap_summary_df <- function(
       n_gwas_sig_hits = safe_int0(n_gwas_sig_hits),
       max_gwas_logp = suppressWarnings(as.numeric(max_gwas_logp)),
       mean_gwas_logp = suppressWarnings(as.numeric(mean_gwas_logp)),
+      min_gwas_p = suppressWarnings(as.numeric(min_gwas_p)),
       gwas_sig_hits = dplyr::coalesce(as.character(gwas_sig_hits), ""),
       n_ld_proxy_hits = safe_int0(n_ld_proxy_hits),
       block_max_ld_value = suppressWarnings(as.numeric(block_max_ld_value)),
@@ -3619,12 +4312,180 @@ block_overlap_summary_df <- function(
   # --------------------------------------------------
   # 7) ordre final
   # --------------------------------------------------
+  if (!"gwas_hits" %in% names(out1)) out1$gwas_hits <- ""
+  if (!"gwas_sig_hits" %in% names(out1)) out1$gwas_sig_hits <- ""
+  if (!"gwas_top_logp" %in% names(out1)) out1$gwas_top_logp <- NA_real_
+  if (!"max_gwas_logp" %in% names(out1)) out1$max_gwas_logp <- NA_real_
+  if (!"gwas_min_p" %in% names(out1)) out1$gwas_min_p <- NA_real_
+  if (!"min_gwas_p" %in% names(out1)) out1$min_gwas_p <- NA_real_
+  
   out1 %>%
+    dplyr::mutate(
+      gwas_hits = dplyr::coalesce(
+        dplyr::na_if(as.character(.data$gwas_hits), ""),
+        dplyr::na_if(as.character(.data$gwas_sig_hits), ""),
+        ""
+      ),
+      gwas_top_logp = dplyr::coalesce(
+        suppressWarnings(as.numeric(.data$gwas_top_logp)),
+        suppressWarnings(as.numeric(.data$max_gwas_logp))
+      ),
+      gwas_min_p = dplyr::coalesce(
+        suppressWarnings(as.numeric(.data$gwas_min_p)),
+        suppressWarnings(as.numeric(.data$min_gwas_p))
+      )
+    ) %>%
     dplyr::arrange(
       cluster_id,
       block_start,
       block_id
     )
+}
+
+append_outblock_summary_rows <- function(block_summary, cluster_row, candidates_df) {
+  if (!is.data.frame(block_summary)) block_summary <- tibble::tibble()
+  if (!is.data.frame(cluster_row) || !nrow(cluster_row)) return(block_summary)
+  
+  cid <- as.character(cluster_row$cluster_id[1])
+  chr_sel <- suppressWarnings(as.integer(cluster_row$chr[1]))
+  st <- suppressWarnings(as.numeric(cluster_row$start[1]))
+  en <- suppressWarnings(as.numeric(cluster_row$end[1]))
+  
+  if (!nzchar(cid) || !is.finite(chr_sel) || !is.finite(st) || !is.finite(en)) {
+    return(block_summary)
+  }
+  
+  blocks <- block_summary %>%
+    dplyr::filter(
+      as.character(cluster_id) == cid,
+      !grepl("OUT", as.character(block_id), ignore.case = TRUE),
+      is.finite(suppressWarnings(as.numeric(block_start))),
+      is.finite(suppressWarnings(as.numeric(block_end)))
+    ) %>%
+    dplyr::transmute(
+      block_start = suppressWarnings(as.numeric(block_start)),
+      block_end = suppressWarnings(as.numeric(block_end))
+    )
+  
+  ca_out <- tibble::tibble()
+  
+  if (is.data.frame(candidates_df) && nrow(candidates_df)) {
+    ca <- candidates_df %>%
+      dplyr::mutate(
+        chr = suppressWarnings(as.integer(chr)),
+        position = suppressWarnings(as.numeric(position)),
+        classe = normalize_classe(classe),
+        source_app = if ("source_app" %in% names(.)) {
+          tolower(trimws(as.character(source_app)))
+        } else {
+          NA_character_
+        },
+        rsid = if ("rsid" %in% names(.)) as.character(rsid) else NA_character_,
+        id_hit = if ("id_hit" %in% names(.)) as.character(id_hit) else NA_character_,
+        hit_show = dplyr::coalesce(
+          dplyr::na_if(rsid, ""),
+          dplyr::na_if(id_hit, ""),
+          ifelse(is.finite(position), paste0("pos_", position), NA_character_)
+        )
+      ) %>%
+      dplyr::filter(
+        chr == chr_sel,
+        is.finite(position),
+        position >= st,
+        position <= en
+      )
+    
+    if (nrow(ca)) {
+      if (nrow(blocks)) {
+        in_any_block <- vapply(ca$position, function(p) {
+          any(p >= blocks$block_start & p <= blocks$block_end)
+        }, logical(1))
+        ca_out <- ca[!in_any_block, , drop = FALSE]
+      } else {
+        ca_out <- ca
+      }
+    }
+  }
+  
+  collapse_hits <- function(x) {
+    x <- unique(trimws(as.character(x)))
+    x <- x[!is.na(x) & nzchar(x)]
+    paste(sort(x), collapse = "; ")
+  }
+  
+  get_hits <- function(class_value) {
+    if (!is.data.frame(ca_out) || !nrow(ca_out)) return("")
+    collapse_hits(ca_out$hit_show[ca_out$classe == class_value])
+  }
+  
+  n_hits <- function(class_value) {
+    if (!is.data.frame(ca_out) || !nrow(ca_out)) return(0L)
+    length(unique(ca_out$hit_show[ca_out$classe == class_value & !is.na(ca_out$hit_show) & nzchar(ca_out$hit_show)]))
+  }
+  
+  gene_cols <- if (is.data.frame(ca_out) && nrow(ca_out)) {
+    intersect(
+      c("gene", "gene_name", "nearest_gene", "mapped_gene", "reported_gene", "eqtl_gene", "symbol"),
+      names(ca_out)
+    )
+  } else {
+    character(0)
+  }
+  
+  genes_out <- if (length(gene_cols)) {
+    collapse_hits(unlist(ca_out[gene_cols], use.names = FALSE))
+  } else {
+    ""
+  }
+  
+  out_row <- tibble::tibble(
+    cluster_id = cid,
+    block_id = paste0(cid, "_OUTBLOCK"),
+    block_label = "OUT-BLOCK",
+    block_priority_score = NA_real_,
+    priority_class = "OUT-BLOCK",
+    chr = chr_sel,
+    block_start = st,
+    block_end = en,
+    block_size_bp = en - st,
+    block_size_kb = (en - st) / 1000,
+    block_support_any = as.integer(is.data.frame(ca_out) && nrow(ca_out) && any(ca_out$classe != "GWAS", na.rm = TRUE)),
+    block_support_apps = if (is.data.frame(ca_out) && nrow(ca_out)) {
+      dplyr::n_distinct(ca_out$source_app[ca_out$classe != "GWAS" & !is.na(ca_out$source_app) & nzchar(ca_out$source_app)])
+    } else {
+      0L
+    },
+    block_support_hits = if (is.data.frame(ca_out) && nrow(ca_out)) sum(ca_out$classe != "GWAS", na.rm = TRUE) else 0L,
+    block_hit_density = NA_real_,
+    block_catalog_hits = n_hits("catalog_hit"),
+    block_gtex_hits = n_hits("gtex_hit"),
+    block_nonsyn_hits = n_hits("nonsyn_hit"),
+    block_ewasdis_hits = n_hits("ewasdis_hit"),
+    block_ewastum_hits = n_hits("ewastum_hit"),
+    n_gwas_sig_hits = n_hits("GWAS"),
+    max_gwas_logp = NA_real_,
+    mean_gwas_logp = NA_real_,
+    min_gwas_p = NA_real_,
+    gwas_sig_hits = get_hits("GWAS"),
+    gwas_hits = get_hits("GWAS"),
+    n_ld_proxy_hits = 0L,
+    block_max_ld_value = NA_real_,
+    block_mean_ld_value = NA_real_,
+    ld_proxy_snps = "",
+    n_genes_in_block = if (nzchar(genes_out)) length(split_semicolon(genes_out)) else 0L,
+    genes_in_block = genes_out
+  )
+  
+  missing_in_out <- setdiff(names(block_summary), names(out_row))
+  for (cc in missing_in_out) out_row[[cc]] <- NA
+  
+  missing_in_summary <- setdiff(names(out_row), names(block_summary))
+  for (cc in missing_in_summary) block_summary[[cc]] <- NA
+  
+  dplyr::bind_rows(
+    block_summary,
+    out_row[, names(block_summary), drop = FALSE]
+  )
 }
 
 summarize_block_overlap_detail_for_dt <- function(df) {
@@ -4028,6 +4889,54 @@ build_snp_link_column_html <- function(snps_str, max_visible = 5L) {
   )
 }
 
+# ============================================================
+# LD SNP limit helpers
+# ============================================================
+
+ld_region_size_bp <- function(cluster_row) {
+  if (!is.data.frame(cluster_row) || !nrow(cluster_row)) {
+    return(NA_real_)
+  }
+  
+  st <- suppressWarnings(as.numeric(cluster_row$start[1]))
+  en <- suppressWarnings(as.numeric(cluster_row$end[1]))
+  
+  if (!is.finite(st) || !is.finite(en)) {
+    return(NA_real_)
+  }
+  
+  abs(en - st)
+}
+
+ld_recommended_max_snps <- function(region_size_bp) {
+  region_size_bp <- suppressWarnings(as.numeric(region_size_bp))
+  
+  if (!is.finite(region_size_bp)) {
+    return(400L)
+  }
+  
+  dplyr::case_when(
+    region_size_bp <= 250000  ~ 300L,
+    region_size_bp <= 750000  ~ 400L,
+    region_size_bp <= 2000000 ~ 450L,
+    TRUE                     ~ 500L
+  )
+}
+
+ld_format_region_size <- function(region_size_bp) {
+  region_size_bp <- suppressWarnings(as.numeric(region_size_bp))
+  
+  if (!is.finite(region_size_bp)) {
+    return("unknown")
+  }
+  
+  if (region_size_bp < 1000000) {
+    return(paste0(round(region_size_bp / 1000, 1), " kb"))
+  }
+  
+  paste0(round(region_size_bp / 1000000, 2), " Mb")
+}
+
 # ------------------------------------------------------------------
 # UI
 # ------------------------------------------------------------------
@@ -4072,8 +4981,68 @@ ld_integrator_module_ui <- function(id) {
           selected = "bp"
         ),
         
-        shiny::numericInput(ns("ld_max_snps_interval"), "Max SNPs in interval (plot safety)", value = 400, min = 50, step = 50),
-        shiny::numericInput(ns("ld_proxy_r2_min"), "Min r² for priority proxies", value = 0.6, min = 0, max = 1, step = 0.05),
+        shiny::selectInput(
+          ns("ld_snp_limit_mode"),
+          "SNP limit mode",
+          choices = c(
+            "Auto by region size" = "auto",
+            "Manual" = "manual"
+          ),
+          selected = "auto"
+        ),
+        
+        shiny::uiOutput(ns("ld_snp_limit_auto_ui")),
+        
+        shiny::conditionalPanel(
+          condition = sprintf("input['%s'] == 'manual'", ns("ld_snp_limit_mode")),
+          shiny::numericInput(
+            ns("ld_max_snps_interval"),
+            "Manual max SNPs in interval",
+            value = 800,
+            min = 50,
+            step = 50
+          )
+        ),
+        
+        shiny::numericInput(
+          ns("ld_proxy_r2_min"),
+          "Min r² for priority proxies",
+          value = 0.6,
+          min = 0,
+          max = 1,
+          step = 0.05
+        ),
+        
+        shiny::numericInput(
+          ns("ld_plot_min_value"),
+          "Min LD value to plot",
+          value = 0.1,
+          min = 0,
+          max = 1,
+          step = 0.01
+        ),
+        
+        shiny::selectInput(
+          ns("ld_plot_max_pairs"),
+          "Max LD pairs to plot",
+          choices = c(
+            "Fast: 15000 pairs" = 15000,
+            "Balanced: 30000 pairs" = 30000,
+            "Detailed: 50000 pairs" = 50000,
+            "Maximum: 75000 pairs" = 75000
+          ),
+          selected = 30000
+        ),
+        
+        shiny::tags$div(
+          style = paste(
+            "font-size:12px;",
+            "color:#666;",
+            "margin-top:-6px;",
+            "margin-bottom:10px;"
+          ),
+          "This affects only the interactive LD plot. Block detection and proxy tables are not changed."
+        ),
         
         shiny::tags$hr(),
         shiny::actionButton(ns("run_cluster_ld"), "Compute LD & blocks", icon = shiny::icon("play")),
@@ -4088,9 +5057,10 @@ ld_integrator_module_ui <- function(id) {
           
           shiny::tabPanel(
             "LD plot",
-            
+            uiOutput(ns("ld_precomputed_available_notice")),
             shinycssloaders::withSpinner(
               plotly::plotlyOutput(ns("ld_plot"), height = "800px")
+              
             ),
             
             shiny::tags$hr(),
@@ -4199,6 +5169,8 @@ ld_integrator_module_server <- function(
     integrated_candidates <- candidates_base_r
     gwas_bridge_df <- gwas_bridge_base_r
     
+    ld_precomputed_available_state <- shiny::reactiveVal(NULL)
+    ld_plot_load_allowed <- shiny::reactiveVal(TRUE)
     
     log_buf <- character(0)
     ld_log  <- shiny::reactiveVal("")
@@ -4539,7 +5511,68 @@ ld_integrator_module_server <- function(
     })
     # ----------------------
     
-    
+    shiny::observeEvent(
+      list(input$ld_chr, input$ld_cluster_id),
+      {
+        # Netegem immediatament el missatge anterior
+        ld_precomputed_available_state(NULL)
+        
+        # Bloquegem temporalment el plot perquè primer es pugui pintar el missatge
+        ld_plot_load_allowed(FALSE)
+        
+        later::later(
+          function() {
+            
+            vals <- shiny::isolate({
+              cid <- selected_cluster_id_r()
+              details_path <- cluster_details_rds_path_r()
+              summary_path <- cluster_summary_rds_path_r()
+              
+              list(
+                cid = as.character(cid %||% ""),
+                details_path = as.character(details_path %||% ""),
+                summary_path = as.character(summary_path %||% "")
+              )
+            })
+            
+            has_details <- nzchar(vals$details_path) && file.exists(vals$details_path)
+            has_summary <- nzchar(vals$summary_path) && file.exists(vals$summary_path)
+            
+            append_log(
+              "[LD-PRECOMPUTED-CHECK] cluster=", vals$cid,
+              " | details_path=", vals$details_path,
+              " | summary_path=", vals$summary_path,
+              " | details_exists=", has_details,
+              " | summary_exists=", has_summary
+            )
+            
+            # Només guardem estat si realment hi ha precomputed
+            if (isTRUE(has_details) || isTRUE(has_summary)) {
+              ld_precomputed_available_state(list(
+                cluster_id = vals$cid,
+                details_path = vals$details_path,
+                summary_path = vals$summary_path,
+                has_details = has_details,
+                has_summary = has_summary
+              ))
+            } else {
+              ld_precomputed_available_state(NULL)
+            }
+            
+            # Donem una mica de temps perquè el missatge es pinti abans del plot
+            later::later(
+              function() {
+                ld_plot_load_allowed(TRUE)
+              },
+              delay = 0.20
+            )
+          },
+          delay = 0.05
+        )
+      },
+      ignoreInit = FALSE,
+      priority = 1000
+    )
     
     selected_candidates <- shiny::reactive({
       cl <- selected_cluster()
@@ -4561,8 +5594,11 @@ ld_integrator_module_server <- function(
         ) %>%
         dplyr::mutate(cluster_id = normalize_cluster_id(cluster_id))
       
-      ca_sub2 <- ca_sub %>% dplyr::filter(cluster_id == cid)
-      if (nrow(ca_sub2) > 0) ca_sub <- ca_sub2
+      # IMPORTANT:
+      # For integrated LD, the genomic interval is the canonical selector.
+      # Do not restrict by cluster_id here because some apps encode IDs as chr11_1,
+      # while Integrator clusters may use global IDs such as 4.
+      ca_sub <- ca_sub
       
       ca_sub <- ca_sub %>%
         dplyr::mutate(classe = normalize_classe(classe)) %>%
@@ -4702,6 +5738,102 @@ ld_integrator_module_server <- function(
       NULL
     })
     
+    ld_selected_cluster_saved_paths <- shiny::reactive({
+      cid <- selected_cluster_id_r()
+      details_path <- cluster_details_rds_path_r()
+      summary_path <- cluster_summary_rds_path_r()
+      
+      has_details <- nzchar(details_path) && file.exists(details_path)
+      has_summary <- nzchar(summary_path) && file.exists(summary_path)
+      
+      append_log(
+        "[LD-PRECOMPUTED-CHECK] cluster=", cid,
+        " | details_path=", details_path,
+        " | summary_path=", summary_path,
+        " | details_exists=", has_details,
+        " | summary_exists=", has_summary
+      )
+      
+      list(
+        cluster_id = cid,
+        details_path = details_path,
+        summary_path = summary_path,
+        has_details = has_details,
+        has_summary = has_summary
+      )
+    })
+    
+    output$ld_precomputed_available_notice <- shiny::renderUI({
+      
+      saved <- ld_precomputed_available_state()
+      
+      if (!is.list(saved)) {
+        return(NULL)
+      }
+      
+      cid <- as.character(saved$cluster_id %||% "")
+      
+      if (!isTRUE(saved$has_details) && !isTRUE(saved$has_summary)) {
+        return(NULL)
+      }
+      
+      if (isTRUE(saved$has_details)) {
+        return(
+          shiny::div(
+            style = paste(
+              "font-size:13px;",
+              "color:#155724;",
+              "background:#d4edda;",
+              "border:1px solid #c3e6cb;",
+              "border-radius:8px;",
+              "padding:8px 10px;",
+              "margin-bottom:10px;"
+            ),
+            shiny::tags$b("Precomputed LD available: "),
+            paste0(
+              "saved LD data were found for cluster ",
+              cid,
+              ". They will be loaded automatically for the plot and block summary."
+            ),
+            shiny::tags$br(),
+            shiny::tags$span(
+              style = "color:#3c763d;",
+              "Use Compute LD / blocks only if you want to refresh or overwrite the precomputed result."
+            )
+          )
+        )
+      }
+      
+      if (isTRUE(saved$has_summary) && !isTRUE(saved$has_details)) {
+        return(
+          shiny::div(
+            style = paste(
+              "font-size:13px;",
+              "color:#856404;",
+              "background:#fff3cd;",
+              "border:1px solid #ffeeba;",
+              "border-radius:8px;",
+              "padding:8px 10px;",
+              "margin-bottom:10px;"
+            ),
+            shiny::tags$b("Precomputed LD block summary available: "),
+            paste0(
+              "a saved block summary was found for cluster ",
+              cid,
+              ", but no saved plot payload was found."
+            ),
+            shiny::tags$br(),
+            shiny::tags$span(
+              style = "color:#856404;",
+              "The table can be loaded from the precomputed summary, but the LD plot may require Compute LD / blocks."
+            )
+          )
+        )
+      }
+      
+      NULL
+    })
+    
     ld_pairs_for_summary_r <- shiny::reactive({
       saved <- ld_cluster_details_for_display()
       
@@ -4776,10 +5908,21 @@ ld_integrator_module_server <- function(
             is.data.frame(cl_row) && nrow(cl_row) > 0,
             "No selected cluster available."
           ))
+          
           shiny::validate(shiny::need(
             is.data.frame(ca_all) && nrow(ca_all) > 0,
             "Integrated candidates not available."
           ))
+          
+          session_dir <- active_integrator_dir()
+          
+          shiny::validate(shiny::need(
+            nzchar(session_dir) && dir.exists(session_dir),
+            "No active Integrator session folder available."
+          ))
+          
+          options(gi_active_integrator_dir = session_dir)
+          Sys.setenv(GI_ACTIVE_INTEGRATOR_DIR = session_dir)
           
           plink_bin <- input$plink_bin %||% ""
           bfile_ref <- input$bfile_ref_prefix %||% ""
@@ -4787,11 +5930,37 @@ ld_integrator_module_server <- function(
           keep_dir  <- input$ld_pops_dir %||% ""
           keep_path <- read_keep_file_dir(pop_sel, keep_dir)
           
-          maxn <- suppressWarnings(as.integer(input$ld_max_snps_interval %||% 400))
-          shiny::validate(shiny::need(is.finite(maxn) && maxn >= 2, "Invalid max SNPs limit."))
+          snp_limit_mode <- as.character(input$ld_snp_limit_mode %||% "auto")
+          
+          region_bp <- ld_region_size_bp(cl_row)
+          maxn_auto <- ld_recommended_max_snps(region_bp)
+          
+          maxn_manual <- suppressWarnings(as.integer(input$ld_max_snps_interval %||% 800))
+          
+          maxn <- if (identical(snp_limit_mode, "manual")) {
+            maxn_manual
+          } else {
+            maxn_auto
+          }
+          
+          shiny::validate(shiny::need(
+            is.finite(maxn) && maxn >= 2,
+            "Invalid max SNPs limit."
+          ))
           
           r2_min <- suppressWarnings(as.numeric(input$ld_proxy_r2_min %||% 0.6))
           ld_metric_now <- input$ld_metric %||% "R2"
+          
+          append_log(
+            "[LD-SNP-LIMIT] mode=", snp_limit_mode,
+            " | region_size=", ld_format_region_size(region_bp),
+            " | max_snps=", maxn
+          )
+          
+          append_log(
+            "[LD-PROXY] min_r2=", r2_min,
+            " | note: this threshold filters priority proxies, not PLINK block detection."
+          )
           
           # --------------------------------------------------
           # 2) common canonical bundle
@@ -4953,20 +6122,97 @@ ld_integrator_module_server <- function(
           # --------------------------------------------------
           # 4b) canonical block summary for table + persistence
           # --------------------------------------------------
-          session_dir <- active_integrator_dir()
+
+          gwas_bridge_for_summary <- NULL
           
-          gwas_bridge_save <- gwas_bridge_base_r()
+          if (is.data.frame(bundle$gwas_hits) && nrow(bundle$gwas_hits)) {
+            gwas_bridge_for_summary <- bundle$gwas_hits
+          } else if (is.data.frame(gwas_bridge_df) && nrow(gwas_bridge_df)) {
+            gwas_bridge_for_summary <- gwas_bridge_df
+          }
           
           canonical_block_summary <- block_overlap_summary_df(
-            block_ranges = bundle$block_ranges,
-            block_hits = bundle$block_hits,
-            block_genes = bundle$block_genes,
-            gwas_bridge_df = gwas_bridge_save,
-            proxy_tbl = bundle$proxies
+            block_ranges   = bundle$block_ranges,
+            block_hits     = bundle$block_hits,
+            block_genes    = bundle$block_genes,
+            gwas_bridge_df = gwas_bridge_for_summary,
+            proxy_tbl      = bundle$proxies
           )
           
-          if (!is.data.frame(canonical_block_summary)) {
+          canonical_block_summary <- build_block_ld_summary(canonical_block_summary)
+          
+          ld_struct_df <- summarize_ld_structure_by_block(
+            block_df = bundle$block_ranges,
+            ld_pairs_df = ld2
+          )  
+          
+          if (!is.data.frame(canonical_block_summary) || !nrow(canonical_block_summary)) {
             canonical_block_summary <- tibble::tibble()
+          } else if (is.data.frame(ld_struct_df) && nrow(ld_struct_df)) {
+            canonical_block_summary <- canonical_block_summary %>%
+              dplyr::select(
+                -dplyr::any_of(c(
+                  "n_ld_proxy_hits",
+                  "block_max_ld_value",
+                  "block_mean_ld_value",
+                  "ld_proxy_snps"
+                ))
+              ) %>%
+              dplyr::left_join(
+                ld_struct_df,
+                by = c("cluster_id", "block_id")
+              ) %>%
+              dplyr::mutate(
+                n_ld_proxy_hits = safe_int0(n_ld_proxy_hits),
+                block_max_ld_value = suppressWarnings(as.numeric(block_max_ld_value)),
+                block_mean_ld_value = suppressWarnings(as.numeric(block_mean_ld_value)),
+                ld_proxy_snps = dplyr::coalesce(as.character(ld_proxy_snps), "")
+              )
+          }
+          
+          detail_df <- summarize_hits_by_block(bundle$block_hits)
+          
+          detail_sum <- summarize_block_overlap_detail_for_dt(detail_df)
+          
+          if (is.data.frame(detail_sum) &&
+              nrow(detail_sum) &&
+              is.data.frame(canonical_block_summary) &&
+              nrow(canonical_block_summary)) {
+            
+            canonical_block_summary <- canonical_block_summary %>%
+              dplyr::select(
+                -dplyr::any_of(c(
+                  "gwas_hits",
+                  "catalog_hits",
+                  "gtex_hits",
+                  "nonsyn_hits",
+                  "ewasdis_hits",
+                  "ewastum_hits",
+                  "n_external_apps",
+                  "external_apps",
+                  "marker_status"
+                ))
+              ) %>%
+              dplyr::left_join(
+                detail_sum %>%
+                  dplyr::select(
+                    cluster_id,
+                    block_id,
+                    n_lead_snps,
+                    lead_snps,
+                    lead_positions,
+                    gwas_hits,
+                    catalog_hits,
+                    gtex_hits,
+                    nonsyn_hits,
+                    ewasdis_hits,
+                    ewastum_hits,
+                    n_external_apps,
+                    external_apps,
+                    marker_status
+                  ),
+                by = c("cluster_id", "block_id")
+              )
           }
           
           cat("[DBG RUN] canonical_block_summary nrow = ", nrow(canonical_block_summary), "\n", sep = "")
@@ -4998,7 +6244,16 @@ ld_integrator_module_server <- function(
           # --------------------------------------------------
           # 6) save cluster-specific RDS
           # --------------------------------------------------
-          if (nzchar(session_dir) && dir.exists(session_dir)) {
+          
+          session_dir <- tryCatch(active_integrator_dir(), error = function(e) "")
+          session_dir <- as.character(session_dir %||% "")
+          
+          if (!nzchar(session_dir) || !dir.exists(session_dir)) {
+            append_log("[LD-ALL][SAVE][SKIP] No valid session_dir for saving cluster LD RDS.")
+          } else {
+            
+            options(gi_active_integrator_dir = session_dir)
+            Sys.setenv(GI_ACTIVE_INTEGRATOR_DIR = session_dir)
             
             cid_safe <- gsub("[^A-Za-z0-9_\\-]", "_", as.character(cid))
             
@@ -5070,7 +6325,6 @@ ld_integrator_module_server <- function(
               } else {
                 0L
               },
-              
               n_block_genes = if (is.data.frame(canonical_block_summary) && nrow(canonical_block_summary) && "n_genes_in_block" %in% names(canonical_block_summary)) {
                 sum(canonical_block_summary$n_genes_in_block, na.rm = TRUE)
               } else if (is.data.frame(canonical_block_summary) && nrow(canonical_block_summary) && "n_block_genes" %in% names(canonical_block_summary)) {
@@ -5084,8 +6338,13 @@ ld_integrator_module_server <- function(
               stringsAsFactors = FALSE
             )
             
+            summary_tbl <- canonical_block_summary
+            
+            if (!is.data.frame(summary_tbl)) {
+              summary_tbl <- data.frame()
+            }
+            
             details_one <- list(
-              # identificació bàsica
               cluster_id = bundle$cluster_id,
               chr = as.character(chr_sel),
               start = as.integer(st),
@@ -5093,8 +6352,6 @@ ld_integrator_module_server <- function(
               population = as.character(pop_sel),
               ld_metric = as.character(ld_metric_now),
               x_mode = as.character(input$ld_x_mode %||% "bp"),
-              
-              # objectes canònics
               fl = bundle$fl,
               bim = bundle$bim,
               candidates = bundle$candidates,
@@ -5106,14 +6363,10 @@ ld_integrator_module_server <- function(
               block_ranges = bundle$block_ranges,
               block_hits = bundle$block_hits,
               block_genes = bundle$block_genes,
-              block_summary = NULL,
-              
-              # objectes específics del plot
+              block_summary = summary_tbl,
               fl_plot = fl2,
               ld_pairs = ld2,
               cand_tracks = cand_tracks,
-              
-              # metadades de render
               plot_meta = list(
                 x_mode = as.character(input$ld_x_mode %||% "bp"),
                 ld_metric = as.character(ld_metric_now),
@@ -5121,26 +6374,12 @@ ld_integrator_module_server <- function(
                 ld_proxy_r2_min = as.numeric(r2_min),
                 saved_at = as.character(Sys.time())
               ),
-              
-              # resum final
               summary = summary_one
             )
             
-            summary_tbl <- canonical_block_summary
-            
-            if (!is.data.frame(summary_tbl)) {
-              summary_tbl <- data.frame()
-            }
-            
             cat("[LD-SAVE SUMMARY] class(summary_tbl) = ", paste(class(summary_tbl), collapse = ", "), "\n", sep = "")
-            cat("[LD-SAVE SUMMARY] is.data.frame(summary_tbl) = ", is.data.frame(summary_tbl), "\n", sep = "")
             cat("[LD-SAVE SUMMARY] nrow(summary_tbl) = ", if (is.data.frame(summary_tbl)) nrow(summary_tbl) else NA, "\n", sep = "")
             cat("[LD-SAVE SUMMARY] ncol(summary_tbl) = ", if (is.data.frame(summary_tbl)) ncol(summary_tbl) else NA, "\n", sep = "")
-            if (is.data.frame(summary_tbl)) {
-              cat("[LD-SAVE SUMMARY] names = ", paste(names(summary_tbl), collapse = ", "), "\n", sep = "")
-            }
-            
-            details_one$block_summary <- summary_tbl
             
             saveRDS(summary_tbl, summary_path_one)
             saveRDS(details_one, details_path_one)
@@ -5347,19 +6586,21 @@ ld_integrator_module_server <- function(
       if (!requireNamespace("plotly", quietly = TRUE)) return(NULL)
       
       if (is.function(append_log)) {
-        append_log("[GENE] building collapsed gene track | chr=", chr_sel, " start=", st, " end=", en)
+        append_log("[GENE] building robust gene track | chr=", chr_sel, " start=", st, " end=", en)
       }
       
       chr_ucsc <- paste0("chr", chr_label_plink(chr_sel))
       
       region_gr <- GenomicRanges::GRanges(
         seqnames = chr_ucsc,
-        ranges   = IRanges::IRanges(start = st, end = en)
+        ranges = IRanges::IRanges(start = st, end = en)
       )
       
       txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene::TxDb.Hsapiens.UCSC.hg38.knownGene
       
-      genes_gr <- suppressMessages(GenomicFeatures::genes(txdb, single.strand.genes.only = TRUE))
+      genes_gr <- suppressMessages(
+        GenomicFeatures::genes(txdb, single.strand.genes.only = TRUE)
+      )
       GenomeInfoDb::seqlevelsStyle(genes_gr) <- GenomeInfoDb::seqlevelsStyle(region_gr)[1]
       
       ov <- GenomicRanges::findOverlaps(genes_gr, region_gr, ignore.strand = TRUE)
@@ -5379,7 +6620,7 @@ ld_integrator_module_server <- function(
       gene_df <- data.frame(
         gene_id = gene_id,
         gene_start = GenomicRanges::start(gsub_gr),
-        gene_end   = GenomicRanges::end(gsub_gr),
+        gene_end = GenomicRanges::end(gsub_gr),
         stringsAsFactors = FALSE
       )
       
@@ -5387,7 +6628,7 @@ ld_integrator_module_server <- function(
         suppressMessages(
           AnnotationDbi::select(
             org.Hs.eg.db::org.Hs.eg.db,
-            keys    = unique(gene_df$gene_id),
+            keys = unique(gene_df$gene_id),
             keytype = "ENTREZID",
             columns = c("SYMBOL")
           )
@@ -5400,13 +6641,18 @@ ld_integrator_module_server <- function(
           dplyr::mutate(gene_id = as.character(ENTREZID)) %>%
           dplyr::select(gene_id, SYMBOL) %>%
           dplyr::distinct(gene_id, .keep_all = TRUE)
+        
         gene_df <- gene_df %>% dplyr::left_join(mp, by = "gene_id")
-      } else {
+      }
+      
+      if (!"SYMBOL" %in% names(gene_df)) {
         gene_df$SYMBOL <- gene_df$gene_id
       }
       
       gene_df <- gene_df %>%
-        dplyr::mutate(label = dplyr::coalesce(SYMBOL, gene_id)) %>%
+        dplyr::mutate(
+          label = dplyr::coalesce(as.character(SYMBOL), as.character(gene_id))
+        ) %>%
         dplyr::arrange(gene_start, gene_end) %>%
         dplyr::mutate(track_y = -seq_len(dplyr::n()))
       
@@ -5414,83 +6660,11 @@ ld_integrator_module_server <- function(
         append_log("[GENE] genes overlapping region n=", nrow(gene_df))
       }
       
-      ex_all <- suppressMessages(GenomicFeatures::exons(txdb, columns = c("gene_id")))
-      GenomeInfoDb::seqlevelsStyle(ex_all) <- GenomeInfoDb::seqlevelsStyle(region_gr)[1]
-      
-      ov_ex <- GenomicRanges::findOverlaps(ex_all, region_gr, ignore.strand = TRUE)
-      ex_sub <- ex_all[unique(S4Vectors::queryHits(ov_ex))]
-      
-      if (!length(ex_sub)) {
-        if (is.function(append_log)) append_log("[GENE] no exons overlapping region")
-        return(NULL)
-      }
-      
-      ex_gene_id <- S4Vectors::mcols(ex_sub)$gene_id
-      if (is.null(ex_gene_id)) {
-        if (is.function(append_log)) append_log("[GENE] exon gene_id missing")
-        return(NULL)
-      }
-      
-      ex_df <- data.frame(
-        gene_id = as.character(ex_gene_id),
-        exon_start = GenomicRanges::start(ex_sub),
-        exon_end   = GenomicRanges::end(ex_sub),
-        stringsAsFactors = FALSE
-      ) %>%
-        dplyr::filter(gene_id %in% gene_df$gene_id)
-      
-      if (!nrow(ex_df)) {
-        if (is.function(append_log)) append_log("[GENE] exon_df empty after gene filter")
-        return(NULL)
-      }
-      
-      collapse_exons_one_gene <- function(df_one) {
-        df_one <- df_one[order(df_one$exon_start, df_one$exon_end), , drop = FALSE]
-        
-        starts <- df_one$exon_start
-        ends   <- df_one$exon_end
-        
-        out_start <- integer(0)
-        out_end   <- integer(0)
-        
-        cur_s <- starts[1]
-        cur_e <- ends[1]
-        
-        if (length(starts) > 1) {
-          for (k in 2:length(starts)) {
-            if (starts[k] <= (cur_e + 1)) {
-              cur_e <- max(cur_e, ends[k])
-            } else {
-              out_start <- c(out_start, cur_s)
-              out_end   <- c(out_end, cur_e)
-              cur_s <- starts[k]
-              cur_e <- ends[k]
-            }
-          }
-        }
-        
-        out_start <- c(out_start, cur_s)
-        out_end   <- c(out_end, cur_e)
-        
-        data.frame(
-          gene_id = df_one$gene_id[1],
-          exon_start = out_start,
-          exon_end = out_end,
-          stringsAsFactors = FALSE
-        )
-      }
-      
-      ex_collapsed <- do.call(
-        rbind,
-        lapply(split(ex_df, ex_df$gene_id), collapse_exons_one_gene)
-      )
-      
-      ex_collapsed <- ex_collapsed %>%
-        dplyr::left_join(gene_df %>% dplyr::select(gene_id, label, track_y), by = "gene_id")
-      
       bp_to_x <- function(bp_vec) {
         bp_vec <- suppressWarnings(as.numeric(bp_vec))
+        
         if (!identical(x_mode, "equal")) return(bp_vec)
+        if (!is.data.frame(fl) || !"BP" %in% names(fl) || !"X" %in% names(fl)) return(bp_vec)
         
         stats::approx(
           x = fl$BP,
@@ -5507,19 +6681,15 @@ ld_integrator_module_server <- function(
           x1 = bp_to_x(gene_end)
         )
       
-      ex_collapsed <- ex_collapsed %>%
-        dplyr::mutate(
-          x0 = bp_to_x(exon_start),
-          x1 = bp_to_x(exon_end)
-        )
-      
       p_gene <- plotly::plot_ly()
       
       for (i in seq_len(nrow(gene_df))) {
         p_gene <- p_gene %>%
           plotly::add_segments(
-            x = gene_df$x0[i], xend = gene_df$x1[i],
-            y = gene_df$track_y[i], yend = gene_df$track_y[i],
+            x = gene_df$x0[i],
+            xend = gene_df$x1[i],
+            y = gene_df$track_y[i],
+            yend = gene_df$track_y[i],
             inherit = FALSE,
             hoverinfo = "text",
             text = paste0(
@@ -5528,7 +6698,7 @@ ld_integrator_module_server <- function(
               "<br>End: ", gene_df$gene_end[i]
             ),
             showlegend = FALSE,
-            line = list(width = 1)
+            line = list(width = 2)
           ) %>%
           plotly::add_text(
             x = x_limits2[2],
@@ -5541,28 +6711,128 @@ ld_integrator_module_server <- function(
           )
       }
       
-      exon_half_height <- 0.28
-      
-      for (i in seq_len(nrow(ex_collapsed))) {
-        y0 <- ex_collapsed$track_y[i] - exon_half_height
-        y1 <- ex_collapsed$track_y[i] + exon_half_height
+      ex_collapsed <- tryCatch({
+        ex_by_gene <- suppressMessages(
+          GenomicFeatures::exonsBy(txdb, by = "gene")
+        )
         
-        p_gene <- p_gene %>%
-          plotly::add_trace(
-            type = "scatter",
-            mode = "lines",
-            x = c(ex_collapsed$x0[i], ex_collapsed$x1[i], ex_collapsed$x1[i], ex_collapsed$x0[i], ex_collapsed$x0[i]),
-            y = c(y0, y0, y1, y1, y0),
-            fill = "toself",
-            inherit = FALSE,
-            hoverinfo = "text",
-            text = paste0(
-              "Gene: ", ex_collapsed$label[i],
-              "<br>Exon: ", ex_collapsed$exon_start[i], "-", ex_collapsed$exon_end[i]
-            ),
-            showlegend = FALSE,
-            line = list(width = 1)
-          )
+        ex_by_gene <- ex_by_gene[names(ex_by_gene) %in% gene_df$gene_id]
+        
+        if (!length(ex_by_gene)) {
+          NULL
+        } else {
+          ex_un <- unlist(ex_by_gene, use.names = FALSE)
+          ex_gene_id <- rep(names(ex_by_gene), S4Vectors::elementNROWS(ex_by_gene))
+          
+          GenomeInfoDb::seqlevelsStyle(ex_un) <- GenomeInfoDb::seqlevelsStyle(region_gr)[1]
+          
+          ov_ex <- GenomicRanges::findOverlaps(ex_un, region_gr, ignore.strand = TRUE)
+          ex_keep <- unique(S4Vectors::queryHits(ov_ex))
+          
+          if (!length(ex_keep)) {
+            NULL
+          } else {
+            ex_sub <- ex_un[ex_keep]
+            
+            ex_df <- data.frame(
+              gene_id = as.character(ex_gene_id[ex_keep]),
+              exon_start = GenomicRanges::start(ex_sub),
+              exon_end = GenomicRanges::end(ex_sub),
+              stringsAsFactors = FALSE
+            ) %>%
+              dplyr::filter(gene_id %in% gene_df$gene_id)
+            
+            if (!nrow(ex_df)) {
+              NULL
+            } else {
+              collapse_exons_one_gene <- function(df_one) {
+                df_one <- df_one[order(df_one$exon_start, df_one$exon_end), , drop = FALSE]
+                
+                starts <- df_one$exon_start
+                ends <- df_one$exon_end
+                
+                out_start <- integer(0)
+                out_end <- integer(0)
+                
+                cur_s <- starts[1]
+                cur_e <- ends[1]
+                
+                if (length(starts) > 1) {
+                  for (k in 2:length(starts)) {
+                    if (starts[k] <= cur_e + 1) {
+                      cur_e <- max(cur_e, ends[k])
+                    } else {
+                      out_start <- c(out_start, cur_s)
+                      out_end <- c(out_end, cur_e)
+                      cur_s <- starts[k]
+                      cur_e <- ends[k]
+                    }
+                  }
+                }
+                
+                out_start <- c(out_start, cur_s)
+                out_end <- c(out_end, cur_e)
+                
+                data.frame(
+                  gene_id = df_one$gene_id[1],
+                  exon_start = out_start,
+                  exon_end = out_end,
+                  stringsAsFactors = FALSE
+                )
+              }
+              
+              do.call(
+                rbind,
+                lapply(split(ex_df, ex_df$gene_id), collapse_exons_one_gene)
+              ) %>%
+                dplyr::left_join(
+                  gene_df %>% dplyr::select(gene_id, label, track_y),
+                  by = "gene_id"
+                ) %>%
+                dplyr::mutate(
+                  x0 = bp_to_x(exon_start),
+                  x1 = bp_to_x(exon_end)
+                )
+            }
+          }
+        }
+      }, error = function(e) {
+        if (is.function(append_log)) {
+          append_log("[GENE] exon layer skipped: ", conditionMessage(e))
+        }
+        NULL
+      })
+      
+      if (is.data.frame(ex_collapsed) && nrow(ex_collapsed)) {
+        exon_half_height <- 0.28
+        
+        for (i in seq_len(nrow(ex_collapsed))) {
+          y0 <- ex_collapsed$track_y[i] - exon_half_height
+          y1 <- ex_collapsed$track_y[i] + exon_half_height
+          
+          p_gene <- p_gene %>%
+            plotly::add_trace(
+              type = "scatter",
+              mode = "lines",
+              x = c(
+                ex_collapsed$x0[i],
+                ex_collapsed$x1[i],
+                ex_collapsed$x1[i],
+                ex_collapsed$x0[i],
+                ex_collapsed$x0[i]
+              ),
+              y = c(y0, y0, y1, y1, y0),
+              fill = "toself",
+              inherit = FALSE,
+              hoverinfo = "text",
+              text = paste0(
+                "Gene: ", ex_collapsed$label[i],
+                "<br>Exon: ", ex_collapsed$exon_start[i], "-", ex_collapsed$exon_end[i]
+              ),
+              showlegend = FALSE,
+              line = list(width = 1)
+            )
+        }
       }
       
       p_gene %>%
@@ -5574,16 +6844,36 @@ ld_integrator_module_server <- function(
           ),
           yaxis = list(
             showticklabels = FALSE,
-            title = ""
+            title = "",
+            range = c(min(gene_df$track_y, na.rm = TRUE) - 1, 0.5)
           ),
           margin = list(l = 40, r = 120, t = 10, b = 0)
         )
-    }
+    } 
     
-    
+    recomb_df_r <- reactive({
+      path <- normalizePath(file.path(getwd(), "www", "recomb_decode_avg.bedGraph"), mustWork = FALSE)
+      validate(need(file.exists(path), paste("Recombination track file not found:", path)))
+      
+      readr::read_tsv(
+        path,
+        comment = "t",
+        col_names = c("chr", "start", "end", "rate"),
+        col_types = readr::cols(
+          chr = readr::col_character(),
+          start = readr::col_double(),
+          end = readr::col_double(),
+          rate = readr::col_double()
+        )
+      ) %>%
+        dplyr::filter(is.finite(start), is.finite(end), is.finite(rate))
+    })
     
     
     output$ld_plot <- plotly::renderPlotly({
+      shiny::req(isTRUE(ld_plot_load_allowed()))
+      
+      append_log("[LD-PLOT][RENDER] entered")
       
       payload <- ld_plot_payload()
       
@@ -5614,7 +6904,7 @@ ld_integrator_module_server <- function(
         shiny::need(is.data.frame(ld) && nrow(ld) > 0, "No LD pairs available.")
       )
       
-      metric <- input$ld_metric %||% "R2"
+      metric <- ld_metric_plot %||% "R2"
       x_mode <- input$ld_x_mode %||% "bp"
       
       append_log("[LD-PLOT][RENDER] entered")
@@ -5647,56 +6937,144 @@ ld_integrator_module_server <- function(
       bp_span <- diff(range(fl$BP, na.rm = TRUE))
       if (!is.finite(bp_span) || bp_span <= 0) bp_span <- 1
       
+      bp_to_x_track <- function(bp_vec, fl_df, x_mode_cur) {
+        bp_vec <- suppressWarnings(as.numeric(bp_vec))
+        
+        if (!identical(x_mode_cur, "equal")) {
+          return(bp_vec)
+        }
+        
+        if (!is.data.frame(fl_df) || !all(c("BP", "X") %in% names(fl_df)) || nrow(fl_df) == 0) {
+          return(rep(NA_real_, length(bp_vec)))
+        }
+        
+        fl_df <- fl_df %>%
+          dplyr::mutate(
+            BP = suppressWarnings(as.numeric(BP)),
+            X = suppressWarnings(as.numeric(X))
+          ) %>%
+          dplyr::filter(is.finite(BP), is.finite(X)) %>%
+          dplyr::arrange(BP, X) %>%
+          dplyr::distinct(BP, .keep_all = TRUE)
+        
+        if (nrow(fl_df) < 2) {
+          return(rep(NA_real_, length(bp_vec)))
+        }
+        
+        stats::approx(
+          x = fl_df$BP,
+          y = fl_df$X,
+          xout = bp_vec,
+          rule = 2,
+          ties = "ordered"
+        )$y
+      }
+      
+      ld_plot_min_value <- suppressWarnings(as.numeric(input$ld_plot_min_value %||% 0.1))
+      
+      if (!is.finite(ld_plot_min_value) || ld_plot_min_value < 0) {
+        ld_plot_min_value <- 0
+      }
+      
+      ld_plot_min_value <- min(ld_plot_min_value, 1)
+      
       tri <- ld %>%
         dplyr::transmute(
           SNP_A = as.character(SNP_A),
           SNP_B = as.character(SNP_B),
           val   = suppressWarnings(as.numeric(value))
         ) %>%
-        dplyr::filter(is.finite(val), SNP_A %in% fl$SNP, SNP_B %in% fl$SNP) %>%
+        dplyr::filter(
+          is.finite(val),
+          val >= ld_plot_min_value,
+          SNP_A %in% fl$SNP,
+          SNP_B %in% fl$SNP,
+          SNP_A != SNP_B
+        ) %>%
         dplyr::mutate(
           X_A = unname(xmap[SNP_A]),
           X_B = unname(xmap[SNP_B]),
-          i   = unname(idxmap[SNP_A]),
-          j   = unname(idxmap[SNP_B]),
-          bpA = unname(bpmap[SNP_A]),
-          bpB = unname(bpmap[SNP_B]),
-          x_mid = (X_A + X_B) / 2,
-          y = if (identical(x_mode, "equal")) {
-            -(abs(j - i) / max(1, nrow(fl) - 1))
-          } else {
-            -(abs(bpB - bpA) / bp_span)
-          },
-          hover = paste0(
-            "SNP_A: ", SNP_A,
-            "<br>SNP_B: ", SNP_B,
-            "<br>", metric, ": ", signif(val, 3),
-            "<br>BP_A: ", bpA,
-            "<br>BP_B: ", bpB
-          )
+          i_raw = unname(idxmap[SNP_A]),
+          j_raw = unname(idxmap[SNP_B]),
+          bpA_raw = unname(bpmap[SNP_A]),
+          bpB_raw = unname(bpmap[SNP_B])
         ) %>%
-        dplyr::filter(is.finite(x_mid), is.finite(y))
+        dplyr::filter(
+          is.finite(X_A),
+          is.finite(X_B),
+          is.finite(i_raw),
+          is.finite(j_raw),
+          is.finite(bpA_raw),
+          is.finite(bpB_raw)
+        ) %>%
+        dplyr::mutate(
+          # Force one non-redundant triangle
+          i = pmax(i_raw, j_raw),
+          j = pmin(i_raw, j_raw),
+          SNP_i = dplyr::if_else(i_raw >= j_raw, SNP_A, SNP_B),
+          SNP_j = dplyr::if_else(i_raw >= j_raw, SNP_B, SNP_A),
+          bp_i = dplyr::if_else(i_raw >= j_raw, bpA_raw, bpB_raw),
+          bp_j = dplyr::if_else(i_raw >= j_raw, bpB_raw, bpA_raw),
+          X_i = dplyr::if_else(i_raw >= j_raw, X_A, X_B),
+          X_j = dplyr::if_else(i_raw >= j_raw, X_B, X_A)
+        ) %>%
+        dplyr::filter(i > j) %>%
+        dplyr::distinct(i, j, .keep_all = TRUE) %>%
+        dplyr::mutate(
+          x_mid = (X_i + X_j) / 2,
+          y = if (identical(x_mode, "equal")) {
+            -(abs(i - j) / max(1, nrow(fl) - 1))
+          } else {
+            -(abs(bp_i - bp_j) / bp_span)
+          }
+         # ,
+         # hover = paste0(
+         #   "SNP_A: ", SNP_i,
+         #   "<br>SNP_B: ", SNP_j,
+         #   "<br>", metric, ": ", signif(val, 3),
+         #   "<br>BP_A: ", bp_i,
+         #   "<br>BP_B: ", bp_j
+         # )
+        ) %>%
+        dplyr::filter(
+          is.finite(x_mid),
+          is.finite(y)
+        )
       
-      shiny::validate(shiny::need(nrow(tri) > 0, "No LD pairs to plot."))
+      append_log(
+        "[LD-PLOT] plotted LD pairs after non-redundant triangle/filter: ",
+        nrow(tri),
+        " | min_plot_value=",
+        ld_plot_min_value
+      )
+      
+      shiny::validate(
+        shiny::need(
+          nrow(tri) > 0,
+          "No LD pairs to plot after filtering. Lower 'Min LD value to plot'."
+        )
+      )
+      
+      ld_plot_max_pairs <- suppressWarnings(as.integer(input$ld_plot_max_pairs %||% 30000))
+      
+      if (!is.finite(ld_plot_max_pairs) || ld_plot_max_pairs < 1000) {
+        ld_plot_max_pairs <- 30000L
+      }
+      
+      if (nrow(tri) > ld_plot_max_pairs) {
+        tri <- tri %>%
+          dplyr::arrange(dplyr::desc(val)) %>%
+          dplyr::slice_head(n = ld_plot_max_pairs) %>%
+          dplyr::arrange(x_mid, y)
+        
+        append_log(
+          "[LD-PLOT] downsampled LD pairs for browser: ",
+          ld_plot_max_pairs,
+          " strongest pairs retained."
+        )
+      }
       
       cand <- if (is.data.frame(cand0) && nrow(cand0)) {
-        
-        bp_to_x_track <- function(bp_vec, fl_df, x_mode_cur) {
-          bp_vec <- suppressWarnings(as.numeric(bp_vec))
-          
-          if (!identical(x_mode_cur, "equal")) {
-            return(bp_vec)
-          }
-          
-          stats::approx(
-            x = fl_df$BP,
-            y = fl_df$X,
-            xout = bp_vec,
-            rule = 2,
-            ties = "ordered"
-          )$y
-        }
-        
         cand0 %>%
           dplyr::mutate(
             BP = suppressWarnings(as.integer(BP)),
@@ -5711,11 +7089,9 @@ ld_integrator_module_server <- function(
               "ID: ", label_id,
               "<br>BP: ", BP,
               "<br>classe: ", classe
-           #   "<br>source_app: ", source_app
             )
           ) %>%
           dplyr::distinct(BP, classe, label_id, source_app, .keep_all = TRUE)
-        
       } else {
         tibble::tibble()
       }
@@ -5740,6 +7116,9 @@ ld_integrator_module_server <- function(
       
       track_base_y <- seq(0.04, by = 0.10, length.out = length(cand_classes))
       names(track_base_y) <- cand_classes
+      
+      recomb_y0 <- if (length(track_base_y)) max(track_base_y) + 0.12 else 0.08
+      recomb_y1 <- recomb_y0 + 0.18
       
       if (nrow(cand) > 0) {
         cand <- cand %>%
@@ -5778,6 +7157,96 @@ ld_integrator_module_server <- function(
         )
       }
       
+      # ===============================
+      # RECOMBINATION TRACK DATA
+      # ===============================
+      rr_track <- tibble::tibble()
+      
+      if (is.finite(as.numeric(payload$chr)) &&
+          is.finite(as.numeric(payload$start)) &&
+          is.finite(as.numeric(payload$end))) {
+        
+        rr_track <- tryCatch({
+          recomb_path <- normalizePath(
+            file.path(getwd(), "www", "recomb_decode_avg.bedGraph"),
+            mustWork = FALSE
+          )
+          
+          if (!file.exists(recomb_path)) {
+            append_log("[RECOMB] file not found: ", recomb_path)
+            tibble::tibble()
+          } else {
+            rr_lines <- readLines(recomb_path, warn = FALSE)
+            rr_lines <- rr_lines[grepl("^chr", rr_lines)]
+            
+            rr <- readr::read_tsv(
+              paste(rr_lines, collapse = "\n"),
+              col_names = c("chr", "start", "end", "rate"),
+              col_types = readr::cols(
+                chr = readr::col_character(),
+                start = readr::col_double(),
+                end = readr::col_double(),
+                rate = readr::col_double()
+              ),
+              show_col_types = FALSE
+            ) %>%
+              dplyr::filter(
+                !is.na(.data$chr),
+                is.finite(.data$start),
+                is.finite(.data$end),
+                is.finite(.data$rate)
+              )
+            
+            chr_lab <- paste0("chr", chr_label_plink(as.integer(payload$chr)))
+            st_reg <- as.integer(payload$start)
+            en_reg <- as.integer(payload$end)
+            
+            rr <- rr %>%
+              dplyr::filter(
+                .data$chr == chr_lab,
+                .data$end >= st_reg,
+                .data$start <= en_reg
+              ) %>%
+              dplyr::mutate(
+                mid = (.data$start + .data$end) / 2,
+                X = bp_to_x_track(.data$mid, fl, x_mode)
+              ) %>%
+              dplyr::filter(
+                is.finite(.data$X),
+                is.finite(.data$rate)
+              ) %>%
+              dplyr::arrange(.data$X)
+            
+            append_log("[RECOMB] rows in region=", nrow(rr))
+            
+            if (!nrow(rr)) {
+              tibble::tibble()
+            } else {
+              append_log(
+                "[RECOMB] rate range = ",
+                paste(range(rr$rate, na.rm = TRUE), collapse = " - ")
+              )
+              
+              q99 <- suppressWarnings(stats::quantile(rr$rate, 0.99, na.rm = TRUE))
+              if (!is.finite(q99) || q99 <= 0) q99 <- max(rr$rate, na.rm = TRUE)
+              if (!is.finite(q99) || q99 <= 0) q99 <- 1
+              
+              rr %>%
+                dplyr::mutate(
+                  rate_plot = pmin(.data$rate, q99),
+                  hover = paste0(
+                    "Recombination rate: ", signif(.data$rate, 4),
+                    " cM/Mb<br>",
+                    .data$chr, ":", .data$start, "-", .data$end
+                  )
+                )
+            }
+          }
+        }, error = function(e) {
+          append_log("[RECOMB][ERROR] ", conditionMessage(e))
+          tibble::tibble()
+        })
+      }
       
       p <- plotly::plot_ly()
       
@@ -5789,13 +7258,12 @@ ld_integrator_module_server <- function(
           data = tri,
           x = ~x_mid,
           y = ~y,
-          type = "scatter",
+          type = "scattergl",
           mode = "markers",
-          text = ~hover,
-          hoverinfo = "text",
+          hoverinfo = "skip",
           marker = list(
             symbol = "square",
-            size = 9,
+            size = 5,
             color = tri$val,
             cmin = 0,
             cmax = 1,
@@ -5812,24 +7280,45 @@ ld_integrator_module_server <- function(
       # ===============================
       # LD BLOCKS
       # ===============================
-      bd <- NULL
+      
+      block_shapes <- list()
+      block_annotations <- list()
+      
+      bd <- tibble::tibble(
+        i = integer(),
+        j = integer(),
+        xL = numeric(),
+        xR = numeric(),
+        xM = numeric(),
+        bpL = integer(),
+        bpR = integer(),
+        block_label = character(),
+        yA = numeric(),
+        hover_block = character()
+      )
+      
+      ld_block_y_min <- NA_real_
       
       if (is.data.frame(bd0) && nrow(bd0) > 0) {
         
-        bd <- bd0 %>%
+        bd_tmp <- bd0 %>%
           dplyr::mutate(
             i = suppressWarnings(as.integer(i)),
             j = suppressWarnings(as.integer(j))
           ) %>%
           dplyr::filter(
-            is.finite(i), is.finite(j),
-            i >= 1, j >= 1,
-            i <= nrow(fl), j <= nrow(fl),
+            is.finite(i),
+            is.finite(j),
+            i >= 1,
+            j >= 1,
+            i <= nrow(fl),
+            j <= nrow(fl),
             j > i
           )
         
-        if (nrow(bd) > 0) {
-          bd <- bd %>%
+        if (is.data.frame(bd_tmp) && nrow(bd_tmp) > 0) {
+          
+          bd_tmp <- bd_tmp %>%
             dplyr::mutate(
               xL  = fl$X[i],
               xR  = fl$X[j],
@@ -5837,69 +7326,189 @@ ld_integrator_module_server <- function(
               bpL = fl$BP[i],
               bpR = fl$BP[j]
             ) %>%
-            dplyr::filter(is.finite(xL), is.finite(xR), is.finite(xM), is.finite(bpL), is.finite(bpR)) %>%
+            dplyr::filter(
+              is.finite(xL),
+              is.finite(xR),
+              is.finite(xM),
+              is.finite(bpL),
+              is.finite(bpR)
+            ) %>%
             dplyr::mutate(
               block_label = paste0("B", dplyr::row_number())
             )
           
-          if (nrow(bd) > 0) {
+          if (is.data.frame(bd_tmp) && nrow(bd_tmp) > 0) {
+            
             y0_blk <- -0.01
             
             if (identical(x_mode, "equal")) {
               denom <- max(1, nrow(fl) - 1)
-              bd <- bd %>% dplyr::mutate(yA = -(abs(j - i) / denom))
+              bd_tmp <- bd_tmp %>%
+                dplyr::mutate(
+                  yA = -(abs(j - i) / denom)
+                )
             } else {
-              bd <- bd %>% dplyr::mutate(yA = -(abs(bpR - bpL) / bp_span))
+              bd_tmp <- bd_tmp %>%
+                dplyr::mutate(
+                  yA = -(abs(bpR - bpL) / bp_span)
+                )
             }
             
-            bd <- bd %>% dplyr::mutate(yA = pmin(yA, y0_blk - 0.02))
-            
-            p <- p %>%
-              plotly::add_segments(
-                data = bd,
-                x = ~xL, xend = ~xR,
-                y = y0_blk, yend = y0_blk,
-                inherit = FALSE,
-                hoverinfo = "skip",
-                showlegend = FALSE,
-                line = list(width = 2)
-              ) %>%
-              plotly::add_segments(
-                data = bd,
-                x = ~xL, xend = ~xM,
-                y = y0_blk, yend = ~yA,
-                inherit = FALSE,
-                hoverinfo = "skip",
-                showlegend = FALSE,
-                line = list(width = 2)
-              ) %>%
-              plotly::add_segments(
-                data = bd,
-                x = ~xR, xend = ~xM,
-                y = y0_blk, yend = ~yA,
-                inherit = FALSE,
-                hoverinfo = "skip",
-                showlegend = FALSE,
-                line = list(width = 2)
-              ) %>%
-              plotly::add_text(
-                data = bd,
-                x = ~xM,
-                y = y0_blk + 0.03,
-                text = ~block_label,
-                textposition = "middle center",
-                inherit = FALSE,
-                hovertext = ~paste0(block_label, "<br>BP: ", bpL, "-", bpR),
-                hoverinfo = "text",
-                textfont = list(size = 11),
-                showlegend = FALSE
+            bd_tmp <- bd_tmp %>%
+              dplyr::mutate(
+                yA = pmin(yA, y0_blk - 0.02),
+                hover_block = paste0(
+                  block_label,
+                  "<br>BP: ", bpL, "-", bpR,
+                  "<br>Size: ", format(bpR - bpL, big.mark = ","), " bp"
+                )
               )
+            
+            bd <- bd_tmp
+            ld_block_y_min <- min(bd$yA, na.rm = TRUE)
+            
+            append_log("[LD-PLOT][BLOCKS] blocks plotted=", nrow(bd))
+            append_log("[LD-PLOT][BLOCKS] y_min=", ld_block_y_min)
+            
+            # --------------------------------------------------
+            # Draw LD block triangles as layout shapes.
+            # This keeps them above scattergl/WebGL LD points.
+            # --------------------------------------------------
+            block_shapes <- unlist(
+              lapply(seq_len(nrow(bd)), function(k) {
+                
+                xL <- bd$xL[k]
+                xR <- bd$xR[k]
+                xM <- bd$xM[k]
+                yA <- bd$yA[k]
+                
+                list(
+                  # base
+                  list(
+                    type = "line",
+                    x0 = xL,
+                    x1 = xR,
+                    y0 = y0_blk,
+                    y1 = y0_blk,
+                    xref = "x",
+                    yref = "y",
+                    layer = "above",
+                    line = list(color = "black", width = 3)
+                  ),
+                  
+                  # left side
+                  list(
+                    type = "line",
+                    x0 = xL,
+                    x1 = xM,
+                    y0 = y0_blk,
+                    y1 = yA,
+                    xref = "x",
+                    yref = "y",
+                    layer = "above",
+                    line = list(color = "black", width = 3)
+                  ),
+                  
+                  # right side
+                  list(
+                    type = "line",
+                    x0 = xR,
+                    x1 = xM,
+                    y0 = y0_blk,
+                    y1 = yA,
+                    xref = "x",
+                    yref = "y",
+                    layer = "above",
+                    line = list(color = "black", width = 3)
+                  )
+                )
+              }),
+              recursive = FALSE
+            )
+            
+            block_annotations <- lapply(seq_len(nrow(bd)), function(k) {
+              list(
+                x = bd$xM[k],
+                y = y0_blk + 0.035,
+                xref = "x",
+                yref = "y",
+                text = bd$block_label[k],
+                showarrow = FALSE,
+                font = list(size = 12, color = "black"),
+                xanchor = "center",
+                yanchor = "middle"
+              )
+            })
           }
         }
       }
       
+      if (!is.data.frame(bd) || !nrow(bd)) {
+        append_log("[LD-PLOT][BLOCKS] no valid block triangles to draw")
+      }
+      
       # ===============================
-      # TRACKS
+      # RECOMBINATION RATE TRACK
+      # ===============================
+      append_log("[RECOMB-DRAW] rr_track n=", if (is.data.frame(rr_track)) nrow(rr_track) else -1)
+      
+      if (is.data.frame(rr_track) && nrow(rr_track) > 0) {
+        
+        ymax_rr <- max(rr_track$rate_plot, na.rm = TRUE)
+        if (!is.finite(ymax_rr) || ymax_rr <= 0) ymax_rr <- 1
+        
+        rr_track <- rr_track %>%
+          dplyr::mutate(
+            Y = recomb_y0 + (.data$rate_plot / ymax_rr) * (recomb_y1 - recomb_y0)
+          )
+        
+        p <- p %>%
+          plotly::add_segments(
+            x = x_limits[1],
+            xend = x_limits[2],
+            y = recomb_y0,
+            yend = recomb_y0,
+            inherit = FALSE,
+            hoverinfo = "skip",
+            showlegend = FALSE,
+            line = list(color = "#1f77b4", width = 2)
+          ) %>%
+          plotly::add_trace(
+            data = rr_track,
+            x = ~X,
+            y = ~Y,
+            type = "scatter",
+            mode = "lines",
+            text = ~hover,
+            hoverinfo = "text",
+            inherit = FALSE,
+            showlegend = FALSE,
+            line = list(color = "#1f77b4", width = 3)
+          ) %>%
+          plotly::add_markers(
+            data = rr_track,
+            x = ~X,
+            y = ~Y,
+            text = ~hover,
+            hoverinfo = "text",
+            inherit = FALSE,
+            showlegend = FALSE,
+            marker = list(color = "#1f77b4", size = 4)
+          ) %>%
+          plotly::add_text(
+            x = x_lab,
+            y = recomb_y1,
+            text = "Recomb.<br>cM/Mb",
+            textposition = "middle left",
+            inherit = FALSE,
+            hoverinfo = "skip",
+            showlegend = FALSE,
+            textfont = list(size = 12, color = "#1f77b4")
+          )
+      }
+      
+      # ===============================
+      # CANDIDATE TRACKS
       # ===============================
       if (nrow(cand) > 0) {
         for (cls in cand_classes) {
@@ -5953,14 +7562,58 @@ ld_integrator_module_server <- function(
         }
       }
       
-      ymax_tracks <- if (length(track_base_y)) max(track_base_y) + 0.12 else 0.25
+      # ===============================
+      # FINAL Y RANGE
+      # Important:
+      # - tri$y can be downsampled/filtered
+      # - bd$yA contains the LD block triangle depth
+      # - candidate/recombination tracks are above zero
+      # Therefore y-axis must include both LD pairs and block triangles.
+      # ===============================
       
-   #  cl <- selected_cluster()
-   #  cluster_lab <- if (is.data.frame(cl) && nrow(cl) == 1 && "cluster_id" %in% names(cl)) {
-   #    as.character(cl$cluster_id[[1]])
-   #  } else {
-   #    "selected cluster"
-   #  }
+      ymin_ld_pairs <- if (is.data.frame(tri) && nrow(tri) > 0 && "y" %in% names(tri)) {
+        suppressWarnings(min(tri$y, na.rm = TRUE))
+      } else {
+        NA_real_
+      }
+      
+      ymin_blocks <- if (is.data.frame(bd) && nrow(bd) > 0 && "yA" %in% names(bd)) {
+        suppressWarnings(min(bd$yA, na.rm = TRUE))
+      } else {
+        NA_real_
+      }
+      
+      ymin_final <- suppressWarnings(min(c(ymin_ld_pairs, ymin_blocks), na.rm = TRUE))
+      
+      if (!is.finite(ymin_final)) {
+        ymin_final <- -1
+      }
+      
+      # Small padding below the deepest LD point/block triangle
+      ymin_final <- ymin_final - 0.08
+      
+      ymax_tracks <- max(
+        if (length(track_base_y)) max(unlist(track_base_y), na.rm = TRUE) + 0.12 else 0.25,
+        if (exists("recomb_y1") && is.finite(recomb_y1) &&
+            is.data.frame(rr_track) && nrow(rr_track) > 0) {
+          recomb_y1 + 0.08
+        } else {
+          0.25
+        },
+        0.25,
+        na.rm = TRUE
+      )
+      
+      if (!is.finite(ymax_tracks)) {
+        ymax_tracks <- 0.25
+      }
+      
+      append_log(
+        "[LD-PLOT][LAYOUT] ymin_final=", signif(ymin_final, 4),
+        " | ymax_tracks=", signif(ymax_tracks, 4),
+        " | tri_n=", if (is.data.frame(tri)) nrow(tri) else -1,
+        " | bd_n=", if (is.data.frame(bd)) nrow(bd) else -1
+      )
       
       p <- p %>%
         plotly::layout(
@@ -5972,27 +7625,42 @@ ld_integrator_module_server <- function(
           xaxis = list(
             title = x_title,
             automargin = TRUE,
-            range = x_limits2
+            range = x_limits2,
+            showgrid = FALSE
           ),
           yaxis = list(
             title = "",
-            range = c(-1.05, max(0.25, ymax_tracks))
+            zeroline = FALSE,
+            showticklabels = FALSE,
+            showgrid = FALSE,
+            range = c(ymin_final, ymax_tracks)
           ),
+          shapes = block_shapes,
+          annotations = block_annotations,
           margin = list(l = 40, r = 120, t = 70, b = 60)
         )
       
+      plots <- list()
+      heights <- c()
+      
       if (!is.null(g0)) {
-        plotly::subplot(
-          g0, p,
-          nrows = 2,
-          heights = c(0.20, 0.80),
-          shareX = TRUE,
-          titleX = TRUE
-        ) %>%
-          plotly::layout(hovermode = "closest")
-      } else {
-        p
+        plots <- c(plots, list(g0))
+        heights <- c(heights, 0.20)
       }
+      
+      plots <- c(plots, list(p))
+      heights <- c(heights, 0.80)
+      
+      heights <- heights / sum(heights)
+      
+      plotly::subplot(
+        plots,
+        nrows = length(plots),
+        heights = heights,
+        shareX = TRUE,
+        titleX = TRUE
+      ) %>%
+        plotly::layout(hovermode = "closest")
     })
     
  
@@ -6548,9 +8216,16 @@ ld_integrator_module_server <- function(
           ),
           ld_proxy_snps = vapply(ld_proxy_snps, build_snp_link_column_html, character(1))
         )
+      df_display <- show_df %>%
+        dplyr::mutate(
+          dplyr::across(
+            where(is.character),
+            ~ dplyr::if_else(is.na(.) | trimws(.) == "", "-", .)
+          )
+        )
       
       DT::datatable(
-        show_df,
+        df_display,
         rownames = FALSE,
         filter = "top",
         selection = "single",
@@ -6621,7 +8296,53 @@ ld_integrator_module_server <- function(
         ))
       }
       
+      # ------------------------------------------------------------
+      # Gene names per block, taken from the canonical block summary
+      # ------------------------------------------------------------
+      block_gene_display <- ld_block_overlap_summary_for_display()
+      
+      if (is.data.frame(block_gene_display) && nrow(block_gene_display)) {
+        block_gene_display <- make_block_canonical_table_display(block_gene_display)
+        
+        if (!"cluster_id" %in% names(block_gene_display)) block_gene_display$cluster_id <- NA_character_
+        if (!"block_id" %in% names(block_gene_display)) block_gene_display$block_id <- NA_character_
+        if (!"genes_name" %in% names(block_gene_display)) block_gene_display$genes_name <- ""
+        
+        block_gene_display <- block_gene_display %>%
+          dplyr::transmute(
+            cluster_id = as.character(cluster_id),
+            block_id = as.character(block_id),
+            genes_name = as.character(genes_name)
+          ) %>%
+          dplyr::distinct(cluster_id, block_id, .keep_all = TRUE)
+        
+      } else {
+        block_gene_display <- tibble::tibble(
+          cluster_id = character(),
+          block_id = character(),
+          genes_name = character()
+        )
+      }
+      
       show_dt <- format_block_hits_grouped_for_dt(dd) %>%
+        dplyr::mutate(
+          cluster_id = as.character(cluster_id),
+          block_id = as.character(block_id)
+        ) %>%
+        dplyr::left_join(
+          block_gene_display,
+          by = c("cluster_id", "block_id")
+        )
+      
+      if (!"genes_name" %in% names(show_dt)) {
+        show_dt$genes_name <- ""
+      }
+      
+      show_dt <- show_dt %>%
+        dplyr::mutate(
+          genes_name = dplyr::coalesce(as.character(genes_name), ""),
+          genes_name = vapply(genes_name, build_gene_link_column_html, character(1))
+        ) %>%
         dplyr::select(
           cluster_id,
           lead_snp,
@@ -6643,7 +8364,8 @@ ld_integrator_module_server <- function(
           nonsyn_hits,
           ewasdis_hits,
           ewastum_hits,
-          source_apps
+          source_apps,
+          genes_name
         )
       
       # Cas 3: hi ha blocs, però després del format no queda cap fila visible
@@ -6655,8 +8377,16 @@ ld_integrator_module_server <- function(
         ))
       }
       
+      df_display <- show_dt %>%
+        dplyr::mutate(
+          dplyr::across(
+            where(is.character),
+            ~ dplyr::if_else(is.na(.) | trimws(.) == "", "-", .)
+          )
+        )
+      
       DT::datatable(
-        show_dt,
+        df_display,
         rownames = FALSE,
         escape = FALSE,
         extensions = "Buttons",
@@ -6676,6 +8406,114 @@ ld_integrator_module_server <- function(
         fillContainer = TRUE
       )
     }, server = FALSE)
+    
+    #Recombinarion rate average
+    read_recomb_bedgraph <- function(path) {
+      readr::read_tsv(
+        path,
+        comment = "t",
+        col_names = c("chr", "start", "end", "rate"),
+        col_types = readr::cols(
+          chr = readr::col_character(),
+          start = readr::col_double(),
+          end = readr::col_double(),
+          rate = readr::col_double()
+        )
+      ) %>%
+        dplyr::filter(!is.na(chr), is.finite(start), is.finite(end), is.finite(rate))
+    }
+    
+    make_recomb_track_plot <- function(recomb_df, chr_sel, st, en, fl, x_limits2, x_mode) {
+      if (!is.data.frame(recomb_df) || nrow(recomb_df) == 0) return(NULL)
+      
+      chr_lab <- paste0("chr", chr_label_plink(chr_sel))
+      
+      rr <- recomb_df %>%
+        dplyr::filter(
+          chr == chr_lab,
+          end >= st,
+          start <= en
+        ) %>%
+        dplyr::mutate(
+          mid = (start + end) / 2,
+          rate = suppressWarnings(as.numeric(rate))
+        ) %>%
+        dplyr::filter(is.finite(mid), is.finite(rate))
+      
+      if (nrow(rr) == 0) return(NULL)
+      
+      bp_to_x <- function(bp_vec) {
+        bp_vec <- suppressWarnings(as.numeric(bp_vec))
+        if (!identical(x_mode, "equal")) return(bp_vec)
+        if (!is.data.frame(fl) || !"BP" %in% names(fl) || !"X" %in% names(fl)) return(bp_vec)
+        
+        stats::approx(
+          x = fl$BP,
+          y = fl$X,
+          xout = bp_vec,
+          rule = 2,
+          ties = "ordered"
+        )$y
+      }
+      
+      rr <- rr %>%
+        dplyr::arrange(mid) %>%
+        dplyr::mutate(x = bp_to_x(mid))
+      
+      plotly::plot_ly(
+        rr,
+        x = ~x,
+        y = ~rate,
+        type = "scatter",
+        mode = "lines",
+        hoverinfo = "text",
+        text = ~paste0(
+          "Recombination rate: ", signif(rate, 4),
+          "<br>Region: ", chr, ":", start, "-", end
+        ),
+        showlegend = FALSE
+      ) %>%
+        plotly::layout(
+          yaxis = list(title = "cM/Mb"),
+          xaxis = list(showticklabels = FALSE, title = "", range = x_limits2),
+          margin = list(l = 40, r = 120, t = 10, b = 0)
+        )
+    }
+    
+    
+    output$ld_snp_limit_auto_ui <- shiny::renderUI({
+      cl <- selected_cluster()
+      
+      if (!is.data.frame(cl) || !nrow(cl)) {
+        return(
+          shiny::tags$div(
+            style = "font-size:12px; color:#666; margin-bottom:8px;",
+            "Auto SNP limit: select a cluster to calculate recommendation."
+          )
+        )
+      }
+      
+      region_bp <- ld_region_size_bp(cl)
+      rec_n <- ld_recommended_max_snps(region_bp)
+      
+      shiny::tags$div(
+        style = paste(
+          "font-size:12px;",
+          "background:#f7f7f7;",
+          "border:1px solid #ddd;",
+          "border-radius:8px;",
+          "padding:8px 10px;",
+          "margin-bottom:8px;"
+        ),
+        shiny::tags$b("Auto SNP limit: "),
+        rec_n,
+        shiny::tags$br(),
+        shiny::tags$span(
+          style = "color:#666;",
+          paste0("Region size: ", ld_format_region_size(region_bp))
+        )
+      )
+    })
     
  #####################   
     invisible(list(

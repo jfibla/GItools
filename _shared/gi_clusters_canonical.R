@@ -372,6 +372,242 @@ standardize_cluster_ids <- function(cl) {
   cl2
 }
 
+# Helpers custom cluster
+
+# -----------------------------
+# User-defined cluster helpers
+# -----------------------------
+
+normalize_user_cluster_colnames <- function(df) {
+  stopifnot(is.data.frame(df))
+  
+  nm <- names(df)
+  nm_low <- tolower(trimws(nm))
+  
+  nm_low <- dplyr::case_when(
+    nm_low %in% c("cluster_id", "clusterid", "cluster-id", "cluster", "id") ~ "cluster_id",
+    nm_low %in% c("chr", "chrom", "chromosome", "cromosoma") ~ "chr",
+    nm_low %in% c("start", "star", "cluster_start", "pos_ini", "begin", "from") ~ "start",
+    nm_low %in% c("end", "cluster_end", "pos_end", "stop", "to") ~ "end",
+    TRUE ~ nm_low
+  )
+  
+  names(df) <- nm_low
+  
+  # If normalization creates duplicate column names, keep the first occurrence
+  if (anyDuplicated(names(df))) {
+    df <- df[, !duplicated(names(df)), drop = FALSE]
+  }
+  
+  df
+}
+
+coerce_user_cluster_chr <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("^chr", "", x, ignore.case = TRUE)
+  x <- toupper(x)
+  x[x %in% c("M", "MT")] <- "MT"
+  x
+}
+
+coerce_user_cluster_pos <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub(",", "", x, fixed = TRUE)
+  suppressWarnings(as.integer(x))
+}
+
+read_user_defined_clusters_file <- function(path, sep = NULL, header = TRUE, app_count_col = "n_app") {
+  stopifnot(length(path) == 1, is.character(path))
+  
+  if (!file.exists(path)) {
+    stop("User-defined cluster file does not exist.", call. = FALSE)
+  }
+  
+  if (is.null(sep)) {
+    ext <- tolower(tools::file_ext(path))
+    sep <- if (identical(ext, "csv")) "," else "\t"
+  }
+  
+  df <- utils::read.table(
+    file = path,
+    header = isTRUE(header),
+    sep = sep,
+    stringsAsFactors = FALSE,
+    check.names = FALSE,
+    comment.char = "",
+    quote = "\"",
+    fill = TRUE
+  )
+  
+  normalize_user_defined_clusters(
+    df = df,
+    app_count_col = app_count_col
+  )
+}
+
+validate_user_defined_clusters <- function(df) {
+  stopifnot(is.data.frame(df))
+  
+  req_cols <- c("chr", "start", "end")
+  miss <- setdiff(req_cols, names(df))
+  if (length(miss) > 0) {
+    stop(
+      paste0(
+        "User-defined cluster file is missing required columns: ",
+        paste(miss, collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+  
+  if (!"cluster_id" %in% names(df)) {
+    df$cluster_id <- NA_character_
+  }
+  
+  if (nrow(df) == 0) {
+    stop("User-defined cluster file contains no rows.", call. = FALSE)
+  }
+  
+  if (any(is.na(df$chr) | !nzchar(df$chr))) {
+    stop("Column 'chr' contains missing or empty values.", call. = FALSE)
+  }
+  
+  if (any(is.na(df$start))) {
+    stop("Column 'start' contains missing or invalid values.", call. = FALSE)
+  }
+  
+  if (any(is.na(df$end))) {
+    stop("Column 'end' contains missing or invalid values.", call. = FALSE)
+  }
+  
+  if (any(df$start <= 0L)) {
+    stop("Column 'start' must contain positions > 0.", call. = FALSE)
+  }
+  
+  if (any(df$end <= 0L)) {
+    stop("Column 'end' must contain positions > 0.", call. = FALSE)
+  }
+  
+  if (any(df$end < df$start)) {
+    bad_n <- sum(df$end < df$start, na.rm = TRUE)
+    stop(
+      paste0(
+        "Found ", bad_n,
+        " interval(s) with end < start in user-defined clusters."
+      ),
+      call. = FALSE
+    )
+  }
+  
+  dup_ids <- df$cluster_id[!is.na(df$cluster_id) & duplicated(df$cluster_id)]
+  if (length(dup_ids) > 0) {
+    stop(
+      paste0(
+        "Duplicated cluster_id values found: ",
+        paste(unique(dup_ids), collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+  
+  df
+}
+
+generate_user_cluster_ids <- function(df) {
+  stopifnot(is.data.frame(df))
+  stopifnot(all(c("chr", "start", "end") %in% names(df)))
+  
+  if (!"cluster_id" %in% names(df)) {
+    df$cluster_id <- NA_character_
+  }
+  
+  missing_id <- is.na(df$cluster_id) | !nzchar(trimws(df$cluster_id))
+  
+  if (!any(missing_id)) {
+    return(df)
+  }
+  
+  tmp <- df[missing_id, , drop = FALSE] %>%
+    dplyr::arrange(.data$chr, .data$start, .data$end) %>%
+    dplyr::group_by(.data$chr) %>%
+    dplyr::mutate(.cluster_seq = dplyr::row_number()) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      cluster_id = paste0("chr", .data$chr, "_", .cluster_seq)
+    ) %>%
+    dplyr::select(-".cluster_seq")
+  
+  out <- dplyr::bind_rows(
+    df[!missing_id, , drop = FALSE],
+    tmp
+  ) %>%
+    dplyr::arrange(.data$chr, .data$start, .data$end)
+  
+  out
+}
+
+normalize_user_defined_clusters <- function(df, app_count_col = "n_app") {
+  stopifnot(is.data.frame(df))
+  
+  out <- df %>%
+    normalize_user_cluster_colnames() %>%
+    dplyr::mutate(
+      chr = coerce_user_cluster_chr(.data$chr),
+      start = coerce_user_cluster_pos(.data$start),
+      end = coerce_user_cluster_pos(.data$end),
+      cluster_id = if ("cluster_id" %in% names(.)) as.character(.data$cluster_id) else NA_character_
+    ) %>%
+    dplyr::select(dplyr::any_of(c("cluster_id", "chr", "start", "end"))) %>%
+    validate_user_defined_clusters() %>%
+    generate_user_cluster_ids()
+  
+  # Convert chr to integer when possible (GItools canonical style)
+  out <- out %>%
+    dplyr::mutate(
+      chr = suppressWarnings(as.integer(.data$chr))
+    )
+  
+  if (any(!is.finite(out$chr))) {
+    stop(
+      "User-defined clusters contain non-numeric chromosomes. Current canonical engine expects numeric chromosomes.",
+      call. = FALSE
+    )
+  }
+  
+  out <- out %>%
+    dplyr::arrange(.data$chr, .data$start, .data$end) %>%
+    dplyr::group_by(.data$chr) %>%
+    dplyr::mutate(cluster_chr = dplyr::row_number()) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      cluster = dplyr::row_number(),
+      cluster_chr_n = paste0("chr", chr_label_plink(.data$chr), "_", .data$cluster_chr),
+      center = as.integer(round((.data$start + .data$end) / 2)),
+      n_snps = NA_integer_,
+      top_snp = NA_character_,
+      top_logp = NA_real_,
+      cluster_size_kb = round((.data$end - .data$start) / 1000, 2)
+    )
+  
+  # Respect user cluster_id if provided; otherwise keep generated ids
+  out$cluster_id <- as.character(out$cluster_id)
+  out$cluster_id[is.na(out$cluster_id) | !nzchar(out$cluster_id)] <- out$cluster_chr_n[is.na(out$cluster_id) | !nzchar(out$cluster_id)]
+  
+  out[[app_count_col]] <- 0L
+  
+  out %>%
+    dplyr::select(
+      dplyr::any_of(c(
+        "chr", "start", "end", "center", "n_snps",
+        "top_snp", "top_logp", "cluster_size_kb",
+        "cluster", "cluster_chr", "cluster_chr_n", "cluster_id",
+        app_count_col
+      ))
+    ) %>%
+    dplyr::arrange(.data$chr, .data$start, .data$end)
+}
 
 # -----------------------------
 # Main init: wire build_ranges
@@ -379,6 +615,7 @@ standardize_cluster_ids <- function(cl) {
 
 gi_clusters_canonical_init <- function(session, input, output,
                                        gwas_df,
+                                       user_clusters_df = NULL,
                                        build_btn_id = "build_ranges",
                                        clusters_dt_id = "cluster_dt",
                                        hits_rows_id = "hits_tbl_rows_selected",
@@ -460,6 +697,7 @@ gi_clusters_canonical_init <- function(session, input, output,
     # reset current
     clusters_cur(tibble::tibble())
     intervals_raw(tibble::tibble(chr=integer(), start=integer(), end=integer(), label=character()))
+    
     
     # -----------------------------
     # METHOD 1: window (+/- flank around hits above pthr)
@@ -848,6 +1086,144 @@ gi_clusters_canonical_init <- function(session, input, output,
       return(invisible(TRUE))
     }
     
+    # -----------------------------
+    # METHOD 3: user-defined intervals
+    # -----------------------------
+    if (identical(method, "user_defined")) {
+      
+      if (is.null(user_clusters_df)) {
+        cat("[GI canonical][user_defined] STOP: user_clusters_df reactive was not provided\n")
+        shiny::showNotification(
+          "User-defined cluster mode is active, but no uploaded cluster source is available.",
+          type = "error",
+          duration = 6
+        )
+        return(NULL)
+      }
+      
+      thr <- safe_num(input$pthr_user_defined, default = NA_real_)
+      min_hits <- safe_int(input$min_hits_user_defined, default = 1L)
+      if (!is.finite(min_hits) || min_hits < 0L) min_hits <- 1L
+      
+      if (!is.finite(thr)) {
+        cat("[GI canonical][user_defined] STOP: pthr_user_defined is missing or invalid\n")
+        shiny::showNotification(
+          "Please provide a valid -log10(P) threshold for assigning GWAS hits to uploaded intervals.",
+          type = "warning",
+          duration = 6
+        )
+        return(NULL)
+      }
+      
+      cl_user_raw <- tryCatch(
+        user_clusters_df(),
+        error = function(e) {
+          cat("[GI canonical][user_defined] user_clusters_df() failed:", conditionMessage(e), "\n")
+          shiny::showNotification(
+            paste("Could not read uploaded cluster intervals:", conditionMessage(e)),
+            type = "error",
+            duration = 8
+          )
+          NULL
+        }
+      )
+      
+      if (!is.data.frame(cl_user_raw) || nrow(cl_user_raw) == 0) {
+        cat("[GI canonical][user_defined] STOP: uploaded cluster table is empty or invalid\n")
+        shiny::showNotification(
+          "Uploaded cluster interval file is empty or invalid.",
+          type = "warning",
+          duration = 6
+        )
+        return(NULL)
+      }
+      
+      cl <- tryCatch(
+        normalize_user_defined_clusters(
+          df = cl_user_raw,
+          app_count_col = app_count_col
+        ),
+        error = function(e) {
+          cat("[GI canonical][user_defined] normalization failed:", conditionMessage(e), "\n")
+          shiny::showNotification(
+            paste("Invalid uploaded cluster intervals:", conditionMessage(e)),
+            type = "error",
+            duration = 8
+          )
+          NULL
+        }
+      )
+      
+      if (!is.data.frame(cl) || nrow(cl) == 0) {
+        cat("[GI canonical][user_defined] STOP: no valid clusters after normalization\n")
+        return(NULL)
+      }
+      
+      df_sig <- df %>%
+        dplyr::filter(is.finite(.data$logp), .data$logp >= thr) %>%
+        dplyr::arrange(.data$CHR, .data$BP)
+      
+      if (!nrow(df_sig)) {
+        shiny::showNotification(
+          "No GWAS hits above the selected threshold for uploaded intervals.",
+          type = "warning",
+          duration = 6
+        )
+      }
+      
+      cl <- add_cluster_stats_from_hits(cl, df_sig) %>%
+        dplyr::arrange(.data$chr, .data$start, .data$end)
+      
+      if (isTRUE(min_hits > 0L)) {
+        cl <- cl %>%
+          dplyr::filter(!is.na(.data$n_snps) & .data$n_snps >= min_hits)
+      }
+      
+      cat("\n[GI canonical][user_defined]")
+      cat("\n  threshold:", thr)
+      cat("\n  min_hits_user_defined:", min_hits)
+      cat("\n  uploaded_rows:", nrow(cl_user_raw))
+      cat("\n  sig_hits:", nrow(df_sig))
+      cat("\n  final_clusters:", nrow(cl), "\n")
+      
+      if (!nrow(cl)) {
+        shiny::showNotification(
+          paste0(
+            "No uploaded intervals remained after applying the current minimum hits filter (",
+            min_hits, ")."
+          ),
+          type = "warning",
+          duration = 6
+        )
+      }
+      
+      clusters_cur(cl)
+      intervals_raw(
+        cl %>%
+          dplyr::transmute(
+            chr = .data$chr,
+            start = .data$start,
+            end = .data$end,
+            label = .data$cluster_id
+          )
+      )
+      
+      if ("ranges_preview" %in% names(output)) {
+        output$ranges_preview <- shiny::renderText({
+          paste0(
+            "method=user_defined",
+            " | threshold=", thr,
+            " | min_hits=", min_hits,
+            " | uploaded intervals=", nrow(cl_user_raw),
+            " | significant GWAS hits=", nrow(df_sig),
+            " | final clusters=", nrow(cl)
+          )
+        })
+      }
+      
+      return(invisible(TRUE))
+    }
+    
   }, ignoreInit = TRUE)
   
   
@@ -858,3 +1234,30 @@ gi_clusters_canonical_init <- function(session, input, output,
     selected_cluster = selected_cluster
   )
 }
+
+
+gi_resolve_cluster_method <- function(cluster_method, hits_mode = NA_character_, user_defined = FALSE) {
+  `%||%` <- function(a, b) {
+    if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
+  }
+  
+  cm <- trimws(as.character(cluster_method %||% ""))
+  hm <- trimws(as.character(hits_mode %||% ""))
+  
+  if (isTRUE(user_defined) || cm == "user_defined") return("user_defined")
+  if (cm == "window") return("window")
+  
+  if (cm %in% c("hits_span1mb", "span1mb")) return("hits_span1mb")
+  if (cm %in% c("hits_tiled", "tiled")) return("hits_tiled")
+  if (cm %in% c("hits_sliding", "sliding", "sliding_window")) return("hits_sliding")
+  
+  if (cm %in% c("hits", "hit")) {
+    if (hm %in% c("span1mb", "span", "1mb", "hits_span1mb")) return("hits_span1mb")
+    if (hm %in% c("tiled", "tiles", "hits_tiled")) return("hits_tiled")
+    if (hm %in% c("sliding", "sliding_window", "hits_sliding")) return("hits_sliding")
+  }
+  
+  if (!nzchar(cm)) "unknown" else cm
+}
+
+

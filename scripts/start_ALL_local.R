@@ -9,6 +9,7 @@
 #
 # Usage (from repo root):
 #   Rscript --vanilla scripts/start_ALL_local.R
+# /Volumes/DISK1TB/Inspector_app_slaves_ngroc/GItools/scripts/start_ALL_local.R
 #   Rscript --vanilla scripts/start_ALL_local.R --ngrok
 #
 # Tip: you can also run from anywhere if the script can find the repo root.
